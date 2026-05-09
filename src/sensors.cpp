@@ -79,7 +79,7 @@ bool FloatSensor::update() {
     lastChangeMs_ = now;
   }
 
-  if (static_cast<uint32_t>(now - lastChangeMs_) >= debounceMs_) {
+  if (now - lastChangeMs_ >= debounceMs_) {
     debouncedLow_ = rawLow;
   }
 

@@ -228,7 +228,7 @@ void loop() {
   handleSerialCommands();
 
   const uint32_t now = millis();
-  if (static_cast<uint32_t>(now - lastLoopMs) < config.loopPeriodMs) {
+  if (now - lastLoopMs < config.loopPeriodMs) {
     return;
   }
   lastLoopMs = now;
@@ -246,7 +246,7 @@ void loop() {
     lastFailsafe = result.failsafe;
   }
 
-  if (static_cast<uint32_t>(now - lastDebugMs) < config.debugPeriodMs) {
+  if (now - lastDebugMs < config.debugPeriodMs) {
     return;
   }
   lastDebugMs = now;
