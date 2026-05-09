@@ -12,10 +12,8 @@ float MapSensor::readKpa() const {
     return 100.0f;
   }
 
-  // Placeholder conversion until GM MAP sensor calibration is implemented.
-  int raw = analogRead(pin_);
-  float voltage = static_cast<float>(raw) * (3.3f / 4095.0f);
-  (void)voltage;
+  // Placeholder read until GM MAP sensor calibration (voltage-to-kPa) is implemented.
+  (void)analogRead(pin_);
   return 100.0f;
 }
 
@@ -23,7 +21,9 @@ bool MapSensor::valid() const { return valid_; }
 
 void FloatSensor::begin(int digitalPin) {
   pin_ = digitalPin;
-  pinMode(pin_, INPUT_PULLUP);
+  if (pin_ >= 0) {
+    pinMode(pin_, INPUT_PULLUP);
+  }
 }
 
 bool FloatSensor::isLow() const {
