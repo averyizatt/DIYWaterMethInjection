@@ -49,7 +49,7 @@ ControlResult InjectionController::update(const SensorReadings &readings, const 
   }
 
   // Requested base model:
-  // Duty = K(1 - M)(Pboost - Pstart), duty clamped 0..100%.
+  // Duty = K(1 - M)(Pboost - Pstart), then constrained to configured duty bounds.
   const float methFraction = constrain(blend.methFraction, 0.0f, 1.0f);
   const float boostDelta = readings.boostPsi - config.boost.startPsi;
   result.baseDutyPercent = config.gainK * (1.0f - methFraction) * boostDelta;

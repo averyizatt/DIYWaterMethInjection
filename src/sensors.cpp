@@ -6,6 +6,11 @@ namespace {
 constexpr float kAdcRefVoltage = 3.3f;
 constexpr float kAdcMaxCount = 4095.0f;
 constexpr float kPsiPerKpa = 0.1450377f;
+
+// Unsigned subtraction is rollover-safe for millis() timestamps.
+inline bool elapsed(uint32_t now, uint32_t start, uint32_t intervalMs) {
+  return static_cast<uint32_t>(now - start) >= intervalMs;
+}
 } // namespace
 
 void MapSensor::begin(int analogPin, const MapCalibration &calibration) {
@@ -79,7 +84,7 @@ bool FloatSensor::update() {
     lastChangeMs_ = now;
   }
 
-  if (now - lastChangeMs_ >= debounceMs_) {
+  if (elapsed(now, lastChangeMs_, debounceMs_)) {
     debouncedLow_ = rawLow;
   }
 

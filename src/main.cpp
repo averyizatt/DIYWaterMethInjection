@@ -28,6 +28,11 @@ constexpr char kPrefsNamespace[] = "wmix";
 constexpr char kPrefsKeyWater[] = "water_l";
 constexpr char kPrefsKeyMeth[] = "meth_l";
 
+// Unsigned subtraction is rollover-safe for millis() timestamps.
+inline bool elapsed(uint32_t now, uint32_t start, uint32_t intervalMs) {
+  return static_cast<uint32_t>(now - start) >= intervalMs;
+}
+
 void printHelp() {
   Serial.println("Commands:");
   Serial.println("  WATER <liters>   - set water volume");
@@ -228,7 +233,7 @@ void loop() {
   handleSerialCommands();
 
   const uint32_t now = millis();
-  if (now - lastLoopMs < config.loopPeriodMs) {
+  if (!elapsed(now, lastLoopMs, config.loopPeriodMs)) {
     return;
   }
   lastLoopMs = now;
@@ -246,7 +251,7 @@ void loop() {
     lastFailsafe = result.failsafe;
   }
 
-  if (now - lastDebugMs < config.debugPeriodMs) {
+  if (!elapsed(now, lastDebugMs, config.debugPeriodMs)) {
     return;
   }
   lastDebugMs = now;
