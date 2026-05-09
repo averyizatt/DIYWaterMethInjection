@@ -39,6 +39,11 @@ ControlResult InjectionController::update(const SensorReadings &readings, const 
     return result;
   }
 
+  if (config.dutyMaxPercent <= 0.0f || config.dutyMaxPercent < config.dutyMinPercent) {
+    result.failsafe = FailsafeReason::InvalidBoostConfig;
+    return result;
+  }
+
   if (readings.boostPsi < config.boost.startPsi) {
     return result;
   }
@@ -47,19 +52,21 @@ ControlResult InjectionController::update(const SensorReadings &readings, const 
   // Duty = K(1 - M)(Pboost - Pstart), duty clamped 0..100%.
   const float methFraction = constrain(blend.methFraction, 0.0f, 1.0f);
   const float boostDelta = readings.boostPsi - config.boost.startPsi;
-  float dutyPercent = config.gainK * (1.0f - methFraction) * boostDelta;
+  result.baseDutyPercent = config.gainK * (1.0f - methFraction) * boostDelta;
+  float dutyPercent = result.baseDutyPercent;
 
   // Progressive ramp to full by the configured fullPsi threshold.
   if (readings.boostPsi >= config.boost.fullPsi) {
     dutyPercent = config.dutyMaxPercent;
   }
 
-  dutyPercent = constrain(dutyPercent, 0.0f, config.dutyMaxPercent);
-  if (dutyPercent > 0.0f && dutyPercent < config.dutyMinPercent) {
+  dutyPercent = constrain(dutyPercent, config.dutyMinPercent, config.dutyMaxPercent);
+  if (result.baseDutyPercent <= 0.0f) {
+    dutyPercent = 0.0f;
+  } else if (dutyPercent < config.dutyMinPercent) {
     dutyPercent = config.dutyMinPercent;
   }
 
-  result.baseDutyPercent = config.gainK * (1.0f - methFraction) * boostDelta;
   result.finalDutyPercent = dutyPercent;
 
   command.enabled = true;
