@@ -2,37 +2,67 @@
 
 #include <Arduino.h>
 
-PumpCommand InjectionController::update(const SensorReadings &readings, const AppConfig &config) const {
-  PumpCommand command{};
+ControlResult InjectionController::update(const SensorReadings &readings, const AppConfig &config,
+                                          const TankBlend &blend) const {
+  ControlResult result{};
+  PumpCommand &command = result.pump;
 
   if (config.mode == InjectionMode::Off) {
-    return command;
+    return result;
   }
 
   if (config.mode == InjectionMode::Prime) {
     command.enabled = true;
-    command.pwm = config.pwmMin;
-    return command;
+    command.dutyPercent = config.dutyMinPercent;
+    result.baseDutyPercent = command.dutyPercent;
+    result.finalDutyPercent = command.dutyPercent;
+    return result;
   }
 
-  if (!readings.mapValid || readings.tankLow) {
-    return command;
+  if (readings.tankLow) {
+    result.failsafe = FailsafeReason::LowFluid;
+    return result;
   }
 
-  if (readings.mapKpa < config.boost.startKpa) {
-    return command;
+  if (!readings.mapValid) {
+    result.failsafe = FailsafeReason::MapInvalid;
+    return result;
   }
 
-  float span = config.boost.fullKpa - config.boost.startKpa;
-  if (span <= 0.0f) {
-    return command;
+  if (blend.totalLiters <= 0.0f || blend.methFraction < 0.0f || blend.methFraction > 1.0f) {
+    result.failsafe = FailsafeReason::InvalidBlend;
+    return result;
   }
 
-  float normalized = (readings.mapKpa - config.boost.startKpa) / span;
-  normalized = constrain(normalized, 0.0f, 1.0f);
-  float trimmed = constrain(normalized * ratioTrim(config.ratio), 0.0f, 1.0f);
+  if (config.boost.fullPsi <= config.boost.startPsi) {
+    result.failsafe = FailsafeReason::InvalidBoostConfig;
+    return result;
+  }
+
+  if (readings.boostPsi < config.boost.startPsi) {
+    return result;
+  }
+
+  // Requested base model:
+  // Duty = K(1 - M)(Pboost - Pstart), duty clamped 0..100%.
+  const float methFraction = constrain(blend.methFraction, 0.0f, 1.0f);
+  const float boostDelta = readings.boostPsi - config.boost.startPsi;
+  float dutyPercent = config.gainK * (1.0f - methFraction) * boostDelta;
+
+  // Progressive ramp to full by the configured fullPsi threshold.
+  if (readings.boostPsi >= config.boost.fullPsi) {
+    dutyPercent = config.dutyMaxPercent;
+  }
+
+  dutyPercent = constrain(dutyPercent, 0.0f, config.dutyMaxPercent);
+  if (dutyPercent > 0.0f && dutyPercent < config.dutyMinPercent) {
+    dutyPercent = config.dutyMinPercent;
+  }
+
+  result.baseDutyPercent = config.gainK * (1.0f - methFraction) * boostDelta;
+  result.finalDutyPercent = dutyPercent;
 
   command.enabled = true;
-  command.pwm = static_cast<uint8_t>(config.pwmMin + (config.pwmMax - config.pwmMin) * trimmed);
-  return command;
+  command.dutyPercent = dutyPercent;
+  return result;
 }

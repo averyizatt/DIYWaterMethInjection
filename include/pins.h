@@ -6,4 +6,5 @@ namespace pins {
 constexpr int MAP_SENSOR_ADC = -1;
 constexpr int FLOAT_SENSOR_DIGITAL = -1;
 constexpr int PUMP_PWM = -1;
+constexpr int WARNING_LED = -1;
 } // namespace pins

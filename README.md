@@ -6,7 +6,7 @@ Starter repository for an ESP32-S3 based water/methanol injection controller usi
 - 72W diaphragm pump + nozzle
 - Custom PCB + housing
 
-This repo is intentionally a **framework starting point** (architecture + stubs), not a finished tuned controller.
+This repo now includes a **working conservative firmware baseline** you can build on.
 
 ## Goals
 
@@ -41,24 +41,42 @@ src/
 platformio.ini
 ```
 
-## Current Firmware Behavior (Scaffold)
+## Current Firmware Behavior
 
-- Reads MAP + float sensor through placeholder/stub drivers.
-- Runs a basic control loop.
-- Enables pump only when:
-  - mode allows injection
-  - MAP is above boost threshold
-  - tank is not low
-- Uses placeholder PWM command logic as a framework.
+- Reads MAP sensor ADC and converts voltage to kPa using configurable linear calibration.
+- Converts manifold absolute pressure to **boost PSI** using configurable barometric reference.
+- Reads float switch with debounce.
+- Disables injection on low fluid and asserts warning output.
+- Accepts user blend entry over serial:
+  - `WATER <liters>`
+  - `METH <liters>`
+- Computes methanol percent using:
+  - `Meth% = Vm / (Vm + Vw) * 100`
+- Stores blend values in ESP32 NVS (Preferences).
+- Progressive boost-based duty using:
+  - `Duty = K(1 - M)(Pboost - Pstart)` (clamped)
+  - forced full duty at configured full-boost threshold.
+- Outputs periodic serial diagnostics.
 
-## Planned Next Steps
+## Conservative Default Control Targets
 
-1. Implement actual GM MAP calibration curve and validation.
-2. Implement real float sensor debounce/filtering.
-3. Add real pump PWM output + frequency/current checks.
-4. Add config persistence (NVS) and runtime tuning interface (Serial/BLE/Wi-Fi).
-5. Add failsafe strategy (sensor fault, dry tank, overrun timeout, limp output).
-6. Add data logging for tuning (MAP, duty, mode, fault state).
+- No injection below ~3.5 psi (default `startPsi`)
+- Progressive injection through mid boost
+- Full injection near ~7.5 psi (default `fullPsi`)
+- Duty gain reduced as methanol fraction increases
+- Intended for supplemental cooling/knock margin, not meth-dependent tuning
+
+## Adjustable Constants
+
+Most important constants are in:
+- `/home/runner/work/DIYWaterMethInjection/DIYWaterMethInjection/include/app_config.h`
+- `/home/runner/work/DIYWaterMethInjection/DIYWaterMethInjection/src/app_config.cpp`
+
+Example defaults include:
+- GM 3-bar style MAP calibration example (`0.5-4.5V`, `20-312 kPa`)
+- Pump PWM frequency `100 Hz` (within recommended 50-200 Hz range)
+- `startPsi = 3.5`, `fullPsi = 7.5`
+- `gainK = 30.0` (% duty per psi)
 
 ## Build
 
@@ -76,4 +94,18 @@ pio run -t upload
 
 ## First Setup
 
-Before testing, set your real board pin assignments in `include/pins.h` (defaults are disabled as `-1`).
+1. Set real board pin assignments in:
+   - `/home/runner/work/DIYWaterMethInjection/DIYWaterMethInjection/include/pins.h`
+2. Verify MAP calibration values match your specific GM sensor.
+3. Confirm float switch polarity (`floatActiveLow`) and wiring.
+4. Verify pump driver hardware is rated for startup current (8-12A possible).
+
+## Serial Commands
+
+- `HELP`
+- `SHOW`
+- `MODE OFF`
+- `MODE BOOST`
+- `MODE PRIME`
+- `WATER 1.5`
+- `METH 0.5`
