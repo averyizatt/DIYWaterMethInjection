@@ -23,8 +23,9 @@ inline float ratioTrim(const MixRatio &ratio) {
   }
 
   constexpr float kDefaultWaterPercent = 50.0f;
-  // 500 -> ±10% trim across extreme 0-100 water split (placeholder only).
-  constexpr float kTrimScalingFactor = 500.0f;
+  constexpr float kMaxWaterDeltaPercent = 50.0f; // distance from 50% to either 0% or 100%
+  constexpr float kMaxTrimFraction = 0.10f;      // placeholder: ±10% max output trim
+  constexpr float kTrimScalingFactor = kMaxWaterDeltaPercent / kMaxTrimFraction;
 
   // Placeholder trim hook so ratio modes can influence commanded output.
   // Final trim strategy should be based on nozzle sizing and calibration data.

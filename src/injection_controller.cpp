@@ -24,7 +24,11 @@ PumpCommand InjectionController::update(const SensorReadings &readings, const Ap
   }
 
   float span = config.boost.fullKpa - config.boost.startKpa;
-  float normalized = span > 0.0f ? (readings.mapKpa - config.boost.startKpa) / span : 0.0f;
+  if (span <= 0.0f) {
+    return command;
+  }
+
+  float normalized = (readings.mapKpa - config.boost.startKpa) / span;
   normalized = constrain(normalized, 0.0f, 1.0f);
   float trimmed = constrain(normalized * ratioTrim(config.ratio), 0.0f, 1.0f);
 

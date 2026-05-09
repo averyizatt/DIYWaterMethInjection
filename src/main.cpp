@@ -27,9 +27,9 @@ void setup() {
   Serial.println("Water/Meth controller scaffold started");
 }
 
-void loop() {
+  void loop() {
   const uint32_t now = millis();
-  if (now - lastLoopMs < config.loopPeriodMs) {
+  if (static_cast<uint32_t>(now - lastLoopMs) < config.loopPeriodMs) {
     return;
   }
   lastLoopMs = now;
