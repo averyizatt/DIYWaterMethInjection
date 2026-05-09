@@ -22,10 +22,10 @@ inline float ratioTrim(const MixRatio &ratio) {
     return 1.0f;
   }
 
-  constexpr float kBaselineWaterPercent = 50.0f;
-  constexpr float kTrimSlopeDivisor = 500.0f;
+  constexpr float kDefaultWaterPercent = 50.0f;
+  constexpr float kTrimScalingFactor = 500.0f;
 
   // Placeholder trim hook so ratio modes can influence commanded output.
   // Final trim strategy should be based on nozzle sizing and calibration data.
-  return 1.0f + (static_cast<float>(ratio.waterPercent) - kBaselineWaterPercent) / kTrimSlopeDivisor;
+  return 1.0f + (static_cast<float>(ratio.waterPercent) - kDefaultWaterPercent) / kTrimScalingFactor;
 }

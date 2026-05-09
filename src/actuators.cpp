@@ -4,6 +4,10 @@
 
 void PumpDriver::begin(int pwmPin) {
   pin_ = pwmPin;
+  if (pin_ < 0) {
+    return;
+  }
+
   pinMode(pin_, OUTPUT);
   analogWrite(pin_, 0);
 }
