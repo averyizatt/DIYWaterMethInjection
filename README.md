@@ -73,7 +73,7 @@ Most important constants are in:
 - `src/app_config.cpp`
 
 Example defaults include:
-- GM 3-bar style MAP calibration example (`0.5-4.5V`, `20-312 kPa`)
+- GM 3-bar style MAP calibration example (`0.5 V to 4.5 V`, `20 kPa to 312 kPa`)
 - Pump PWM frequency `100 Hz` (within recommended 50-200 Hz range)
 - `startPsi = 3.5`, `fullPsi = 7.5`
 - `gainK = 30.0` (% duty per psi)

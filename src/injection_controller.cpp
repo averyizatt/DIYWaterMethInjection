@@ -60,11 +60,10 @@ ControlResult InjectionController::update(const SensorReadings &readings, const 
     dutyPercent = config.dutyMaxPercent;
   }
 
-  dutyPercent = constrain(dutyPercent, config.dutyMinPercent, config.dutyMaxPercent);
   if (result.baseDutyPercent <= 0.0f) {
     dutyPercent = 0.0f;
-  } else if (dutyPercent < config.dutyMinPercent) {
-    dutyPercent = config.dutyMinPercent;
+  } else {
+    dutyPercent = constrain(dutyPercent, config.dutyMinPercent, config.dutyMaxPercent);
   }
 
   result.finalDutyPercent = dutyPercent;
