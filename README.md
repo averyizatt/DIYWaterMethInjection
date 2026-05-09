@@ -73,3 +73,7 @@ Upload (when hardware is connected):
 ```bash
 pio run -t upload
 ```
+
+## First Setup
+
+Before testing, set your real board pin assignments in `include/pins.h` (defaults are disabled as `-1`).

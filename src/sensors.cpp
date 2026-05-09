@@ -12,8 +12,7 @@ float MapSensor::readKpa() const {
     return 100.0f;
   }
 
-  // Placeholder read until GM MAP sensor calibration (voltage-to-kPa) is implemented.
-  (void)analogRead(pin_);
+  // Placeholder until GM MAP sensor calibration (ADC/voltage-to-kPa) is implemented.
   return 100.0f;
 }
 

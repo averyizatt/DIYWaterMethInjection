@@ -23,6 +23,7 @@ inline float ratioTrim(const MixRatio &ratio) {
   }
 
   constexpr float kDefaultWaterPercent = 50.0f;
+  // 500 -> ±10% trim across extreme 0-100 water split (placeholder only).
   constexpr float kTrimScalingFactor = 500.0f;
 
   // Placeholder trim hook so ratio modes can influence commanded output.
