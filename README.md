@@ -69,8 +69,8 @@ platformio.ini
 ## Adjustable Constants
 
 Most important constants are in:
-- `/home/runner/work/DIYWaterMethInjection/DIYWaterMethInjection/include/app_config.h`
-- `/home/runner/work/DIYWaterMethInjection/DIYWaterMethInjection/src/app_config.cpp`
+- `include/app_config.h`
+- `src/app_config.cpp`
 
 Example defaults include:
 - GM 3-bar style MAP calibration example (`0.5-4.5V`, `20-312 kPa`)
@@ -95,7 +95,7 @@ pio run -t upload
 ## First Setup
 
 1. Set real board pin assignments in:
-   - `/home/runner/work/DIYWaterMethInjection/DIYWaterMethInjection/include/pins.h`
+   - `include/pins.h`
 2. Verify MAP calibration values match your specific GM sensor.
 3. Confirm float switch polarity (`floatActiveLow`) and wiring.
 4. Verify pump driver hardware is rated for startup current (8-12A possible).
