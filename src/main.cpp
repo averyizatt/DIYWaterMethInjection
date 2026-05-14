@@ -4,6 +4,7 @@
 
 #include "actuators.h"
 #include "app_config.h"
+#include "can_bridge.h"
 #include "injection_controller.h"
 #include "pins.h"
 #include "sensors.h"
@@ -17,11 +18,13 @@ FloatSensor floatSensor;
 PumpDriver pumpDriver;
 WarningOutput warningOutput;
 InjectionController controller;
+CanBridge canBridge;
 Preferences preferences;
 
 uint32_t lastLoopMs = 0;
 uint32_t lastDebugMs = 0;
 FailsafeReason lastFailsafe = FailsafeReason::None;
+FailsafeReason lastReportedCanFault = FailsafeReason::None;
 String serialLine;
 
 constexpr char kPrefsNamespace[] = "wmix";
@@ -225,6 +228,12 @@ void setup() {
   pumpDriver.begin(pins::PUMP_PWM, config.pwmFrequencyHz, config.pwmResolutionBits);
   warningOutput.begin(pins::WARNING_LED, true);
 
+  if (canBridge.begin(pins::CAN_TX, pins::CAN_RX)) {
+    Serial.println("CAN: online");
+  } else {
+    Serial.println("CAN: TWAI init failed — running serial-only");
+  }
+
   printSetupSummary();
   printHelp();
 }
@@ -238,18 +247,69 @@ void loop() {
   }
   lastLoopMs = now;
 
+  // Process incoming CAN frames (ARM/DISARM, manual test commands, config).
+  canBridge.poll();
+
+  // Apply ratio update from CCM if the master sent a new value.
+  // The ratio tells us what % methanol is physically in the tank.
+  if (canBridge.hasRemoteRatio()) {
+    const uint8_t pct = canBridge.remoteRatioPercent();
+    // Recompute blend keeping the same total-volume scale (100 L nominal).
+    blend = computeTankBlend(static_cast<float>(100 - pct), static_cast<float>(pct));
+    canBridge.clearRemoteRatio();
+  }
+  if (canBridge.hasClearFaultsRequest()) {
+    lastFailsafe = FailsafeReason::None;
+    lastReportedCanFault = FailsafeReason::None;
+    canBridge.clearFaultsRequest();
+  }
+
   SensorReadings readings = mapSensor.read();
   readings.tankLow = floatSensor.update();
 
-  ControlResult result = controller.update(readings, config, blend);
+  // If the master has disarmed via CAN, force injection off regardless of local config.
+  AppConfig effectiveConfig = config;
+  if (!canBridge.isArmed() && canBridge.isOnline()) {
+    effectiveConfig.mode = InjectionMode::Off;
+  }
+
+  // Manual test overrides normal injection control.
+  ControlResult result{};
+  if (canBridge.hasPendingManualTest()) {
+    result.pump.enabled = true;
+    result.pump.dutyPercent = constrain(canBridge.manualTestDuty(), 0, 100);
+    result.finalDutyPercent = result.pump.dutyPercent;
+  } else {
+    result = controller.update(readings, effectiveConfig, blend);
+  }
+
   pumpDriver.apply(result.pump);
   warningOutput.set(result.failsafe != FailsafeReason::None);
+
+  // Report new fault conditions over CAN.
+  if (result.failsafe != lastReportedCanFault) {
+    if (result.failsafe != FailsafeReason::None) {
+      uint8_t code = 0;
+      switch (result.failsafe) {
+        case FailsafeReason::LowFluid:           code = 0x01; break;
+        case FailsafeReason::MapInvalid:         code = 0x05; break;
+        case FailsafeReason::InvalidBlend:       code = 0x08; break;
+        case FailsafeReason::InvalidBoostConfig: code = 0x08; break;
+        default:                                 code = 0x09; break;
+      }
+      canBridge.sendFault(code, 1 /*WARNING*/, 0, 0);
+    }
+    lastReportedCanFault = result.failsafe;
+  }
 
   if (result.failsafe != lastFailsafe) {
     Serial.print("Failsafe state changed: ");
     Serial.println(failsafeName(result.failsafe));
     lastFailsafe = result.failsafe;
   }
+
+  // Transmit state frame to CCM master.
+  canBridge.sendStateIfDue(readings, result, effectiveConfig, now);
 
   if (!elapsed(now, lastDebugMs, config.debugPeriodMs)) {
     return;
@@ -266,6 +326,8 @@ void loop() {
   Serial.print(readings.boostPsi, 2);
   Serial.print(" low=");
   Serial.print(readings.tankLow ? "1" : "0");
+  Serial.print(" armed=");
+  Serial.print(canBridge.isArmed() ? "Y" : "N");
   Serial.print(" meth%=");
   Serial.print(blend.methPercent, 1);
   Serial.print(" dutyBase=");

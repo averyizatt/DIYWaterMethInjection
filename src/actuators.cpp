@@ -11,8 +11,13 @@ void PumpDriver::begin(int pwmPin, uint16_t frequencyHz, uint8_t resolutionBits)
   resolutionBits_ = resolutionBits;
   maxDutyCount_ = (1UL << resolutionBits_) - 1UL;
 
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
+  // Arduino ESP32 v3.x unified LEDC API.
+  ledcAttachChannel(pin_, frequencyHz, resolutionBits_, channel_);
+#else
   ledcSetup(channel_, frequencyHz, resolutionBits_);
   ledcAttachPin(pin_, channel_);
+#endif
   ledcWrite(channel_, 0);
 }
 
