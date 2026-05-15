@@ -11,20 +11,16 @@ void PumpDriver::begin(int pwmPin, uint16_t frequencyHz, uint8_t resolutionBits)
   resolutionBits_ = resolutionBits;
   maxDutyCount_ = (1UL << resolutionBits_) - 1UL;
 
-<<<<<<< HEAD
-  // arduino-esp32 3.x unified LEDC API (no explicit channel needed)
+  // arduino-esp32 v3.x: ledcAttach(pin, freq, resolution)
+  // arduino-esp32 v2.x: ledcSetup(channel, freq, resolution) + ledcAttachPin(pin, channel)
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
   ledcAttach(pin_, frequencyHz, resolutionBits_);
   ledcWrite(pin_, 0);
-=======
-#if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
-  // Arduino ESP32 v3.x unified LEDC API.
-  ledcAttachChannel(pin_, frequencyHz, resolutionBits_, channel_);
 #else
   ledcSetup(channel_, frequencyHz, resolutionBits_);
   ledcAttachPin(pin_, channel_);
-#endif
   ledcWrite(channel_, 0);
->>>>>>> 54c27c114127d33f6a78ce395b3c255993478aad
+#endif
 }
 
 void PumpDriver::apply(const PumpCommand &command) {
@@ -33,13 +29,21 @@ void PumpDriver::apply(const PumpCommand &command) {
   }
 
   if (!command.enabled) {
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
     ledcWrite(pin_, 0);
+#else
+    ledcWrite(channel_, 0);
+#endif
     return;
   }
 
   const float clampedDuty = constrain(command.dutyPercent, 0.0f, 100.0f);
   const uint32_t dutyCount = static_cast<uint32_t>((clampedDuty / 100.0f) * static_cast<float>(maxDutyCount_));
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
   ledcWrite(pin_, dutyCount);
+#else
+  ledcWrite(channel_, dutyCount);
+#endif
 }
 
 void WarningOutput::begin(int pin, bool activeHigh) {
