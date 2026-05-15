@@ -92,3 +92,40 @@ bool FloatSensor::update() {
 }
 
 bool FloatSensor::isLow() const { return debouncedLow_; }
+
+void TempSensor::begin(int dataPin) {
+  pin_ = dataPin;
+  if (pin_ < 0) {
+    return;
+  }
+  wire_ = new OneWire(dataPin);
+  sensors_ = new DallasTemperature(wire_);
+  sensors_->begin();
+  sensors_->setWaitForConversion(false); // non-blocking conversions
+  valid_ = sensors_->getDeviceCount() > 0;
+}
+
+void TempSensor::requestConversion() {
+  if (!valid_) {
+    return;
+  }
+  sensors_->requestTemperatures();
+}
+
+void TempSensor::readResult() {
+  if (!valid_) {
+    return;
+  }
+  const float t = sensors_->getTempCByIndex(0);
+  if (t != DEVICE_DISCONNECTED_C) {
+    tempC_ = t;
+  } else {
+    valid_ = false;
+  }
+}
+
+float TempSensor::celsius() const { return tempC_; }
+
+float TempSensor::fahrenheit() const { return tempC_ * 9.0f / 5.0f + 32.0f; }
+
+bool TempSensor::valid() const { return valid_; }

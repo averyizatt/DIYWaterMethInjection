@@ -1,5 +1,7 @@
 #include <Arduino.h>
 #include <Preferences.h>
+#include <SPI.h>
+#include <mcp_can.h>
 #include <stdlib.h>
 
 #include "actuators.h"
@@ -14,13 +16,20 @@ TankBlend blend = computeTankBlend(1.5f, 0.5f);
 
 MapSensor mapSensor;
 FloatSensor floatSensor;
+TempSensor engineTempSensor;
+TempSensor ambientTempSensor;
 PumpDriver pumpDriver;
 WarningOutput warningOutput;
 InjectionController controller;
 Preferences preferences;
+MCP_CAN can(pins::CAN_CS);
 
+bool canAvailable = false;
 uint32_t lastLoopMs = 0;
 uint32_t lastDebugMs = 0;
+uint32_t lastTempRequestMs = 0;
+uint32_t lastCanMs = 0;
+bool tempConversionPending = false;
 FailsafeReason lastFailsafe = FailsafeReason::None;
 String serialLine;
 
@@ -118,6 +127,36 @@ void printSetupSummary() {
   Serial.print("  Meth%: ");
   Serial.println(blend.methPercent, 1);
   Serial.println("-------------------------------");
+}
+
+void sendCanFrames(const SensorReadings &sr, const ControlResult &cr) {
+  if (!canAvailable) {
+    return;
+  }
+
+  // Frame 0x100 — sensor data (all values scaled x10, signed 16-bit big-endian)
+  // Bytes 0-1: boost PSI x10  |  2-3: MAP kPa x10
+  // Bytes 4-5: engine bay °C x10  |  6-7: ambient °C x10
+  const int16_t boostX10 = static_cast<int16_t>(sr.boostPsi * 10.0f);
+  const int16_t mapX10 = static_cast<int16_t>(sr.mapKpa * 10.0f);
+  const int16_t engTX10 = static_cast<int16_t>(engineTempSensor.celsius() * 10.0f);
+  const int16_t ambTX10 = static_cast<int16_t>(ambientTempSensor.celsius() * 10.0f);
+  uint8_t sensorFrame[8] = {
+      static_cast<uint8_t>(boostX10 >> 8), static_cast<uint8_t>(boostX10 & 0xFF),
+      static_cast<uint8_t>(mapX10 >> 8),   static_cast<uint8_t>(mapX10 & 0xFF),
+      static_cast<uint8_t>(engTX10 >> 8),  static_cast<uint8_t>(engTX10 & 0xFF),
+      static_cast<uint8_t>(ambTX10 >> 8),  static_cast<uint8_t>(ambTX10 & 0xFF)};
+  can.sendMsgBuf(0x100, 0, 8, sensorFrame);
+
+  // Frame 0x101 — pump status
+  // Byte 0: duty % (0-100)  |  1: pump enabled  |  2: failsafe code  |  3: tank low
+  uint8_t pumpFrame[8] = {
+      static_cast<uint8_t>(cr.finalDutyPercent),
+      cr.pump.enabled ? 1u : 0u,
+      static_cast<uint8_t>(cr.failsafe),
+      sr.tankLow ? 1u : 0u,
+      0, 0, 0, 0};
+  can.sendMsgBuf(0x101, 0, 8, pumpFrame);
 }
 
 bool parsePositiveFloat(const String &token, float &valueOut) {
@@ -222,8 +261,26 @@ void setup() {
 
   mapSensor.begin(pins::MAP_SENSOR_ADC, config.map);
   floatSensor.begin(pins::FLOAT_SENSOR_DIGITAL, config.floatActiveLow, config.floatDebounceMs);
+  engineTempSensor.begin(pins::TEMP_ENGINE_BAY);
+  ambientTempSensor.begin(pins::TEMP_AMBIENT);
   pumpDriver.begin(pins::PUMP_PWM, config.pwmFrequencyHz, config.pwmResolutionBits);
   warningOutput.begin(pins::WARNING_LED, true);
+
+  // MCP2515 CAN bus — 500 kbps, 8 MHz oscillator (change MCP_8MHZ to MCP_16MHZ if your
+  // module has a 16 MHz crystal)
+  if (can.begin(MCP_ANY, CAN_500KBPS, MCP_8MHZ) == CAN_OK) {
+    can.setMode(MCP_NORMAL);
+    canAvailable = true;
+    Serial.println("CAN bus ready (500 kbps)");
+  } else {
+    Serial.println("WARNING: CAN bus init failed — check wiring/oscillator");
+  }
+
+  // Kick off the first temperature conversion
+  engineTempSensor.requestConversion();
+  ambientTempSensor.requestConversion();
+  lastTempRequestMs = millis();
+  tempConversionPending = true;
 
   printSetupSummary();
   printHelp();
@@ -238,12 +295,31 @@ void loop() {
   }
   lastLoopMs = now;
 
+  // Temperature: read result 800 ms after conversion request, then request again
+  if (tempConversionPending && elapsed(now, lastTempRequestMs, 800)) {
+    engineTempSensor.readResult();
+    ambientTempSensor.readResult();
+    tempConversionPending = false;
+  }
+  if (!tempConversionPending && elapsed(now, lastTempRequestMs, 1000)) {
+    engineTempSensor.requestConversion();
+    ambientTempSensor.requestConversion();
+    lastTempRequestMs = now;
+    tempConversionPending = true;
+  }
+
   SensorReadings readings = mapSensor.read();
   readings.tankLow = floatSensor.update();
 
   ControlResult result = controller.update(readings, config, blend);
   pumpDriver.apply(result.pump);
   warningOutput.set(result.failsafe != FailsafeReason::None);
+
+  // CAN bus — transmit at 100 ms interval
+  if (elapsed(now, lastCanMs, 100)) {
+    sendCanFrames(readings, result);
+    lastCanMs = now;
+  }
 
   if (result.failsafe != lastFailsafe) {
     Serial.print("Failsafe state changed: ");
@@ -275,5 +351,20 @@ void loop() {
   Serial.print(" pump=");
   Serial.print(result.pump.enabled ? "ON" : "OFF");
   Serial.print(" fs=");
-  Serial.println(failsafeName(result.failsafe));
+  Serial.print(failsafeName(result.failsafe));
+  Serial.print(" engT=");
+  if (engineTempSensor.valid()) {
+    Serial.print(engineTempSensor.celsius(), 1);
+    Serial.print("C");
+  } else {
+    Serial.print("NC");
+  }
+  Serial.print(" ambT=");
+  if (ambientTempSensor.valid()) {
+    Serial.print(ambientTempSensor.celsius(), 1);
+    Serial.print("C");
+  } else {
+    Serial.print("NC");
+  }
+  Serial.println();
 }
