@@ -24,7 +24,11 @@ void MapSensor::begin(int analogPin, const MapCalibration &calibration) {
   valid_ = pin_ >= 0 && calibration_.vMax > calibration_.vMin && calibration_.kpaMax > calibration_.kpaMin;
 
   if (pin_ >= 0) {
+    pinMode(pin_, INPUT);
     analogReadResolution(12);
+#if defined(ADC_11db)
+    analogSetPinAttenuation(pin_, ADC_11db);
+#endif
   }
 }
 
@@ -151,6 +155,9 @@ void ThermistorSensor::begin(const ThermistorConfig &config) {
 
   pinMode(config_.pin, INPUT);
   analogReadResolution(12);
+#if defined(ADC_11db)
+  analogSetPinAttenuation(config_.pin, ADC_11db);
+#endif
 }
 
 float ThermistorSensor::readVoltage() const {
@@ -241,6 +248,9 @@ void PressureSensor::begin(const PressureConfig &config) {
 
   pinMode(config_.pin, INPUT);
   analogReadResolution(12);
+#if defined(ADC_11db)
+  analogSetPinAttenuation(config_.pin, ADC_11db);
+#endif
 }
 
 float PressureSensor::readAdcNodeVoltage() const {

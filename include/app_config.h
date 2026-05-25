@@ -35,13 +35,47 @@ enum class KnockResponseMode : uint8_t {
 
 struct KnockConfig {
   bool enabled{true};
+  // Detection is only active when both arming conditions are met.
+  uint16_t minRpmToArm{0};
+  float minMapKpaToArm{120.0f};
+
+  // Front-end ADC sampling and analysis block sizing.
+  uint16_t sampleRateHz{8000};
+  uint8_t samplesPerUpdate{64};
+
+  // Knock band targeting. If autoCenterFromBore is true, centerFreqHz is
+  // estimated from bore and harmonic assumptions at runtime.
+  bool autoCenterFromBore{true};
+  float boreMm{96.0f};
+  float centerFreqHz{6500.0f};
+  float bandwidthHz{1800.0f};
+
+  // Sensor and DSP scaling.
+  float signalGain{1.0f};
+  float biasAlpha{0.002f};
+  float envelopeAlpha{0.20f};
+  float rmsAlpha{0.12f};
+
+  // Adjustable thresholding.
+  float thresholdOffset{8.0f};
   float boostEnableKpa{120.0f};
   float thresholdMultiplier{2.5f};
-  float thresholdOffset{8.0f};
+  bool baselineLearningEnabled{true};
+  float baselineLearnAlpha{0.02f};
+
+  // Event timing and severity integration.
   uint16_t eventCooldownMs{250};
   uint8_t warningThresholdCount{2};
   uint8_t criticalThresholdCount{4};
-  bool baselineLearningEnabled{true};
+
+  // Sensor sanity/fault detection controls.
+  uint16_t clipLowAdc{5};
+  uint16_t clipHighAdc{4090};
+  uint8_t clipPercentForFault{30};
+  uint16_t stuckAdcDelta{3};
+  uint16_t faultHoldMs{1200};
+  float missingSignalRms{0.8f};
+
   KnockResponseMode responseMode{KnockResponseMode::WarnOnly};
 };
 

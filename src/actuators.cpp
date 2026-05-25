@@ -10,10 +10,6 @@ void PumpDriver::begin(int pwmPin, uint16_t frequencyHz, uint8_t resolutionBits)
 
   resolutionBits_ = resolutionBits;
   maxDutyCount_ = (1UL << resolutionBits_) - 1UL;
-<<<<<<< HEAD
-  ledcAttach(pin_, frequencyHz, resolutionBits_);
-  ledcWrite(pin_, 0);
-=======
 
   // arduino-esp32 v3.x: ledcAttach(pin, freq, resolution)
   // arduino-esp32 v2.x: ledcSetup(channel, freq, resolution) + ledcAttachPin(pin, channel)
@@ -25,7 +21,6 @@ void PumpDriver::begin(int pwmPin, uint16_t frequencyHz, uint8_t resolutionBits)
   ledcAttachPin(pin_, channel_);
   ledcWrite(channel_, 0);
 #endif
->>>>>>> 9f85b5a265fae4c4b6d3167df006c2b6cc9d5f89
 }
 
 void PumpDriver::apply(const PumpCommand &command) {

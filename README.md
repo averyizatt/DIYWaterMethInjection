@@ -1,134 +1,138 @@
-# Water-Meth Controller Module
+# DIY Water/Meth Injection Controller
 
-This module runs the standalone water-meth controller firmware and publishes state over the shared CAN contract.
+Standalone Nano ESP32 firmware for a water/meth controller with:
 
-## Analog sensor support in-module
+- MCP2515 (SPI) CAN bus only
+- MAP/float/temperature/pressure analog sensing
+- Pump control and failsafe handling
+- Knock DSP detection with CAN telemetry hooks for a remote UI/main controller
 
-The analog thermistor and pressure support is implemented in this module (not in CCM runtime logic).
+## Hardware and firmware model
 
-### Thermistor channels (NTC, passive 2-wire)
+This device does not require a local display. Knock and system observability are exposed over CAN so a separate main controller can render UI and issue tuning commands.
 
-Implemented channels:
+## Sensors and control
 
-- IAT
-- Engine bay temperature
-- Cabin temperature
-- Ambient temperature
+Implemented analog channels:
 
-Wiring per channel:
+- MAP/boost sensor
+- IAT, engine bay, cabin, ambient thermistors
+- Oil/fuel/meth/boost-ref pressure transducers
+- Optional spare pressure channels
 
-```text
-3.3V -> 10k pullup -> ADC node -> NTC sensor -> GND
-```
+The firmware performs conversion, smoothing, and fault detection on all supported channels.
 
-The module performs:
+## CAN bus interface
 
-- oversampled ADC reads
-- voltage/resistance conversion
-- Steinhart-Hart temperature conversion
-- smoothing filter
-- open/short/out-of-range fault detection
+Existing controller frames:
 
-### Pressure channels (3-wire transducers)
+- `0x300` `ID_ENGINE_METH_STATE`
+- `0x303` `ID_ENGINE_SENSOR_EXT`
+- `0x307` `ID_ENGINE_KNOCK_STATE`
+- `0x308` `ID_ENGINE_KNOCK_FAULT`
 
-Implemented channels:
+Added knock UI hook frames for remote display/debug:
 
-- Oil pressure
-- Fuel pressure
-- Meth pressure
-- Boost reference pressure
-- Spare pressure 1
-- Spare pressure 2
+- `0x30B` knock live hook frame
+- `0x30C` knock config page 1
+- `0x30D` knock config page 2
 
-Sensor output scaling:
+`0x30B` payload:
 
-```text
-Sensor OUT -> 220R protection -> 10k -> ADC node -> 20k -> GND
-```
+- `B0` flags: bit0 enabled, bit1 armed, bit2 detected, bit3 sensorFault, bit4 clipping, bit5 warning, bit6 critical, bit7 baselineLearned
+- `B1` live knock RMS
+- `B2` adaptive threshold
+- `B3` adaptive baseline
+- `B4` event count
+- `B5` bias ADC (scaled /16)
+- `B6` raw ADC (scaled /16)
+- `B7` envelope level
 
-The module performs:
+`0x30C` payload:
 
-- ADC node voltage read + reconstruction of sensor output voltage
-- configurable 0.5V–4.5V transfer conversion to PSI
-- optional calibration scale/offset
-- smoothing and fault detection
+- `B0` config flags: bit0 enabled, bit1 autoCenterFromBore
+- `B1` threshold offset
+- `B2` adaptive multiplier x10
+- `B3` min RPM /100
+- `B4` min MAP kPa
+- `B5` debounce ms /10
+- `B6` gain x10
+- `B7` center frequency /100 Hz
 
-## CAN telemetry
+`0x30D` payload:
 
-- `0x300` (`ID_ENGINE_METH_STATE`) now publishes real IAT and engine-bay temperature values.
-- `0x303` (`ID_ENGINE_SENSOR_EXT`) publishes pressure channels plus ambient/cabin temperatures and analog fault flags.
-- `0x307` (`ID_ENGINE_KNOCK_STATE`) publishes knock status, energy/baseline/threshold, and rolling event counters.
-- `0x308` (`ID_ENGINE_KNOCK_FAULT`) publishes knock warning/critical and sensor health faults.
+- `B0` bandwidth /100 Hz
+- `B1` sample rate /100 Hz
+- `B2` samples per update
+- `B3` bias alpha x1000
+- `B4` RMS alpha x100
+- `B5` envelope alpha x100
+- `B6` bore mm
+- `B7` reserved
 
-## Nano ESP32 pinout used by this firmware
+Knock tuning commands are accepted on `ID_ENGINE_METH_COMMAND` (`0x301`) with these command bytes:
 
-Source of truth: `modules/water-meth/include/pins.h`
+- `0x40` set enable (`B1`: 0/1)
+- `0x41` set threshold offset (`B1`)
+- `0x42` set adaptive multiplier x10 (`B1`)
+- `0x43` set minimum RPM /100 (`B1`)
+- `0x44` set minimum MAP/boost kPa (`B1`)
+- `0x45` set debounce ms /10 (`B1`)
+- `0x46` set gain x10 (`B1`)
+- `0x47` set center frequency /100 Hz (`B1`)
+- `0x48` set bandwidth /100 Hz (`B1`)
+- `0x49` set auto frequency from bore (`B1`: 0/1)
+- `0x4A` clear knock events/fault latch
 
-| Function | Pin |
-| --- | --- |
-| MAP / boost sensor ADC | A0 |
-| Knock sensor ADC | A1 |
-| Float switch digital | D3 |
-| Pump PWM output | D2 |
-| Warning LED output | GPIO17 |
-| Native TWAI TX | D5 |
-| Native TWAI RX | D6 |
-| IAT thermistor | D4 |
-| DHT11 input | D6 |
-| Engine bay thermistor | GPIO8 |
-| Cabin thermistor | GPIO9 |
-| Ambient thermistor | GPIO10 |
-| Oil pressure ADC | A4 |
-| Fuel pressure ADC | A5 |
-| Meth / BoostRef / Spare1 / Spare2 pressure ADC | GPIO13 / GPIO14 / GPIO15 / GPIO16 |
+## Knock DSP pipeline
 
-### MCP2515 SPI wiring note
+The knock subsystem is modular and runs as:
 
-If using an SPI CAN module instead of native TWAI, use the Nano ESP32 hardware SPI bus (this is a mutually-exclusive wiring profile with the default GPIO8 sensor usage):
+- high-rate ADC block capture
+- bias removal
+- biquad bandpass filtering
+- rectified envelope plus RMS-like energy
+- adaptive threshold (`threshold = baseline * multiplier + offset`)
+- RPM/MAP arming gates
+- debounce/event window logic
+- clipping/missing/stuck sensor fault detection
 
-- MOSI = D11
-- MISO = D12
-- SCK = D13
-- CS / INT default to D10 and D7 in this module
-- RST can be assigned to any free GPIO if used
+## Serial (optional)
 
-The default pin map uses CS=D10, INT=D7, level switch=D3, pump PWM=D2, knock=A1, and IAT=D4.
-Native TWAI RX (D6) and DHT11 (D6) share a pin in this mapping, so they are mutually exclusive unless you remap one.
+Serial knock commands are still available for bench bring-up, but the intended production path is CAN-based hooks and commands.
 
-## Knock subsystem in-module
+## Unit tests
 
-Knock detection now runs entirely in this firmware:
+Host-side unit tests were added for knock detector logic in [test/knock_detector/test_knock_detector.cpp](test/knock_detector/test_knock_detector.cpp), covering:
 
-- ADC sampling + centered absolute energy computation
-- adaptive baseline + dynamic threshold (`multiplier * baseline + offset`)
-- warning/critical event windows with cooldown
-- sensor health checks (low activity/disconnect + clipping)
-- response modes:
-  - `LOG` (telemetry/fault reporting only)
-  - `WARN` (currently same runtime behavior as LOG, reserved for stricter warning-only policy)
-  - `FORCE` (force minimum spray on critical knock)
-  - `SHUTDOWN` (force pump off on critical knock)
+- no signal
+- normal vibration below threshold
+- random noise
+- true knock burst at target frequency
+- wrong-frequency burst rejection
+- changing bias
+- knock below RPM/MAP arm threshold
+- knock while armed
 
-### Serial commands for knock tuning
-
-- `KNOCK SHOW`
-- `KNOCK ENABLE 0|1`
-- `KNOCK BOOSTKPA <kpa>`
-- `KNOCK MULT <value>`
-- `KNOCK OFFSET <value>`
-- `KNOCK MODE LOG|WARN|FORCE|SHUTDOWN`
-- `KNOCK RESET`
-
-### Optional/unsupported sensors
-
-- If a pressure channel is physically unwired, leave it disabled in firmware config to avoid persistent fault bits.
-- MAP/boost control uses the dedicated MAP ADC (`GPIO1 / A0`); the boost-reference pressure channel remains optional telemetry.
-
-## Build
-
-Build this module independently with PlatformIO from this directory:
+Run tests:
 
 ```bash
-cd modules/water-meth
-pio run -e arduino_nano_esp32
+platformio test -e native_knock_tests
+```
+
+## Knock tuning workflow
+
+Use this sequence when calibrating a new engine/setup:
+
+1. Log normal engine noise with no knock.
+2. Find the baseline envelope/RMS level in your operating range.
+3. Set threshold above baseline.
+4. Test under different RPM and load ranges.
+5. Adjust center frequency and bandwidth until true knock is captured while false positives are minimized.
+
+## Build and upload
+
+```bash
+platformio run -e arduino_nano_esp32
+platformio run -e arduino_nano_esp32 -t upload
 ```
