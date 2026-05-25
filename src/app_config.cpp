@@ -47,5 +47,15 @@ AppConfig defaultConfig() {
   config.debugPeriodMs = 250;
   config.loopPeriodMs = 20;
 
+  config.knock.enabled = true;
+  config.knock.boostEnableKpa = 120.0f;
+  config.knock.thresholdMultiplier = 2.5f;
+  config.knock.thresholdOffset = 8.0f;
+  config.knock.eventCooldownMs = 250;
+  config.knock.warningThresholdCount = 2;
+  config.knock.criticalThresholdCount = 4;
+  config.knock.baselineLearningEnabled = true;
+  config.knock.responseMode = KnockResponseMode::WarnOnly;
+
   return config;
 }

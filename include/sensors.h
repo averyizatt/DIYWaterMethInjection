@@ -11,6 +11,27 @@ struct SensorReadings {
   float boostPsi{0.0f};
   bool mapValid{false};
   bool tankLow{true};
+  float iatC{0.0f};
+  float engineBayC{0.0f};
+  float cabinC{0.0f};
+  float ambientC{0.0f};
+  float oilPressurePsi{0.0f};
+  float fuelPressurePsi{0.0f};
+  float methPressurePsi{0.0f};
+  float boostRefPressurePsi{0.0f};
+  float sparePressure1Psi{0.0f};
+  float sparePressure2Psi{0.0f};
+  bool iatValid{false};
+  bool engineBayValid{false};
+  bool cabinValid{false};
+  bool ambientValid{false};
+  bool oilPressureValid{false};
+  bool fuelPressureValid{false};
+  bool methPressureValid{false};
+  bool boostRefPressureValid{false};
+  bool sparePressure1Valid{false};
+  bool sparePressure2Valid{false};
+  uint16_t analogFaultFlags{0};
 };
 
 class MapSensor {
@@ -62,4 +83,106 @@ private:
   DallasTemperature *sensors_{nullptr};
   float tempC_{-127.0f};
   bool valid_{false};
+};
+
+enum class ThermistorFault : uint8_t {
+  None = 0,
+  Disabled = 1,
+  OpenCircuit = 2,
+  ShortToGround = 3,
+  OutOfRange = 4,
+  InvalidConfig = 5,
+  StaleReading = 6,
+  AdcError = 7,
+};
+
+struct ThermistorConfig {
+  bool enabled{false};
+  int pin{-1};
+  float pullupOhms{10000.0f};
+  float adcVref{3.3f};
+  uint16_t adcMaxCount{4095};
+  uint8_t oversampleCount{8};
+  float filterAlpha{0.20f};
+  uint16_t staleTimeoutMs{1000};
+  float minValidTempC{-50.0f};
+  float maxValidTempC{180.0f};
+  float openCircuitThresholdV{3.15f};
+  float shortThresholdV{0.08f};
+  float steinhartA{1.129148e-3f};
+  float steinhartB{2.34125e-4f};
+  float steinhartC{8.76741e-8f};
+};
+
+class ThermistorSensor {
+public:
+  void begin(const ThermistorConfig &config);
+  void update(uint32_t nowMs);
+  float valueC() const { return filteredTempC_; }
+  bool valid() const { return valid_; }
+  ThermistorFault fault() const { return fault_; }
+  const ThermistorConfig &config() const { return config_; }
+
+private:
+  float readVoltage() const;
+
+  ThermistorConfig config_{};
+  float filteredTempC_{NAN};
+  float rawVoltage_{0.0f};
+  bool valid_{false};
+  ThermistorFault fault_{ThermistorFault::Disabled};
+  uint32_t lastUpdateMs_{0};
+};
+
+enum class PressureFault : uint8_t {
+  None = 0,
+  Disabled = 1,
+  OpenCircuit = 2,
+  ShortToGround = 3,
+  OutOfRange = 4,
+  InvalidConfig = 5,
+  StaleReading = 6,
+  AdcError = 7,
+};
+
+struct PressureConfig {
+  bool enabled{false};
+  int pin{-1};
+  float adcVref{3.3f};
+  uint16_t adcMaxCount{4095};
+  uint8_t oversampleCount{8};
+  float filterAlpha{0.20f};
+  uint16_t staleTimeoutMs{1000};
+  float dividerTopOhms{10000.0f};
+  float dividerBottomOhms{20000.0f};
+  float sensorMinV{0.5f};
+  float sensorMaxV{4.5f};
+  float pressureMinPsi{0.0f};
+  float pressureMaxPsi{100.0f};
+  float calibrationScale{1.0f};
+  float calibrationOffsetPsi{0.0f};
+  float openCircuitThresholdV{4.9f};
+  float shortThresholdV{0.1f};
+  float minValidPsi{-5.0f};
+  float maxValidPsi{300.0f};
+};
+
+class PressureSensor {
+public:
+  void begin(const PressureConfig &config);
+  void update(uint32_t nowMs);
+  float valuePsi() const { return filteredPsi_; }
+  bool valid() const { return valid_; }
+  PressureFault fault() const { return fault_; }
+  const PressureConfig &config() const { return config_; }
+
+private:
+  float readAdcNodeVoltage() const;
+
+  PressureConfig config_{};
+  float filteredPsi_{NAN};
+  float sensorVoltage_{0.0f};
+  bool valid_{false};
+  PressureFault fault_{PressureFault::Disabled};
+  uint32_t lastUpdateMs_{0};
 };

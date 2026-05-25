@@ -2,6 +2,7 @@
 
 #include <stdint.h>
 #include "app_config.h"
+#include "can_contract/can_protocol.h"
 #include "injection_controller.h"
 #include "sensors.h"
 
@@ -40,6 +41,8 @@ public:
 
   // Transmit a fault frame immediately.
   void sendFault(uint8_t code, uint8_t severity, uint8_t data0, uint8_t data1);
+  void sendKnockStateIfDue(const can_protocol::EngineKnockState& state, uint32_t nowMs);
+  void sendKnockFault(uint8_t code, uint8_t severity, uint8_t data0, uint8_t data1);
 
   // ---------- command outputs read by main loop ----------
   bool isArmed() const { return armed_; }

@@ -26,6 +26,25 @@ struct BoostThresholdsPsi {
   float fullPsi{7.5f};
 };
 
+enum class KnockResponseMode : uint8_t {
+  LogOnly = 0,
+  WarnOnly = 1,
+  ForceSpray = 2,
+  SafetyShutdown = 3,
+};
+
+struct KnockConfig {
+  bool enabled{true};
+  float boostEnableKpa{120.0f};
+  float thresholdMultiplier{2.5f};
+  float thresholdOffset{8.0f};
+  uint16_t eventCooldownMs{250};
+  uint8_t warningThresholdCount{2};
+  uint8_t criticalThresholdCount{4};
+  bool baselineLearningEnabled{true};
+  KnockResponseMode responseMode{KnockResponseMode::WarnOnly};
+};
+
 struct TankBlend {
   float waterLiters{1.5f};
   float methLiters{0.5f};
@@ -61,6 +80,8 @@ struct AppConfig {
   uint32_t serialBaud{115200};
   uint32_t debugPeriodMs{250};
   uint32_t loopPeriodMs{20};
+
+  KnockConfig knock{};
 };
 
 AppConfig defaultConfig();

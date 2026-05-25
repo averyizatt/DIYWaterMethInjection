@@ -13,6 +13,7 @@
 namespace {
 // State TX period: 50 ms per shared contract (ID_ENGINE_METH_STATE).
 constexpr uint32_t kStateTxIntervalMs = 50;
+constexpr uint32_t kSensorExtTxIntervalMs = 250;
 // If no frame from master in 3 seconds, report master as timed out.
 constexpr uint32_t kMasterTimeoutMs = 3000;
 
@@ -188,11 +189,33 @@ void CanBridge::sendStateIfDue(const SensorReadings& readings,
   tx.data[2] = tankLevel;
   tx.data[3] = flowStatus;
   tx.data[4] = boostKpa;
-  tx.data[5] = can_protocol::tempToOffset40(0);  // IAT: not sensed; transmit 0 °C placeholder
-  tx.data[6] = can_protocol::tempToOffset40(static_cast<int>(temperatureRead()));  // on-die temp
+  tx.data[5] = can_protocol::tempToOffset40(static_cast<int>(readings.iatC));
+  tx.data[6] = can_protocol::tempToOffset40(static_cast<int>(readings.engineBayC));
   tx.data[7] = faultFlags;
 
   twai_transmit(&tx, 0);
+
+  static uint32_t lastSensorExtTxMs = 0;
+  if ((nowMs - lastSensorExtTxMs) >= kSensorExtTxIntervalMs) {
+    can_protocol::EngineSensorExt ext{};
+    ext.oil_pressure_psi = can_protocol::clampU8(static_cast<int>(readings.oilPressurePsi));
+    ext.fuel_pressure_psi = can_protocol::clampU8(static_cast<int>(readings.fuelPressurePsi));
+    ext.meth_pressure_psi = can_protocol::clampU8(static_cast<int>(readings.methPressurePsi));
+    ext.boost_ref_pressure_psi = can_protocol::clampU8(static_cast<int>(readings.boostRefPressurePsi));
+    ext.ambient_temp_c = static_cast<int8_t>(readings.ambientC);
+    ext.cabin_temp_c = static_cast<int8_t>(readings.cabinC);
+    ext.analog_fault_flags = readings.analogFaultFlags;
+    const can_protocol::CanFrame frame = can_protocol::packEngineSensorExt(ext);
+
+    twai_message_t extTx{};
+    extTx.identifier = frame.id;
+    extTx.extd = 0;
+    extTx.rtr = 0;
+    extTx.data_length_code = frame.dlc;
+    for (uint8_t i = 0; i < frame.dlc; ++i) extTx.data[i] = frame.data[i];
+    twai_transmit(&extTx, 0);
+    lastSensorExtTxMs = nowMs;
+  }
 #else
   (void)readings;
   (void)result;
@@ -213,6 +236,46 @@ void CanBridge::sendFault(uint8_t code, uint8_t severity, uint8_t data0, uint8_t
   tx.data[1] = severity;
   tx.data[2] = data0;
   tx.data[3] = data1;
+  twai_transmit(&tx, 0);
+#else
+  (void)code;
+  (void)severity;
+  (void)data0;
+  (void)data1;
+#endif
+}
+
+void CanBridge::sendKnockStateIfDue(const can_protocol::EngineKnockState& state, uint32_t nowMs) {
+#if WMETH_HAS_TWAI
+  if (!twaiReady_) return;
+  static uint32_t lastKnockTxMs = 0;
+  if ((nowMs - lastKnockTxMs) < kStateTxIntervalMs) return;
+  lastKnockTxMs = nowMs;
+
+  const can_protocol::CanFrame frame = can_protocol::packEngineKnockState(state);
+  twai_message_t tx{};
+  tx.identifier = frame.id;
+  tx.extd = 0;
+  tx.rtr = 0;
+  tx.data_length_code = frame.dlc;
+  for (uint8_t i = 0; i < frame.dlc; ++i) tx.data[i] = frame.data[i];
+  twai_transmit(&tx, 0);
+#else
+  (void)state;
+  (void)nowMs;
+#endif
+}
+
+void CanBridge::sendKnockFault(uint8_t code, uint8_t severity, uint8_t data0, uint8_t data1) {
+#if WMETH_HAS_TWAI
+  if (!twaiReady_) return;
+  const can_protocol::CanFrame frame = can_protocol::packEngineKnockFault(code, severity, data0, data1);
+  twai_message_t tx{};
+  tx.identifier = frame.id;
+  tx.extd = 0;
+  tx.rtr = 0;
+  tx.data_length_code = frame.dlc;
+  for (uint8_t i = 0; i < frame.dlc; ++i) tx.data[i] = frame.data[i];
   twai_transmit(&tx, 0);
 #else
   (void)code;
