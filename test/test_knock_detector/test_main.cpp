@@ -8,10 +8,6 @@
 namespace {
 constexpr float kPi = 3.14159265358979323846f;
 
-bool approxLess(float value, float limit) {
-  return value < limit;
-}
-
 void fillConstant(uint16_t *buffer, uint8_t count, uint16_t value) {
   for (uint8_t i = 0; i < count; ++i) {
     buffer[i] = value;
@@ -93,7 +89,6 @@ bool normalVibrationBelowThreshold_noEvents() {
   uint16_t samples[64];
   uint32_t now = 0;
 
-  // Learn baseline unarmed.
   for (int i = 0; i < 30; ++i) {
     now += 20;
     fillSine(samples, 64, cfg.sampleRateHz, 3200.0f, 8.0f, static_cast<float>(i));
