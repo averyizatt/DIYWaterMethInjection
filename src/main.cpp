@@ -1,10 +1,9 @@
-#include <Arduino.h>
+﻿#include <Arduino.h>
 #include <Preferences.h>
 #include <stdlib.h>
 
 #include "actuators.h"
 #include "app_config.h"
-#include "can_bridge.h"
 #include "injection_controller.h"
 #include "knock_monitor.h"
 #include "pins.h"
@@ -30,14 +29,16 @@ PressureSensor sparePressure2;
 PumpDriver pumpDriver;
 WarningOutput warningOutput;
 InjectionController controller;
+<<<<<<< HEAD
 CanBridge canBridge;
 KnockMonitor knockMonitor;
+=======
+>>>>>>> 9f85b5a265fae4c4b6d3167df006c2b6cc9d5f89
 Preferences preferences;
 
 uint32_t lastLoopMs = 0;
 uint32_t lastDebugMs = 0;
 FailsafeReason lastFailsafe = FailsafeReason::None;
-FailsafeReason lastReportedCanFault = FailsafeReason::None;
 String serialLine;
 
 constexpr char kPrefsNamespace[] = "wmix";
@@ -86,41 +87,58 @@ void printHelp() {
 
 const char *modeName(InjectionMode mode) {
   switch (mode) {
+<<<<<<< HEAD
   case InjectionMode::Off: return "OFF";
   case InjectionMode::BoostOnly: return "BOOST";
   case InjectionMode::Prime: return "PRIME";
   default: return "UNKNOWN";
+=======
+  case InjectionMode::Off:    return "OFF";
+  case InjectionMode::BoostOnly: return "BOOST";
+  case InjectionMode::Prime:  return "PRIME";
+  default:                    return "UNKNOWN";
+>>>>>>> 9f85b5a265fae4c4b6d3167df006c2b6cc9d5f89
   }
 }
 
 const char *failsafeName(FailsafeReason reason) {
   switch (reason) {
+<<<<<<< HEAD
   case FailsafeReason::None: return "NONE";
   case FailsafeReason::LowFluid: return "LOW_FLUID";
   case FailsafeReason::MapInvalid: return "MAP_INVALID";
   case FailsafeReason::InvalidBlend: return "INVALID_BLEND";
   case FailsafeReason::InvalidBoostConfig: return "INVALID_BOOST_CONFIG";
   default: return "UNKNOWN";
+=======
+  case FailsafeReason::None:                return "NONE";
+  case FailsafeReason::LowFluid:            return "LOW_FLUID";
+  case FailsafeReason::MapInvalid:          return "MAP_INVALID";
+  case FailsafeReason::InvalidBlend:        return "INVALID_BLEND";
+  case FailsafeReason::InvalidBoostConfig:  return "INVALID_BOOST_CONFIG";
+  default:                                  return "UNKNOWN";
+>>>>>>> 9f85b5a265fae4c4b6d3167df006c2b6cc9d5f89
   }
 }
 
 void saveBlend() {
   if (!preferences.begin(kPrefsNamespace, false)) return;
   preferences.putFloat(kPrefsKeyWater, blend.waterLiters);
-  preferences.putFloat(kPrefsKeyMeth, blend.methLiters);
+  preferences.putFloat(kPrefsKeyMeth,  blend.methLiters);
   preferences.end();
 }
 
 void loadBlend() {
   if (!preferences.begin(kPrefsNamespace, true)) return;
   const float water = preferences.getFloat(kPrefsKeyWater, blend.waterLiters);
-  const float meth = preferences.getFloat(kPrefsKeyMeth, blend.methLiters);
+  const float meth  = preferences.getFloat(kPrefsKeyMeth,  blend.methLiters);
   preferences.end();
   blend = computeTankBlend(water, meth);
 }
 
 void printSetupSummary() {
   Serial.println("---- Water/Meth Controller ----");
+<<<<<<< HEAD
   Serial.print("Mode: "); Serial.println(modeName(config.mode));
   Serial.print("MAP calibration (V): ");
   Serial.print(config.map.vMin, 2); Serial.print(" to "); Serial.print(config.map.vMax, 2);
@@ -333,20 +351,83 @@ void parseCommand(const String &line) {
       saveBlend();
       Serial.print("Water updated. Meth% = "); Serial.println(blend.methPercent, 1);
     } else Serial.println("Invalid WATER value.");
+=======
+  Serial.print("Mode: ");         Serial.println(modeName(config.mode));
+  Serial.print("MAP (V): ");      Serial.print(config.map.vMin, 2);
+  Serial.print(" to ");           Serial.print(config.map.vMax, 2);
+  Serial.print(" -> (kPa): ");    Serial.print(config.map.kpaMin, 1);
+  Serial.print(" to ");           Serial.println(config.map.kpaMax, 1);
+  Serial.print("Boost (psi): ");  Serial.print(config.boost.startPsi, 1);
+  Serial.print(" / ");            Serial.println(config.boost.fullPsi, 1);
+  Serial.print("K gain: ");       Serial.println(config.gainK, 2);
+  Serial.print("Blend (L): ");    Serial.print(blend.waterLiters, 2);
+  Serial.print(" / ");            Serial.print(blend.methLiters, 2);
+  Serial.print("  Meth%: ");      Serial.println(blend.methPercent, 1);
+  Serial.println("-------------------------------");
+}
+
+void sendCanFrames(const SensorReadings &sr, const ControlResult &cr) {
+  if (!canAvailable) return;
+  const int16_t boostX10 = static_cast<int16_t>(sr.boostPsi * 10.0f);
+  const int16_t mapX10   = static_cast<int16_t>(sr.mapKpa   * 10.0f);
+  const int16_t engTX10  = static_cast<int16_t>(engineTempSensor.celsius()  * 10.0f);
+  const int16_t ambTX10  = static_cast<int16_t>(ambientTempSensor.celsius() * 10.0f);
+  uint8_t sf[8] = {
+    static_cast<uint8_t>(boostX10>>8), static_cast<uint8_t>(boostX10&0xFF),
+    static_cast<uint8_t>(mapX10>>8),   static_cast<uint8_t>(mapX10&0xFF),
+    static_cast<uint8_t>(engTX10>>8),  static_cast<uint8_t>(engTX10&0xFF),
+    static_cast<uint8_t>(ambTX10>>8),  static_cast<uint8_t>(ambTX10&0xFF)};
+  can.sendMsgBuf(0x100, 0, 8, sf);
+  uint8_t pf[8] = {
+    static_cast<uint8_t>(cr.finalDutyPercent),
+    cr.pump.enabled ? 1u : 0u,
+    static_cast<uint8_t>(cr.failsafe),
+    sr.tankLow ? 1u : 0u,
+    0,0,0,0};
+  can.sendMsgBuf(0x101, 0, 8, pf);
+}
+
+bool parsePositiveFloat(const String &token, float &out) {
+  char buf[32]; token.toCharArray(buf, sizeof(buf));
+  char *end = nullptr;
+  const float v = strtof(buf, &end);
+  if (end == buf) return false;
+  out = v; return true;
+}
+
+void parseCommand(const String &line) {
+  String cmd = line; cmd.trim();
+  if (cmd.length() == 0) return;
+  if (cmd.equalsIgnoreCase("HELP"))  { printHelp();        return; }
+  if (cmd.equalsIgnoreCase("SHOW"))  { printSetupSummary(); return; }
+  if (cmd.startsWith("WATER ") || cmd.startsWith("water ")) {
+    float v = 0.0f;
+    if (parsePositiveFloat(cmd.substring(6), v) && v >= 0.0f) {
+      blend = computeTankBlend(v, blend.methLiters); saveBlend();
+      Serial.print("Water updated. Meth% = "); Serial.println(blend.methPercent,1);
+    } else { Serial.println("Invalid WATER value."); }
+>>>>>>> 9f85b5a265fae4c4b6d3167df006c2b6cc9d5f89
     return;
   }
-
   if (cmd.startsWith("METH ") || cmd.startsWith("meth ")) {
+<<<<<<< HEAD
     float value = 0.0f;
     if (parsePositiveFloat(cmd.substring(5), value) && value >= 0.0f) {
       blend = computeTankBlend(blend.waterLiters, value);
       saveBlend();
       Serial.print("Meth updated. Meth% = "); Serial.println(blend.methPercent, 1);
     } else Serial.println("Invalid METH value.");
+=======
+    float v = 0.0f;
+    if (parsePositiveFloat(cmd.substring(5), v) && v >= 0.0f) {
+      blend = computeTankBlend(blend.waterLiters, v); saveBlend();
+      Serial.print("Meth updated. Meth% = "); Serial.println(blend.methPercent,1);
+    } else { Serial.println("Invalid METH value."); }
+>>>>>>> 9f85b5a265fae4c4b6d3167df006c2b6cc9d5f89
     return;
   }
-
   if (cmd.startsWith("MODE ") || cmd.startsWith("mode ")) {
+<<<<<<< HEAD
     const String value = cmd.substring(5);
     if (value.equalsIgnoreCase("OFF")) config.mode = InjectionMode::Off;
     else if (value.equalsIgnoreCase("BOOST")) config.mode = InjectionMode::BoostOnly;
@@ -425,9 +506,16 @@ void parseCommand(const String &line) {
   if (cmdUpper == "KNOCK RESET") {
     knockMonitor.clearFaults();
     Serial.println("Knock event counters and faults cleared.");
+=======
+    const String val = cmd.substring(5);
+    if      (val.equalsIgnoreCase("OFF"))   config.mode = InjectionMode::Off;
+    else if (val.equalsIgnoreCase("BOOST")) config.mode = InjectionMode::BoostOnly;
+    else if (val.equalsIgnoreCase("PRIME")) config.mode = InjectionMode::Prime;
+    else { Serial.println("Invalid MODE. Use OFF|BOOST|PRIME"); return; }
+    Serial.print("Mode set to "); Serial.println(modeName(config.mode));
+>>>>>>> 9f85b5a265fae4c4b6d3167df006c2b6cc9d5f89
     return;
   }
-
   Serial.println("Unknown command. Type HELP.");
 }
 
@@ -435,11 +523,15 @@ void handleSerialCommands() {
   while (Serial.available() > 0) {
     const char c = static_cast<char>(Serial.read());
     if (c == '\r') continue;
+<<<<<<< HEAD
     if (c == '\n') {
       parseCommand(serialLine);
       serialLine = "";
       continue;
     }
+=======
+    if (c == '\n') { parseCommand(serialLine); serialLine = ""; continue; }
+>>>>>>> 9f85b5a265fae4c4b6d3167df006c2b6cc9d5f89
     if (serialLine.length() < 120) serialLine += c;
   }
 }
@@ -448,7 +540,6 @@ void handleSerialCommands() {
 void setup() {
   Serial.begin(config.serialBaud);
   delay(200);
-
   loadBlend();
   mapSensor.begin(pins::MAP_SENSOR_ADC, config.map);
   floatSensor.begin(pins::FLOAT_SENSOR_DIGITAL, config.floatActiveLow, config.floatDebounceMs);
@@ -457,12 +548,29 @@ void setup() {
   pumpDriver.begin(pins::PUMP_PWM, config.pwmFrequencyHz, config.pwmResolutionBits);
   warningOutput.begin(pins::WARNING_LED, true);
 
+<<<<<<< HEAD
   if (canBridge.begin(pins::CAN_TX, pins::CAN_RX)) {
     Serial.println("CAN: online");
   } else {
     Serial.println("CAN: TWAI init failed — running serial-only");
   }
 
+=======
+  if (can.begin(MCP_ANY, CAN_500KBPS, MCP_8MHZ) == CAN_OK) {
+    can.setMode(MCP_NORMAL);
+    pinMode(pins::CAN_INT, INPUT); // MCP2515 pulls LOW when a frame is waiting
+    canAvailable = true;
+    Serial.println("CAN bus ready (500 kbps)");
+  } else {
+    Serial.println("CAN bus not present -- running without it");
+  }
+
+  engineTempSensor.requestConversion();
+  ambientTempSensor.requestConversion();
+  lastTempRequestMs = millis();
+  tempConversionPending = true;
+
+>>>>>>> 9f85b5a265fae4c4b6d3167df006c2b6cc9d5f89
   printSetupSummary();
   printHelp();
 }
@@ -473,6 +581,7 @@ void loop() {
   if (!elapsed(now, lastLoopMs, config.loopPeriodMs)) return;
   lastLoopMs = now;
 
+<<<<<<< HEAD
   canBridge.poll();
 
   if (canBridge.hasRemoteRatio()) {
@@ -484,6 +593,18 @@ void loop() {
     lastFailsafe = FailsafeReason::None;
     lastReportedCanFault = FailsafeReason::None;
     canBridge.clearFaultsRequest();
+=======
+  if (tempConversionPending && elapsed(now, lastTempRequestMs, 800)) {
+    engineTempSensor.readResult();
+    ambientTempSensor.readResult();
+    tempConversionPending = false;
+  }
+  if (!tempConversionPending && elapsed(now, lastTempRequestMs, 1000)) {
+    engineTempSensor.requestConversion();
+    ambientTempSensor.requestConversion();
+    lastTempRequestMs = now;
+    tempConversionPending = true;
+>>>>>>> 9f85b5a265fae4c4b6d3167df006c2b6cc9d5f89
   }
 
   SensorReadings readings = mapSensor.read();
@@ -493,6 +614,7 @@ void loop() {
   // Standalone water-meth module currently has no RPM input path, so RPM is reported as 0.
   const KnockStateSnapshot knockState = knockMonitor.update(readings.mapKpa, 0, now);
 
+<<<<<<< HEAD
   AppConfig effectiveConfig = config;
   if (!canBridge.isArmed() && canBridge.isOnline()) effectiveConfig.mode = InjectionMode::Off;
 
@@ -562,6 +684,39 @@ void loop() {
   if (knockMonitor.consumeFault(knockFault)) {
     canBridge.sendKnockFault(knockFault.code, knockFault.severity,
                              knockFault.data0, knockFault.data1);
+=======
+  ControlResult result = controller.update(readings, config, blend);
+  pumpDriver.apply(result.pump);
+  warningOutput.set(result.failsafe != FailsafeReason::None);
+
+  if (elapsed(now, lastCanMs, 100)) {
+    sendCanFrames(readings, result);
+    lastCanMs = now;
+  }
+
+  // CAN receive -- drain all waiting frames (INT pin pulled LOW by MCP2515 when frame pending).
+  if (canAvailable) {
+    while (digitalRead(pins::CAN_INT) == LOW) {
+      unsigned long rxId;
+      uint8_t       rxLen;
+      uint8_t  rxBuf[8];
+      if (can.readMsgBuf(&rxId, &rxLen, rxBuf) == CAN_OK) {
+        Serial.print("CAN RX id=0x");
+        Serial.print(rxId, HEX);
+        Serial.print(" len=");
+        Serial.print(rxLen);
+        Serial.print(" data=");
+        for (uint8_t i = 0; i < rxLen; i++) {
+          if (rxBuf[i] < 0x10) Serial.print('0');
+          Serial.print(rxBuf[i], HEX);
+          Serial.print(' ');
+        }
+        Serial.println();
+      } else {
+        break; // read error, stop draining
+      }
+    }
+>>>>>>> 9f85b5a265fae4c4b6d3167df006c2b6cc9d5f89
   }
 
   if (result.failsafe != lastFailsafe) {
@@ -570,6 +725,7 @@ void loop() {
     lastFailsafe = result.failsafe;
   }
 
+<<<<<<< HEAD
   canBridge.sendStateIfDue(readings, result, effectiveConfig, now);
 
   if (!elapsed(now, lastDebugMs, config.debugPeriodMs)) return;
@@ -592,5 +748,25 @@ void loop() {
   Serial.print(knockState.warningActive ? "1" : "0");
   Serial.print(knockState.criticalActive ? "1" : "0");
   Serial.print(" analogFault=0x"); Serial.print(readings.analogFaultFlags, HEX);
+=======
+  if (!elapsed(now, lastDebugMs, config.debugPeriodMs)) return;
+  lastDebugMs = now;
+
+  Serial.print("MAPraw=");   Serial.print(readings.mapRaw);
+  Serial.print(" V=");       Serial.print(readings.mapVoltage, 3);
+  Serial.print(" kPa=");     Serial.print(readings.mapKpa, 1);
+  Serial.print(" psi=");     Serial.print(readings.boostPsi, 2);
+  Serial.print(" low=");     Serial.print(readings.tankLow ? "1" : "0");
+  Serial.print(" meth%=");   Serial.print(blend.methPercent, 1);
+  Serial.print(" duty=");    Serial.print(result.finalDutyPercent, 1);
+  Serial.print(" pump=");    Serial.print(result.pump.enabled ? "ON" : "OFF");
+  Serial.print(" fs=");      Serial.print(failsafeName(result.failsafe));
+  Serial.print(" engT=");
+  if (engineTempSensor.valid())  { Serial.print(engineTempSensor.celsius(), 1);  Serial.print("C"); }
+  else                           { Serial.print("NC"); }
+  Serial.print(" ambT=");
+  if (ambientTempSensor.valid()) { Serial.print(ambientTempSensor.celsius(), 1); Serial.print("C"); }
+  else                           { Serial.print("NC"); }
+>>>>>>> 9f85b5a265fae4c4b6d3167df006c2b6cc9d5f89
   Serial.println();
 }

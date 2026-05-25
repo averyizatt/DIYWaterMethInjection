@@ -14,6 +14,7 @@ public:
 
 private:
   int pin_{-1};
+  int channel_{0};
   uint8_t resolutionBits_{10};
   uint32_t maxDutyCount_{1023};
 };

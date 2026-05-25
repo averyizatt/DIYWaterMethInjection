@@ -21,12 +21,13 @@ TankBlend computeTankBlend(float waterLiters, float methLiters) {
 AppConfig defaultConfig() {
   AppConfig config{};
 
-  // Default to GM 3-bar example calibration.
+  // GM 3-bar MAP sensor through 47k/94k voltage divider (ratio 0.6667).
+  // Sensor outputs 0.5–4.5 V; after divider: 0.333–3.000 V at the ESP32 ADC pin.
   config.mapType = MapSensorType::GM3Bar;
-  config.map.vMin = 0.50f;
-  config.map.vMax = 4.50f;
-  config.map.kpaMin = 20.0f;  // Example value for many GM 3-bar sensors.
-  config.map.kpaMax = 312.0f; // Example value for many GM 3-bar sensors.
+  config.map.vMin = 0.333f;
+  config.map.vMax = 3.000f;
+  config.map.kpaMin = 20.0f;  // GM 3-bar sensor range.
+  config.map.kpaMax = 312.0f; // GM 3-bar sensor range.
   config.map.baroKpa = 101.325f;
 
   // Gain chosen to be conservative for cooling/knock margin use.
