@@ -51,6 +51,9 @@ String serialLine;
 bool armed = false;
 bool pendingManualTest = false;
 uint8_t manualTestDuty = 0;
+bool benchButtonActive = false;       // true while physical button is held
+bool benchButtonOwnsTest = false;     // true when the button (not CAN) started pendingManualTest
+uint32_t benchButtonDebounceMs = 0;   // last edge time
 uint8_t remoteRatioPercent = 50;
 bool hasRemoteRatio = false;
 bool clearFaultsRequested = false;
@@ -219,6 +222,7 @@ void dispatchCanFrame(uint16_t id, uint8_t dlc, const uint8_t *data, uint32_t no
     if (cmd == meth_command::STOP_MANUAL_TEST) {
       pendingManualTest = false;
       manualTestDuty = 0;
+      benchButtonOwnsTest = false;
       armed = false;
       return;
     }
@@ -397,6 +401,8 @@ void printHelp() {
   Serial.println("  METH <liters>    - set methanol volume");
   Serial.println("  SHOW             - print current config/blend");
   Serial.println("  MODE OFF|BOOST|PRIME");
+  Serial.println("  TEST <0-100>     - fire pump at duty% (bench test)");
+  Serial.println("  TEST OFF         - stop bench test");
   KnockUi::printHelp(Serial);
   Serial.println("  HELP");
 }
@@ -470,6 +476,11 @@ void printSetupSummary() {
   Serial.println(blend.methPercent, 1);
   Serial.print("Knock ADC pin: ");
   Serial.println(pins::KNOCK_SENSOR_ADC);
+  Serial.print("Bench test button: pin ");
+  Serial.print(pins::BENCH_TEST_BUTTON);
+  Serial.print(" (D9/GPIO18) - hold to fire pump at ");
+  Serial.print(config.benchTestDutyPercent);
+  Serial.println("%");
   Serial.println("CAN: MCP2515 SPI");
   Serial.println("--------------------------------");
 }
@@ -662,6 +673,27 @@ void parseCommand(const String &line) {
     }
     return;
   }
+
+  if (cmdUpper.startsWith("TEST")) {
+    const String arg = cmd.length() > 5 ? cmd.substring(5) : String("");
+    if (arg.equalsIgnoreCase("OFF") || arg.length() == 0) {
+      pendingManualTest = false;
+      manualTestDuty = 0;
+      Serial.println("Manual test stopped.");
+    } else {
+      float duty = 0.0f;
+      if (parsePositiveFloat(arg, duty) && duty <= 100.0f) {
+        manualTestDuty = static_cast<uint8_t>(duty);
+        pendingManualTest = true;
+        Serial.print("Manual test: pump at ");
+        Serial.print(manualTestDuty);
+        Serial.println("%");
+      } else {
+        Serial.println("Usage: TEST <0-100> | TEST OFF");
+      }
+    }
+    return;
+  }
 }
 
 void handleSerialCommands() {
@@ -674,6 +706,37 @@ void handleSerialCommands() {
       continue;
     }
     if (serialLine.length() < 120) serialLine += c;
+  }
+}
+
+// Poll the physical bench-test button (active LOW, internal pull-up).
+// Holding the button sets pendingManualTest; releasing clears it only if
+// the button itself started the test (not a CAN-commanded manual test).
+void pollBenchButton(uint32_t nowMs) {
+  constexpr uint32_t kDebounceMs = 30;
+  const bool rawPressed = (digitalRead(pins::BENCH_TEST_BUTTON) == LOW);
+
+  if (rawPressed != benchButtonActive) {
+    if ((nowMs - benchButtonDebounceMs) >= kDebounceMs) {
+      benchButtonActive = rawPressed;
+      benchButtonDebounceMs = nowMs;
+
+      if (benchButtonActive) {
+        pendingManualTest = true;
+        benchButtonOwnsTest = true;
+        manualTestDuty = config.benchTestDutyPercent;
+        Serial.print("Bench test button pressed – pump duty ");
+        Serial.print(manualTestDuty);
+        Serial.println("%");
+      } else if (benchButtonOwnsTest) {
+        pendingManualTest = false;
+        manualTestDuty = 0;
+        benchButtonOwnsTest = false;
+        Serial.println("Bench test button released – pump off");
+      }
+    }
+  } else {
+    benchButtonDebounceMs = nowMs;
   }
 }
 } // namespace
@@ -689,6 +752,7 @@ void setup() {
   knockMonitor.begin(pins::KNOCK_SENSOR_ADC, config.knock);
   pumpDriver.begin(pins::PUMP_PWM, config.pwmFrequencyHz, config.pwmResolutionBits);
   warningOutput.begin(pins::WARNING_LED, true);
+  pinMode(pins::BENCH_TEST_BUTTON, INPUT_PULLUP);
 
   SPI.begin();
   pinMode(pins::CAN_SPI_INT, INPUT);
@@ -708,6 +772,8 @@ void loop() {
   handleSerialCommands();
 
   const uint32_t now = millis();
+  pollBenchButton(now);
+
   if (!elapsed(now, lastLoopMs, config.loopPeriodMs)) return;
   lastLoopMs = now;
 
