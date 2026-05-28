@@ -58,11 +58,50 @@ KnockDetectorConfig KnockMonitor::toDetectorConfig(const KnockConfig &config) co
   detectorCfg.enabled = config.enabled;
   detectorCfg.minRpmToArm = config.minRpmToArm;
   detectorCfg.minMapKpaToArm = config.minMapKpaToArm;
+  detectorCfg.minLoadPercentToArm = config.minLoadPercentToArm;
   detectorCfg.eventCooldownMs = config.eventCooldownMs;
   detectorCfg.autoCenterFromBore = config.autoCenterFromBore;
   detectorCfg.boreMm = config.boreMm;
   detectorCfg.centerFreqHz = config.centerFreqHz;
   detectorCfg.bandwidthHz = config.bandwidthHz;
+  detectorCfg.multiBandSpread = config.multiBandSpread;
+  detectorCfg.fftEnabled = config.fftEnabled;
+  detectorCfg.fftMinSnrDb = config.fftMinSnrDb;
+  detectorCfg.fftWeight = config.fftWeight;
+  detectorCfg.fftShortWeight = config.fftShortWeight;
+  detectorCfg.fftHarmonicWeight = config.fftHarmonicWeight;
+  detectorCfg.spectralTemplateWeight = config.spectralTemplateWeight;
+  detectorCfg.mapRateGateKpaPerSec = config.mapRateGateKpaPerSec;
+  detectorCfg.transientThresholdScale = config.transientThresholdScale;
+  detectorCfg.transientHoldMs = config.transientHoldMs;
+  detectorCfg.minDetectConfidence = config.minDetectConfidence;
+  detectorCfg.warnConfidence = config.warnConfidence;
+  detectorCfg.criticalConfidence = config.criticalConfidence;
+  detectorCfg.confidenceWeightSpectral = config.confidenceWeightSpectral;
+  detectorCfg.confidenceWeightFft = config.confidenceWeightFft;
+  detectorCfg.confidenceWeightHarmonic = config.confidenceWeightHarmonic;
+  detectorCfg.confidenceWeightTemplate = config.confidenceWeightTemplate;
+  detectorCfg.iatTempCompStartC = config.iatTempCompStartC;
+  detectorCfg.iatTempCompPerC = config.iatTempCompPerC;
+  detectorCfg.bayTempCompStartC = config.bayTempCompStartC;
+  detectorCfg.bayTempCompPerC = config.bayTempCompPerC;
+  detectorCfg.maxTempCompScale = config.maxTempCompScale;
+  detectorCfg.profileScaleIdle = config.profileScaleIdle;
+  detectorCfg.profileScaleSpool = config.profileScaleSpool;
+  detectorCfg.profileScaleSteady = config.profileScaleSteady;
+  detectorCfg.profileScaleLift = config.profileScaleLift;
+  detectorCfg.profileScaleHeatSoak = config.profileScaleHeatSoak;
+  detectorCfg.longTermBaselineAlpha = config.longTermBaselineAlpha;
+  detectorCfg.driftWarnPercent = config.driftWarnPercent;
+  detectorCfg.driftCriticalPercent = config.driftCriticalPercent;
+  detectorCfg.adaptiveMultMin = config.adaptiveMultMin;
+  detectorCfg.adaptiveMultMax = config.adaptiveMultMax;
+  detectorCfg.adaptiveMultLearnAlpha = config.adaptiveMultLearnAlpha;
+  detectorCfg.riskMapRateWeight = config.riskMapRateWeight;
+  detectorCfg.riskConfidenceWeight = config.riskConfidenceWeight;
+  detectorCfg.riskEventWeight = config.riskEventWeight;
+  detectorCfg.conservativeHealthThreshold = config.conservativeHealthThreshold;
+  detectorCfg.failsafeHealthThreshold = config.failsafeHealthThreshold;
   detectorCfg.thresholdOffset = config.thresholdOffset;
   detectorCfg.thresholdMultiplier = config.thresholdMultiplier;
   detectorCfg.baselineLearningEnabled = config.baselineLearningEnabled;
@@ -83,7 +122,10 @@ KnockDetectorConfig KnockMonitor::toDetectorConfig(const KnockConfig &config) co
   return detectorCfg;
 }
 
-KnockStateSnapshot KnockMonitor::update(float boostKpa, uint16_t rpm, uint32_t nowMs) {
+KnockStateSnapshot KnockMonitor::update(float mapKpa, float loadPercent,
+                                        float mapRateKpaPerSec,
+                                        float iatC, float bayC,
+                                        uint32_t nowMs) {
   state_.online = adcPin_ >= 0;
   if (adcPin_ < 0) {
     state_.signalValid = false;
@@ -110,7 +152,8 @@ KnockStateSnapshot KnockMonitor::update(float boostKpa, uint16_t rpm, uint32_t n
     return state_;
   }
 
-  const KnockDetectorFrame frame = detector_.processBlock(sampleBuffer_, captured, rpm, boostKpa, nowMs,
+  const KnockDetectorFrame frame = detector_.processBlock(sampleBuffer_, captured, loadPercent, mapKpa,
+                                                          mapRateKpaPerSec, iatC, bayC, nowMs,
                                                           stats.minAdc, stats.maxAdc,
                                                           stats.clipLowCount, stats.clipHighCount);
 
@@ -127,6 +170,37 @@ KnockStateSnapshot KnockMonitor::update(float boostKpa, uint16_t rpm, uint32_t n
   state_.filteredSignal = frame.filtered;
   state_.envelope = frame.envelope;
   state_.knockLevelRms = frame.rms;
+  state_.lowBandRms = frame.lowBandRms;
+  state_.midBandRms = frame.midBandRms;
+  state_.highBandRms = frame.highBandRms;
+  state_.spectralConfidence = frame.spectralConfidence;
+  state_.fftSnrDb = frame.fftSnrDb;
+  state_.fftShortSnrDb = frame.fftShortSnrDb;
+  state_.fftLongSnrDb = frame.fftLongSnrDb;
+  state_.harmonicScore = frame.harmonicScore;
+  state_.templateDeviation = frame.templateDeviation;
+  state_.fftTargetMag = frame.fftTargetMag;
+  state_.fftNoiseMag = frame.fftNoiseMag;
+  state_.selectedCenterHz = frame.selectedCenterHz;
+  state_.expectedCenterHz = frame.expectedCenterHz;
+  state_.loadPercent = frame.loadPercent;
+  state_.mapRateKpaPerSec = frame.mapRateKpaPerSec;
+  state_.transientScale = frame.transientScale;
+  state_.tempScale = frame.tempScale;
+  state_.profileScale = frame.profileScale;
+  state_.adaptiveMultiplier = frame.adaptiveMultiplier;
+  state_.shortBaseline = frame.shortBaseline;
+  state_.longBaseline = frame.longBaseline;
+  state_.driftPercent = frame.driftPercent;
+  state_.finalConfidence = frame.finalConfidence;
+  state_.knockRisk = frame.knockRisk;
+  state_.healthScore = frame.healthScore;
+  state_.iatC = frame.iatC;
+  state_.bayC = frame.bayC;
+  state_.reasonFlags = frame.reasonFlags;
+  state_.profile = static_cast<uint8_t>(frame.profile);
+  state_.anomalyClass = static_cast<uint8_t>(frame.anomalyClass);
+  state_.degradeMode = static_cast<uint8_t>(frame.degradeMode);
   state_.energy = frame.rms;
   state_.baseline = frame.baseline;
   state_.threshold = frame.threshold;
@@ -134,8 +208,8 @@ KnockStateSnapshot KnockMonitor::update(float boostKpa, uint16_t rpm, uint32_t n
 
   if (frame.detected) {
     lastEventMs_ = nowMs;
-    state_.lastEventRpm = rpm;
-    state_.lastEventBoostKpa = can_protocol::clampU8(static_cast<int>(boostKpa));
+    state_.lastEventRpm = static_cast<uint16_t>(state_.loadPercent * 100.0f);
+    state_.lastEventBoostKpa = can_protocol::clampU8(static_cast<int>(mapKpa));
 
     if (frame.criticalActive) {
       maybeQueueFault(can_protocol::knock_fault_code::KNOCK_CRITICAL,

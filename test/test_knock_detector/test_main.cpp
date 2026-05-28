@@ -36,10 +36,13 @@ KnockDetectorConfig testConfig() {
   cfg.enabled = true;
   cfg.minRpmToArm = 2500;
   cfg.minMapKpaToArm = 140.0f;
+  cfg.minLoadPercentToArm = 35.0f;
   cfg.eventCooldownMs = 100;
   cfg.autoCenterFromBore = false;
   cfg.centerFreqHz = 3200.0f;
   cfg.bandwidthHz = 1200.0f;
+  cfg.multiBandSpread = 0.14f;
+  cfg.fftEnabled = false;
   cfg.thresholdOffset = 4.0f;
   cfg.thresholdMultiplier = 2.5f;
   cfg.baselineLearningEnabled = true;
@@ -73,7 +76,8 @@ bool noSignal_noEvents() {
   uint8_t totalEvents = 0;
   for (int i = 0; i < 60; ++i) {
     now += 20;
-    const auto frame = logic.processBlock(samples, 64, 3000, 160.0f, now, 2048, 2048, 0, 0);
+    const auto frame = logic.processBlock(samples, 64, 70.0f, 160.0f, 0.0f, 35.0f, 45.0f,
+                        now, 2048, 2048, 0, 0);
     totalEvents = frame.eventCount;
     if (frame.detected) return false;
   }
@@ -92,13 +96,15 @@ bool normalVibrationBelowThreshold_noEvents() {
   for (int i = 0; i < 30; ++i) {
     now += 20;
     fillSine(samples, 64, cfg.sampleRateHz, 3200.0f, 8.0f, static_cast<float>(i));
-    logic.processBlock(samples, 64, 1000, 110.0f, now, 2030, 2066, 0, 0);
+    logic.processBlock(samples, 64, 20.0f, 110.0f, 0.0f, 35.0f, 45.0f,
+               now, 2030, 2066, 0, 0);
   }
 
   for (int i = 0; i < 30; ++i) {
     now += 20;
     fillSine(samples, 64, cfg.sampleRateHz, 3200.0f, 10.0f, static_cast<float>(i));
-    const auto frame = logic.processBlock(samples, 64, 3000, 170.0f, now, 2028, 2068, 0, 0);
+    const auto frame = logic.processBlock(samples, 64, 65.0f, 170.0f, 0.0f, 35.0f, 45.0f,
+                        now, 2028, 2068, 0, 0);
     if (frame.detected) return false;
   }
 
@@ -123,7 +129,8 @@ bool randomNoise_noEvents() {
       samples[s] = static_cast<uint16_t>(value < 0 ? 0 : (value > 4095 ? 4095 : value));
     }
     now += 20;
-    const auto frame = logic.processBlock(samples, 64, 3200, 180.0f, now, 2030, 2066, 0, 0);
+    const auto frame = logic.processBlock(samples, 64, 75.0f, 180.0f, 0.0f, 35.0f, 45.0f,
+                        now, 2030, 2066, 0, 0);
     if (frame.detected) return false;
   }
 
@@ -144,14 +151,16 @@ bool targetFreqBurst_triggersWhenArmed() {
   for (int i = 0; i < 35; ++i) {
     now += 20;
     fillSine(samples, 64, cfg.sampleRateHz, 3200.0f, 8.0f, static_cast<float>(i));
-    logic.processBlock(samples, 64, 1200, 110.0f, now, 2030, 2066, 0, 0);
+    logic.processBlock(samples, 64, 20.0f, 110.0f, 0.0f, 35.0f, 45.0f,
+               now, 2030, 2066, 0, 0);
   }
 
   bool detected = false;
   for (int i = 0; i < 8; ++i) {
     now += 20;
     fillSine(samples, 64, cfg.sampleRateHz, 3200.0f, 80.0f, static_cast<float>(i));
-    const auto frame = logic.processBlock(samples, 64, 3500, 180.0f, now, 1960, 2140, 0, 0);
+    const auto frame = logic.processBlock(samples, 64, 78.0f, 180.0f, 0.0f, 35.0f, 45.0f,
+                        now, 1960, 2140, 0, 0);
     if (frame.detected) {
       detected = true;
       break;
@@ -174,13 +183,15 @@ bool wrongFreqBurst_isRejected() {
   for (int i = 0; i < 35; ++i) {
     now += 20;
     fillSine(samples, 64, cfg.sampleRateHz, 3200.0f, 8.0f, static_cast<float>(i));
-    logic.processBlock(samples, 64, 1200, 110.0f, now, 2030, 2066, 0, 0);
+    logic.processBlock(samples, 64, 20.0f, 110.0f, 0.0f, 35.0f, 45.0f,
+               now, 2030, 2066, 0, 0);
   }
 
   for (int i = 0; i < 12; ++i) {
     now += 20;
     fillSine(samples, 64, cfg.sampleRateHz, 900.0f, 90.0f, static_cast<float>(i));
-    const auto frame = logic.processBlock(samples, 64, 3500, 180.0f, now, 1950, 2150, 0, 0);
+    const auto frame = logic.processBlock(samples, 64, 78.0f, 180.0f, 0.0f, 35.0f, 45.0f,
+                        now, 1950, 2150, 0, 0);
     if (frame.detected) return false;
   }
 
@@ -202,7 +213,8 @@ bool changingBias_noFalseEvents() {
     now += 20;
     const uint16_t minAdc = static_cast<uint16_t>(dc - 20.0f);
     const uint16_t maxAdc = static_cast<uint16_t>(dc + 20.0f);
-    const auto frame = logic.processBlock(samples, 64, 3200, 180.0f, now, minAdc, maxAdc, 0, 0);
+    const auto frame = logic.processBlock(samples, 64, 70.0f, 180.0f, 0.0f, 35.0f, 45.0f,
+                        now, minAdc, maxAdc, 0, 0);
     if (frame.detected) return false;
   }
 
@@ -223,7 +235,8 @@ bool knockBelowArmThreshold_doesNotTrigger() {
   for (int i = 0; i < 40; ++i) {
     now += 20;
     fillSine(samples, 64, cfg.sampleRateHz, 3200.0f, 70.0f, static_cast<float>(i));
-    const auto frame = logic.processBlock(samples, 64, 1800, 120.0f, now, 1970, 2130, 0, 0);
+    const auto frame = logic.processBlock(samples, 64, 22.0f, 120.0f, 0.0f, 35.0f, 45.0f,
+                        now, 1970, 2130, 0, 0);
     if (frame.detected || frame.armed) return false;
   }
 
@@ -244,13 +257,15 @@ bool knockWhileArmed_triggers() {
   for (int i = 0; i < 35; ++i) {
     now += 20;
     fillSine(samples, 64, cfg.sampleRateHz, 3200.0f, 8.0f, static_cast<float>(i));
-    logic.processBlock(samples, 64, 1200, 110.0f, now, 2030, 2066, 0, 0);
+    logic.processBlock(samples, 64, 18.0f, 110.0f, 0.0f, 35.0f, 45.0f,
+               now, 2030, 2066, 0, 0);
   }
 
   for (int i = 0; i < 12; ++i) {
     now += 20;
     fillSine(samples, 64, cfg.sampleRateHz, 3200.0f, 80.0f, static_cast<float>(i));
-    const auto frame = logic.processBlock(samples, 64, 3600, 190.0f, now, 1960, 2140, 0, 0);
+    const auto frame = logic.processBlock(samples, 64, 85.0f, 190.0f, 0.0f, 35.0f, 45.0f,
+                        now, 1960, 2140, 0, 0);
     if (frame.detected && frame.armed) return true;
   }
 

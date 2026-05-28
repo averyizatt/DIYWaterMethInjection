@@ -101,9 +101,19 @@ The knock subsystem is modular and runs as:
 
 Serial knock commands are still available for bench bring-up, but the intended production path is CAN-based hooks and commands.
 
+## Runtime hardening for automotive conditions
+
+The firmware includes additional resilience measures for noisy and transient environments:
+
+- Boost hysteresis and latch logic to prevent rapid on/off pump chatter near threshold.
+- CAN command timeout fail-safe: if the master controller stops sending updates, the module disarms and exits manual test mode.
+- MCP2515 recovery loop: repeated CAN TX errors mark CAN offline and trigger periodic re-init attempts.
+- Knock config input sanitation for both serial and CAN tuning commands (range-constrained values).
+- Analog critical fault shutdown (IAT, engine bay temp, meth pressure channels): pump output is forced off until faults clear.
+
 ## Unit tests
 
-Host-side unit tests were added for knock detector logic in [test/knock_detector/test_knock_detector.cpp](test/knock_detector/test_knock_detector.cpp), covering:
+Host-side unit tests were added for knock detector logic in [test/test_knock_detector/test_main.cpp](test/test_knock_detector/test_main.cpp), covering:
 
 - no signal
 - normal vibration below threshold

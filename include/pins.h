@@ -18,7 +18,8 @@ constexpr int IAT_THERM_PIN = D4;       // D4
 constexpr int DHT11_PIN = D6;           // D6
 constexpr int ENGINE_BAY_THERM_PIN = 8; // GPIO8
 constexpr int CABIN_THERM_PIN = 9;      // GPIO9
-constexpr int AMBIENT_THERM_PIN = 10;   // GPIO10
+// Disabled by default because GPIO10 maps to D10, which is used by MCP2515 CS.
+constexpr int AMBIENT_THERM_PIN = -1;
 
 // Pressure transducers (divider-scaled to ADC)
 constexpr int OIL_PRESSURE_ADC = A4;       // A4

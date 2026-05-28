@@ -30,6 +30,37 @@ struct KnockStateSnapshot {
   float filteredSignal{0.0f};
   float envelope{0.0f};
   float knockLevelRms{0.0f};
+  float lowBandRms{0.0f};
+  float midBandRms{0.0f};
+  float highBandRms{0.0f};
+  float spectralConfidence{0.0f};
+  float fftSnrDb{0.0f};
+  float fftShortSnrDb{0.0f};
+  float fftLongSnrDb{0.0f};
+  float harmonicScore{0.0f};
+  float templateDeviation{0.0f};
+  float fftTargetMag{0.0f};
+  float fftNoiseMag{0.0f};
+  float selectedCenterHz{0.0f};
+  float expectedCenterHz{0.0f};
+  float loadPercent{0.0f};
+  float mapRateKpaPerSec{0.0f};
+  float transientScale{1.0f};
+  float tempScale{1.0f};
+  float profileScale{1.0f};
+  float adaptiveMultiplier{2.5f};
+  float shortBaseline{0.0f};
+  float longBaseline{0.0f};
+  float driftPercent{0.0f};
+  float finalConfidence{0.0f};
+  float knockRisk{0.0f};
+  float healthScore{100.0f};
+  float iatC{20.0f};
+  float bayC{20.0f};
+  uint16_t reasonFlags{0};
+  uint8_t profile{0};
+  uint8_t anomalyClass{0};
+  uint8_t degradeMode{0};
   float baseline{12.0f};
   float threshold{32.0f};
 
@@ -46,7 +77,8 @@ public:
   void begin(int adcPin, const KnockConfig &config);
   void setConfig(const KnockConfig &config);
   void clearFaults();
-  KnockStateSnapshot update(float boostKpa, uint16_t rpm, uint32_t nowMs);
+  KnockStateSnapshot update(float mapKpa, float loadPercent, float mapRateKpaPerSec,
+                            float iatC, float bayC, uint32_t nowMs);
   KnockStateSnapshot state() const { return state_; }
   bool consumeFault(KnockFaultEvent &eventOut);
 

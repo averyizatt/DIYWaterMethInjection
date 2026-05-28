@@ -21,5 +21,9 @@ struct ControlResult {
 
 class InjectionController {
 public:
-  ControlResult update(const SensorReadings &readings, const AppConfig &config, const TankBlend &blend) const;
+  ControlResult update(const SensorReadings &readings, const AppConfig &config, const TankBlend &blend);
+
+private:
+  // Hysteresis prevents rapid on/off chatter when boost hovers at startPsi.
+  bool sprayLatched_{false};
 };

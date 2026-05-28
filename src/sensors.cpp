@@ -11,6 +11,8 @@ constexpr float kMinFilterAlpha = 0.01f;
 constexpr float kMaxFilterAlpha = 1.0f;
 constexpr float kMinResistanceOhms = 1.0f;
 constexpr float kKelvinOffset = 273.15f;
+constexpr float kMapVoltageMargin = 0.10f;
+constexpr float kPressureVoltageMargin = 0.08f;
 
 // Unsigned subtraction is rollover-safe for millis() timestamps.
 inline bool elapsed(uint32_t now, uint32_t start, uint32_t intervalMs) {
@@ -50,12 +52,14 @@ SensorReadings MapSensor::read() const {
   const float voltage = static_cast<float>(raw) * (kAdcRefVoltage / kAdcMaxCount);
   const float mapKpa = kpaFromVoltage(voltage);
   const float boostPsi = (mapKpa - calibration_.baroKpa) * kPsiPerKpa;
+  const bool inRange = (voltage >= (calibration_.vMin - kMapVoltageMargin)) &&
+                       (voltage <= (calibration_.vMax + kMapVoltageMargin));
 
   readings.mapRaw = raw;
   readings.mapVoltage = voltage;
   readings.mapKpa = mapKpa;
   readings.boostPsi = boostPsi;
-  readings.mapValid = valid_;
+  readings.mapValid = valid_ && inRange;
   return readings;
 }
 
@@ -285,6 +289,14 @@ void PressureSensor::update(uint32_t nowMs) {
     fault_ = PressureFault::AdcError;
     return;
   }
+
+  if (sensorVoltage_ < (config_.sensorMinV - kPressureVoltageMargin) ||
+      sensorVoltage_ > (config_.sensorMaxV + kPressureVoltageMargin)) {
+    valid_ = false;
+    fault_ = PressureFault::OutOfRange;
+    return;
+  }
+
   if (sensorVoltage_ >= config_.openCircuitThresholdV) {
     valid_ = false;
     fault_ = PressureFault::OpenCircuit;

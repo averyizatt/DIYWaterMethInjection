@@ -56,6 +56,9 @@ bool hasRemoteRatio = false;
 bool clearFaultsRequested = false;
 uint8_t lastConfigVersion = 0;
 uint8_t lastConfigRatioPercent = 255;
+uint32_t lastCanRecoveryAttemptMs = 0;
+uint16_t canTxFailStreak = 0;
+bool analogSafetyLatched = false;
 
 constexpr char kPrefsNamespace[] = "wmix";
 constexpr char kPrefsKeyWater[] = "water_l";
@@ -67,10 +70,16 @@ constexpr uint32_t kExtTxIntervalMs = 250;
 constexpr uint32_t kKnockTxIntervalMs = 50;
 constexpr uint32_t kKnockApiTxIntervalMs = 100;
 constexpr uint32_t kKnockCfgTxIntervalMs = 500;
+constexpr uint32_t kCanCommandTimeoutMs = 2000;
+constexpr uint32_t kCanRecoveryIntervalMs = 1000;
+constexpr uint16_t kCanTxFailStreakBeforeOffline = 6;
 
 constexpr uint16_t kCanIdKnockUiState = 0x30B;
 constexpr uint16_t kCanIdKnockUiConfig1 = 0x30C;
 constexpr uint16_t kCanIdKnockUiConfig2 = 0x30D;
+constexpr uint16_t kCanIdKnockUiBands = 0x30E;
+constexpr uint16_t kCanIdKnockUiDsp = 0x30F;
+constexpr uint16_t kCanIdKnockUiExplain = 0x310;
 
 constexpr uint8_t kCmdKnockSetEnable = 0x40;
 constexpr uint8_t kCmdKnockSetThresholdOffset = 0x41;
@@ -83,6 +92,23 @@ constexpr uint8_t kCmdKnockSetCenterHzDiv100 = 0x47;
 constexpr uint8_t kCmdKnockSetBandwidthHzDiv100 = 0x48;
 constexpr uint8_t kCmdKnockSetAutoFreq = 0x49;
 constexpr uint8_t kCmdKnockResetEvents = 0x4A;
+constexpr uint8_t kCmdKnockSetMinLoadPct = 0x4B;
+constexpr uint8_t kCmdKnockSetSpreadX100 = 0x4C;
+constexpr uint8_t kCmdKnockSetFftEnable = 0x4D;
+constexpr uint8_t kCmdKnockSetFftSnrDb = 0x4E;
+constexpr uint8_t kCmdKnockSetFftShortWeightX100 = 0x4F;
+constexpr uint8_t kCmdKnockSetFftHarmonicWeightX100 = 0x50;
+constexpr uint8_t kCmdKnockSetTemplateWeightX100 = 0x51;
+constexpr uint8_t kCmdKnockSetMapRateGateKpaPerSec = 0x52;
+constexpr uint8_t kCmdKnockSetTransientScaleX100 = 0x53;
+constexpr uint8_t kCmdKnockSetTransientHoldDiv10 = 0x54;
+constexpr uint8_t kCmdKnockSetDetectConfidenceX100 = 0x55;
+constexpr uint8_t kCmdKnockSetWarnConfidenceX100 = 0x56;
+constexpr uint8_t kCmdKnockSetCriticalConfidenceX100 = 0x57;
+constexpr uint8_t kCmdKnockSetIatCompStartC = 0x58;
+constexpr uint8_t kCmdKnockSetIatCompPerCx1000 = 0x59;
+constexpr uint8_t kCmdKnockSetBayCompStartC = 0x5A;
+constexpr uint8_t kCmdKnockSetBayCompPerCx1000 = 0x5B;
 
 constexpr uint16_t kFaultIat = 1U << 0;
 constexpr uint16_t kFaultEngineBay = 1U << 1;
@@ -118,14 +144,116 @@ inline bool elapsed(uint32_t now, uint32_t start, uint32_t intervalMs) {
   return static_cast<uint32_t>(now - start) >= intervalMs;
 }
 
+float clampFloat(float value, float minValue, float maxValue) {
+  if (value < minValue) return minValue;
+  if (value > maxValue) return maxValue;
+  return value;
+}
+
 uint8_t toU8(float value, float scale = 1.0f) {
   const int scaled = static_cast<int>(value * scale);
   return can_protocol::clampU8(scaled);
 }
 
+bool initCanBus() {
+  if (canBus.begin(MCP_ANY, CAN_500KBPS, MCP_8MHZ) != CAN_OK) {
+    canOnline = false;
+    return false;
+  }
+  canBus.setMode(MCP_NORMAL);
+  canOnline = true;
+  canTxFailStreak = 0;
+  return true;
+}
+
+void sanitizeKnockConfig(KnockConfig &knock) {
+  knock.minRpmToArm = constrain(knock.minRpmToArm, static_cast<uint16_t>(0), static_cast<uint16_t>(12000));
+  knock.minMapKpaToArm = clampFloat(knock.minMapKpaToArm, 20.0f, 320.0f);
+  knock.minLoadPercentToArm = clampFloat(knock.minLoadPercentToArm, 0.0f, 100.0f);
+  knock.sampleRateHz = constrain(knock.sampleRateHz, static_cast<uint16_t>(2000), static_cast<uint16_t>(20000));
+  knock.samplesPerUpdate = constrain(knock.samplesPerUpdate, static_cast<uint8_t>(16), static_cast<uint8_t>(128));
+  knock.boreMm = clampFloat(knock.boreMm, 60.0f, 120.0f);
+  knock.centerFreqHz = clampFloat(knock.centerFreqHz, 1000.0f, 9000.0f);
+  knock.bandwidthHz = clampFloat(knock.bandwidthHz, 300.0f, 5000.0f);
+  knock.multiBandSpread = clampFloat(knock.multiBandSpread, 0.05f, 0.35f);
+  knock.fftMinSnrDb = clampFloat(knock.fftMinSnrDb, -6.0f, 20.0f);
+  knock.fftWeight = clampFloat(knock.fftWeight, 0.0f, 1.0f);
+  knock.fftShortWeight = clampFloat(knock.fftShortWeight, 0.0f, 1.0f);
+  knock.fftHarmonicWeight = clampFloat(knock.fftHarmonicWeight, 0.0f, 1.0f);
+  knock.spectralTemplateWeight = clampFloat(knock.spectralTemplateWeight, 0.0f, 1.0f);
+  knock.mapRateGateKpaPerSec = clampFloat(knock.mapRateGateKpaPerSec, 20.0f, 400.0f);
+  knock.transientThresholdScale = clampFloat(knock.transientThresholdScale, 1.0f, 2.5f);
+  knock.transientHoldMs = constrain(knock.transientHoldMs, static_cast<uint16_t>(10),
+                                    static_cast<uint16_t>(1000));
+  knock.minDetectConfidence = clampFloat(knock.minDetectConfidence, 0.20f, 0.95f);
+  knock.warnConfidence = clampFloat(knock.warnConfidence, 0.25f, 0.98f);
+  knock.criticalConfidence = clampFloat(knock.criticalConfidence, 0.30f, 0.99f);
+  if (knock.warnConfidence < knock.minDetectConfidence) knock.warnConfidence = knock.minDetectConfidence;
+  if (knock.criticalConfidence < knock.warnConfidence) knock.criticalConfidence = knock.warnConfidence;
+  knock.confidenceWeightSpectral = clampFloat(knock.confidenceWeightSpectral, 0.0f, 1.0f);
+  knock.confidenceWeightFft = clampFloat(knock.confidenceWeightFft, 0.0f, 1.0f);
+  knock.confidenceWeightHarmonic = clampFloat(knock.confidenceWeightHarmonic, 0.0f, 1.0f);
+  knock.confidenceWeightTemplate = clampFloat(knock.confidenceWeightTemplate, 0.0f, 1.0f);
+  knock.iatTempCompStartC = clampFloat(knock.iatTempCompStartC, -20.0f, 120.0f);
+  knock.iatTempCompPerC = clampFloat(knock.iatTempCompPerC, 0.0f, 0.05f);
+  knock.bayTempCompStartC = clampFloat(knock.bayTempCompStartC, -20.0f, 150.0f);
+  knock.bayTempCompPerC = clampFloat(knock.bayTempCompPerC, 0.0f, 0.05f);
+  knock.maxTempCompScale = clampFloat(knock.maxTempCompScale, 1.0f, 2.5f);
+  knock.profileScaleIdle = clampFloat(knock.profileScaleIdle, 0.8f, 2.0f);
+  knock.profileScaleSpool = clampFloat(knock.profileScaleSpool, 0.8f, 2.0f);
+  knock.profileScaleSteady = clampFloat(knock.profileScaleSteady, 0.8f, 2.0f);
+  knock.profileScaleLift = clampFloat(knock.profileScaleLift, 0.8f, 2.0f);
+  knock.profileScaleHeatSoak = clampFloat(knock.profileScaleHeatSoak, 0.8f, 2.0f);
+  knock.longTermBaselineAlpha = clampFloat(knock.longTermBaselineAlpha, 0.0001f, 0.05f);
+  knock.driftWarnPercent = clampFloat(knock.driftWarnPercent, 5.0f, 150.0f);
+  knock.driftCriticalPercent = clampFloat(knock.driftCriticalPercent, 10.0f, 200.0f);
+  if (knock.driftCriticalPercent < knock.driftWarnPercent) {
+    knock.driftCriticalPercent = knock.driftWarnPercent;
+  }
+  knock.adaptiveMultMin = clampFloat(knock.adaptiveMultMin, 0.8f, 5.0f);
+  knock.adaptiveMultMax = clampFloat(knock.adaptiveMultMax, 1.0f, 8.0f);
+  if (knock.adaptiveMultMax < knock.adaptiveMultMin) knock.adaptiveMultMax = knock.adaptiveMultMin;
+  knock.adaptiveMultLearnAlpha = clampFloat(knock.adaptiveMultLearnAlpha, 0.0005f, 0.1f);
+  knock.riskMapRateWeight = clampFloat(knock.riskMapRateWeight, 0.0f, 1.0f);
+  knock.riskConfidenceWeight = clampFloat(knock.riskConfidenceWeight, 0.0f, 1.0f);
+  knock.riskEventWeight = clampFloat(knock.riskEventWeight, 0.0f, 1.0f);
+  knock.conservativeHealthThreshold = clampFloat(knock.conservativeHealthThreshold, 10.0f, 95.0f);
+  knock.failsafeHealthThreshold = clampFloat(knock.failsafeHealthThreshold, 5.0f, 90.0f);
+  if (knock.failsafeHealthThreshold > knock.conservativeHealthThreshold) {
+    knock.failsafeHealthThreshold = knock.conservativeHealthThreshold;
+  }
+  knock.signalGain = clampFloat(knock.signalGain, 0.1f, 20.0f);
+  knock.biasAlpha = clampFloat(knock.biasAlpha, 0.0001f, 0.05f);
+  knock.envelopeAlpha = clampFloat(knock.envelopeAlpha, 0.01f, 0.8f);
+  knock.rmsAlpha = clampFloat(knock.rmsAlpha, 0.01f, 0.6f);
+  knock.thresholdOffset = clampFloat(knock.thresholdOffset, 0.0f, 200.0f);
+  knock.thresholdMultiplier = clampFloat(knock.thresholdMultiplier, 0.5f, 8.0f);
+  knock.baselineLearnAlpha = clampFloat(knock.baselineLearnAlpha, 0.001f, 0.3f);
+  knock.eventCooldownMs = constrain(knock.eventCooldownMs, static_cast<uint16_t>(20), static_cast<uint16_t>(5000));
+}
+
+void attemptCanRecoveryIfNeeded(uint32_t nowMs) {
+  if (canOnline) return;
+  if (!elapsed(nowMs, lastCanRecoveryAttemptMs, kCanRecoveryIntervalMs)) return;
+  lastCanRecoveryAttemptMs = nowMs;
+
+  if (initCanBus()) {
+    Serial.println("CAN: MCP2515 recovered");
+  }
+}
+
 void sendRawCanFrame(uint16_t id, const uint8_t *data, uint8_t dlc) {
   if (!canOnline) return;
-  canBus.sendMsgBuf(id, 0, dlc, const_cast<uint8_t *>(data));
+  const byte tx = canBus.sendMsgBuf(id, 0, dlc, const_cast<uint8_t *>(data));
+  if (tx == CAN_OK) {
+    canTxFailStreak = 0;
+    return;
+  }
+
+  if (canTxFailStreak < 65535) ++canTxFailStreak;
+  if (canTxFailStreak >= kCanTxFailStreakBeforeOffline) {
+    canOnline = false;
+  }
 }
 
 void sendCanFrame(const can_protocol::CanFrame &frame) {
@@ -191,8 +319,41 @@ void sendKnockApiHooksIfDue(const KnockStateSnapshot &knockState, uint32_t nowMs
         toU8(config.knock.rmsAlpha * 100.0f),
         toU8(config.knock.envelopeAlpha * 100.0f),
         toU8(config.knock.boreMm),
-        0};
+        toU8(config.knock.minLoadPercentToArm)};
     sendRawCanFrame(kCanIdKnockUiConfig2, payloadCfg2, 8);
+
+    const uint8_t payloadBands[8] = {
+        toU8(knockState.lowBandRms),
+        toU8(knockState.midBandRms),
+        toU8(knockState.highBandRms),
+        toU8(knockState.spectralConfidence * 100.0f),
+      toU8(knockState.selectedCenterHz / 100.0f),
+      toU8(knockState.loadPercent),
+      toU8((knockState.fftSnrDb + 6.0f) * 8.0f),
+      toU8(config.knock.multiBandSpread * 100.0f)};
+    sendRawCanFrame(kCanIdKnockUiBands, payloadBands, 8);
+
+    const uint8_t payloadDsp[8] = {
+      toU8((knockState.fftLongSnrDb + 6.0f) * 8.0f),
+      toU8((knockState.fftShortSnrDb + 6.0f) * 8.0f),
+      toU8(knockState.harmonicScore * 100.0f),
+      toU8(knockState.templateDeviation * 100.0f),
+      toU8(knockState.mapRateKpaPerSec + 127.0f),
+      toU8(knockState.transientScale * 100.0f),
+      toU8(config.knock.fftShortWeight * 100.0f),
+      toU8(config.knock.spectralTemplateWeight * 100.0f)};
+    sendRawCanFrame(kCanIdKnockUiDsp, payloadDsp, 8);
+
+    const uint8_t payloadExplain[8] = {
+      static_cast<uint8_t>(knockState.profile),
+      static_cast<uint8_t>(knockState.anomalyClass),
+      static_cast<uint8_t>(knockState.degradeMode),
+      toU8(knockState.finalConfidence * 100.0f),
+      toU8(knockState.knockRisk * 100.0f),
+      toU8(knockState.healthScore),
+      static_cast<uint8_t>(knockState.reasonFlags & 0xFFU),
+      static_cast<uint8_t>((knockState.reasonFlags >> 8) & 0xFFU)};
+    sendRawCanFrame(kCanIdKnockUiExplain, payloadExplain, 8);
 
     lastKnockCfgTxMs = nowMs;
   }
@@ -229,44 +390,139 @@ void dispatchCanFrame(uint16_t id, uint8_t dlc, const uint8_t *data, uint32_t no
 
     if (cmd == kCmdKnockSetEnable && dlc >= 2) {
       config.knock.enabled = data[1] != 0;
+      sanitizeKnockConfig(config.knock);
       return;
     }
     if (cmd == kCmdKnockSetThresholdOffset && dlc >= 2) {
       config.knock.thresholdOffset = static_cast<float>(data[1]);
+      sanitizeKnockConfig(config.knock);
       return;
     }
     if (cmd == kCmdKnockSetMultiplierX10 && dlc >= 2) {
       config.knock.thresholdMultiplier = static_cast<float>(data[1]) / 10.0f;
+      sanitizeKnockConfig(config.knock);
       return;
     }
     if (cmd == kCmdKnockSetMinRpmDiv100 && dlc >= 2) {
       config.knock.minRpmToArm = static_cast<uint16_t>(data[1]) * 100U;
+      sanitizeKnockConfig(config.knock);
       return;
     }
     if (cmd == kCmdKnockSetMinMapKpa && dlc >= 2) {
       config.knock.minMapKpaToArm = static_cast<float>(data[1]);
       config.knock.boostEnableKpa = config.knock.minMapKpaToArm;
+      sanitizeKnockConfig(config.knock);
       return;
     }
     if (cmd == kCmdKnockSetDebounceDiv10 && dlc >= 2) {
       config.knock.eventCooldownMs = static_cast<uint16_t>(data[1]) * 10U;
+      sanitizeKnockConfig(config.knock);
       return;
     }
     if (cmd == kCmdKnockSetGainX10 && dlc >= 2) {
       config.knock.signalGain = static_cast<float>(data[1]) / 10.0f;
+      sanitizeKnockConfig(config.knock);
       return;
     }
     if (cmd == kCmdKnockSetCenterHzDiv100 && dlc >= 2) {
       config.knock.centerFreqHz = static_cast<float>(data[1]) * 100.0f;
       config.knock.autoCenterFromBore = false;
+      sanitizeKnockConfig(config.knock);
       return;
     }
     if (cmd == kCmdKnockSetBandwidthHzDiv100 && dlc >= 2) {
       config.knock.bandwidthHz = static_cast<float>(data[1]) * 100.0f;
+      sanitizeKnockConfig(config.knock);
       return;
     }
     if (cmd == kCmdKnockSetAutoFreq && dlc >= 2) {
       config.knock.autoCenterFromBore = data[1] != 0;
+      sanitizeKnockConfig(config.knock);
+      return;
+    }
+    if (cmd == kCmdKnockSetMinLoadPct && dlc >= 2) {
+      config.knock.minLoadPercentToArm = static_cast<float>(data[1]);
+      sanitizeKnockConfig(config.knock);
+      return;
+    }
+    if (cmd == kCmdKnockSetSpreadX100 && dlc >= 2) {
+      config.knock.multiBandSpread = static_cast<float>(data[1]) / 100.0f;
+      sanitizeKnockConfig(config.knock);
+      return;
+    }
+    if (cmd == kCmdKnockSetFftEnable && dlc >= 2) {
+      config.knock.fftEnabled = data[1] != 0;
+      sanitizeKnockConfig(config.knock);
+      return;
+    }
+    if (cmd == kCmdKnockSetFftSnrDb && dlc >= 2) {
+      config.knock.fftMinSnrDb = static_cast<float>(data[1]) - 20.0f;
+      sanitizeKnockConfig(config.knock);
+      return;
+    }
+    if (cmd == kCmdKnockSetFftShortWeightX100 && dlc >= 2) {
+      config.knock.fftShortWeight = static_cast<float>(data[1]) / 100.0f;
+      sanitizeKnockConfig(config.knock);
+      return;
+    }
+    if (cmd == kCmdKnockSetFftHarmonicWeightX100 && dlc >= 2) {
+      config.knock.fftHarmonicWeight = static_cast<float>(data[1]) / 100.0f;
+      sanitizeKnockConfig(config.knock);
+      return;
+    }
+    if (cmd == kCmdKnockSetTemplateWeightX100 && dlc >= 2) {
+      config.knock.spectralTemplateWeight = static_cast<float>(data[1]) / 100.0f;
+      sanitizeKnockConfig(config.knock);
+      return;
+    }
+    if (cmd == kCmdKnockSetMapRateGateKpaPerSec && dlc >= 2) {
+      config.knock.mapRateGateKpaPerSec = static_cast<float>(data[1]);
+      sanitizeKnockConfig(config.knock);
+      return;
+    }
+    if (cmd == kCmdKnockSetTransientScaleX100 && dlc >= 2) {
+      config.knock.transientThresholdScale = static_cast<float>(data[1]) / 100.0f;
+      sanitizeKnockConfig(config.knock);
+      return;
+    }
+    if (cmd == kCmdKnockSetTransientHoldDiv10 && dlc >= 2) {
+      config.knock.transientHoldMs = static_cast<uint16_t>(data[1]) * 10U;
+      sanitizeKnockConfig(config.knock);
+      return;
+    }
+    if (cmd == kCmdKnockSetDetectConfidenceX100 && dlc >= 2) {
+      config.knock.minDetectConfidence = static_cast<float>(data[1]) / 100.0f;
+      sanitizeKnockConfig(config.knock);
+      return;
+    }
+    if (cmd == kCmdKnockSetWarnConfidenceX100 && dlc >= 2) {
+      config.knock.warnConfidence = static_cast<float>(data[1]) / 100.0f;
+      sanitizeKnockConfig(config.knock);
+      return;
+    }
+    if (cmd == kCmdKnockSetCriticalConfidenceX100 && dlc >= 2) {
+      config.knock.criticalConfidence = static_cast<float>(data[1]) / 100.0f;
+      sanitizeKnockConfig(config.knock);
+      return;
+    }
+    if (cmd == kCmdKnockSetIatCompStartC && dlc >= 2) {
+      config.knock.iatTempCompStartC = static_cast<float>(data[1]) - 40.0f;
+      sanitizeKnockConfig(config.knock);
+      return;
+    }
+    if (cmd == kCmdKnockSetIatCompPerCx1000 && dlc >= 2) {
+      config.knock.iatTempCompPerC = static_cast<float>(data[1]) / 1000.0f;
+      sanitizeKnockConfig(config.knock);
+      return;
+    }
+    if (cmd == kCmdKnockSetBayCompStartC && dlc >= 2) {
+      config.knock.bayTempCompStartC = static_cast<float>(data[1]) - 40.0f;
+      sanitizeKnockConfig(config.knock);
+      return;
+    }
+    if (cmd == kCmdKnockSetBayCompPerCx1000 && dlc >= 2) {
+      config.knock.bayTempCompPerC = static_cast<float>(data[1]) / 1000.0f;
+      sanitizeKnockConfig(config.knock);
       return;
     }
     if (cmd == kCmdKnockResetEvents) {
@@ -659,6 +915,8 @@ void parseCommand(const String &line) {
   if (cmdUpper.startsWith("KNOCK")) {
     if (!KnockUi::handleCommand(cmd, config.knock, knockMonitor, Serial)) {
       Serial.println("Invalid KNOCK command. Use KNOCK SHOW for current settings.");
+    } else {
+      sanitizeKnockConfig(config.knock);
     }
     return;
   }
@@ -682,6 +940,8 @@ void setup() {
   Serial.begin(config.serialBaud);
   delay(200);
 
+  sanitizeKnockConfig(config.knock);
+
   loadBlend();
   mapSensor.begin(pins::MAP_SENSOR_ADC, config.map);
   floatSensor.begin(pins::FLOAT_SENSOR_DIGITAL, config.floatActiveLow, config.floatDebounceMs);
@@ -692,10 +952,9 @@ void setup() {
 
   SPI.begin();
   pinMode(pins::CAN_SPI_INT, INPUT);
-  if (canBus.begin(MCP_ANY, CAN_500KBPS, MCP_8MHZ) == CAN_OK) {
-    canBus.setMode(MCP_NORMAL);
-    canOnline = true;
+  if (initCanBus()) {
     Serial.println("CAN: MCP2515 online");
+    lastMasterRxMs = millis();
   } else {
     Serial.println("CAN: MCP2515 init failed - running serial-only");
   }
@@ -711,7 +970,15 @@ void loop() {
   if (!elapsed(now, lastLoopMs, config.loopPeriodMs)) return;
   lastLoopMs = now;
 
+  attemptCanRecoveryIfNeeded(now);
   pollCan(now);
+
+  if (canOnline && elapsed(now, lastMasterRxMs, kCanCommandTimeoutMs)) {
+    // Fail safe to OFF if the master controller stops sending commands.
+    armed = false;
+    pendingManualTest = false;
+    manualTestDuty = 0;
+  }
 
   if (hasRemoteRatio) {
     const uint8_t pct = remoteRatioPercent;
@@ -721,6 +988,7 @@ void loop() {
   if (clearFaultsRequested) {
     lastFailsafe = FailsafeReason::None;
     lastReportedCanFault = FailsafeReason::None;
+    analogSafetyLatched = false;
     clearFaultsRequested = false;
   }
 
@@ -728,8 +996,31 @@ void loop() {
   readings.tankLow = floatSensor.update();
   updateAnalogReadings(readings, now);
 
+  float loadPercent = 0.0f;
+  static float lastMapKpaForRate = 0.0f;
+  static uint32_t lastMapRateMs = 0;
+  const float mapSpan = config.map.kpaMax - config.map.baroKpa;
+  if (mapSpan > 1.0f) {
+    loadPercent = ((readings.mapKpa - config.map.baroKpa) / mapSpan) * 100.0f;
+  }
+  loadPercent = clampFloat(loadPercent, 0.0f, 100.0f);
+
+  float mapRateKpaPerSec = 0.0f;
+  if (lastMapRateMs != 0 && now > lastMapRateMs) {
+    const float dt = static_cast<float>(now - lastMapRateMs) / 1000.0f;
+    if (dt > 0.0005f) {
+      mapRateKpaPerSec = (readings.mapKpa - lastMapKpaForRate) / dt;
+    }
+  }
+  lastMapKpaForRate = readings.mapKpa;
+  lastMapRateMs = now;
+
   knockMonitor.setConfig(config.knock);
-  const KnockStateSnapshot knockState = knockMonitor.update(readings.mapKpa, 0, now);
+  const KnockStateSnapshot knockState = knockMonitor.update(readings.mapKpa, loadPercent,
+                                                            mapRateKpaPerSec,
+                                                            readings.iatC,
+                                                            readings.engineBayC,
+                                                            now);
 
   AppConfig effectiveConfig = config;
   if (canOnline && !armed) effectiveConfig.mode = InjectionMode::Off;
@@ -755,6 +1046,14 @@ void loop() {
     result.finalDutyPercent = effectiveConfig.dutyMinPercent;
   }
 
+  const uint16_t analogCriticalMask = static_cast<uint16_t>(kFaultIat | kFaultEngineBay | kFaultMeth);
+  const bool analogCriticalFault = (readings.analogFaultFlags & analogCriticalMask) != 0;
+  if (analogCriticalFault) {
+    result.pump.enabled = false;
+    result.pump.dutyPercent = 0.0f;
+    result.finalDutyPercent = 0.0f;
+  }
+
   pumpDriver.apply(result.pump);
   warningOutput.set(result.failsafe != FailsafeReason::None || knockSafetyShutdown ||
                     knockState.warningActive || knockState.criticalActive);
@@ -773,6 +1072,15 @@ void loop() {
 
   if (knockSafetyShutdown) {
     sendFault(can_protocol::meth_fault_code::SAFETY_SHUTDOWN, kFaultSeverityWarning, 0, 0);
+  }
+
+  if (analogCriticalFault && !analogSafetyLatched) {
+    sendFault(0x0B, kFaultSeverityWarning,
+              static_cast<uint8_t>(readings.analogFaultFlags & 0xFFU),
+              static_cast<uint8_t>((readings.analogFaultFlags >> 8) & 0xFFU));
+    analogSafetyLatched = true;
+  } else if (!analogCriticalFault) {
+    analogSafetyLatched = false;
   }
 
   KnockFaultEvent knockFault{};
@@ -820,6 +1128,38 @@ void loop() {
   Serial.print(knockState.envelope, 2);
   Serial.print(" knockRMS=");
   Serial.print(knockState.knockLevelRms, 2);
+  Serial.print(" knockL/M/H=");
+  Serial.print(knockState.lowBandRms, 2);
+  Serial.print("/");
+  Serial.print(knockState.midBandRms, 2);
+  Serial.print("/");
+  Serial.print(knockState.highBandRms, 2);
+  Serial.print(" specC=");
+  Serial.print(knockState.spectralConfidence, 3);
+  Serial.print(" fftSNR=");
+  Serial.print(knockState.fftSnrDb, 2);
+  Serial.print(" fftL/S=");
+  Serial.print(knockState.fftLongSnrDb, 2);
+  Serial.print("/");
+  Serial.print(knockState.fftShortSnrDb, 2);
+  Serial.print(" harm=");
+  Serial.print(knockState.harmonicScore, 2);
+  Serial.print(" tdev=");
+  Serial.print(knockState.templateDeviation, 3);
+  Serial.print(" mapRate=");
+  Serial.print(knockState.mapRateKpaPerSec, 1);
+  Serial.print(" conf/risk=");
+  Serial.print(knockState.finalConfidence, 2);
+  Serial.print("/");
+  Serial.print(knockState.knockRisk, 2);
+  Serial.print(" hlth=");
+  Serial.print(knockState.healthScore, 1);
+  Serial.print(" cls=");
+  Serial.print(knockState.anomalyClass);
+  Serial.print(" dg=");
+  Serial.print(knockState.degradeMode);
+  Serial.print(" ts=");
+  Serial.print(knockState.transientScale, 2);
   Serial.print(" knockThr=");
   Serial.print(knockState.threshold, 2);
   Serial.print(" knockDet=");

@@ -36,19 +36,67 @@ enum class KnockResponseMode : uint8_t {
 struct KnockConfig {
   bool enabled{true};
   // Detection is only active when both arming conditions are met.
+  // RPM can remain unused if no reliable crank signal is available.
   uint16_t minRpmToArm{0};
   float minMapKpaToArm{120.0f};
+  float minLoadPercentToArm{30.0f};
 
   // Front-end ADC sampling and analysis block sizing.
-  uint16_t sampleRateHz{8000};
+  uint16_t sampleRateHz{20000};
   uint8_t samplesPerUpdate{64};
 
   // Knock band targeting. If autoCenterFromBore is true, centerFreqHz is
   // estimated from bore and harmonic assumptions at runtime.
   bool autoCenterFromBore{true};
-  float boreMm{96.0f};
-  float centerFreqHz{6500.0f};
+  float boreMm{87.5f};
+  float centerFreqHz{7200.0f};
   float bandwidthHz{1800.0f};
+  float multiBandSpread{0.14f};
+  bool fftEnabled{true};
+  float fftMinSnrDb{3.0f};
+  float fftWeight{0.40f};
+  float fftShortWeight{0.45f};
+  float fftHarmonicWeight{0.30f};
+  float spectralTemplateWeight{0.25f};
+
+  // During fast MAP transients, detection thresholds are raised briefly to
+  // reject spool/tip-in mechanical bursts that are not true combustion knock.
+  float mapRateGateKpaPerSec{140.0f};
+  float transientThresholdScale{1.30f};
+  uint16_t transientHoldMs{180};
+
+  float minDetectConfidence{0.52f};
+  float warnConfidence{0.58f};
+  float criticalConfidence{0.72f};
+  float confidenceWeightSpectral{0.35f};
+  float confidenceWeightFft{0.30f};
+  float confidenceWeightHarmonic{0.20f};
+  float confidenceWeightTemplate{0.15f};
+
+  float iatTempCompStartC{40.0f};
+  float iatTempCompPerC{0.010f};
+  float bayTempCompStartC{60.0f};
+  float bayTempCompPerC{0.006f};
+  float maxTempCompScale{1.45f};
+
+  float profileScaleIdle{1.35f};
+  float profileScaleSpool{1.20f};
+  float profileScaleSteady{1.00f};
+  float profileScaleLift{1.15f};
+  float profileScaleHeatSoak{1.28f};
+
+  float longTermBaselineAlpha{0.003f};
+  float driftWarnPercent{35.0f};
+  float driftCriticalPercent{65.0f};
+  float adaptiveMultMin{1.2f};
+  float adaptiveMultMax{3.8f};
+  float adaptiveMultLearnAlpha{0.015f};
+
+  float riskMapRateWeight{0.45f};
+  float riskConfidenceWeight{0.35f};
+  float riskEventWeight{0.20f};
+  float conservativeHealthThreshold{65.0f};
+  float failsafeHealthThreshold{40.0f};
 
   // Sensor and DSP scaling.
   float signalGain{1.0f};
