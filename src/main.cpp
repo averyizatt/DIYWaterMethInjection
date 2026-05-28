@@ -37,6 +37,7 @@ Preferences preferences;
 
 MCP_CAN canBus(pins::CAN_SPI_CS);
 bool canOnline = false;
+bool canRecoveryEnabled = true;
 
 uint32_t lastLoopMs = 0;
 uint32_t lastDebugMs = 0;
@@ -165,6 +166,7 @@ bool initCanBus() {
   }
   canBus.setMode(MCP_NORMAL);
   canOnline = true;
+  canRecoveryEnabled = true;
   canTxFailStreak = 0;
   return true;
 }
@@ -236,6 +238,7 @@ void sanitizeKnockConfig(KnockConfig &knock) {
 }
 
 void attemptCanRecoveryIfNeeded(uint32_t nowMs) {
+  if (!canRecoveryEnabled) return;
   if (canOnline) return;
   if (!elapsed(nowMs, lastCanRecoveryAttemptMs, kCanRecoveryIntervalMs)) return;
   lastCanRecoveryAttemptMs = nowMs;
@@ -256,6 +259,7 @@ void sendRawCanFrame(uint16_t id, const uint8_t *data, uint8_t dlc) {
   if (canTxFailStreak < 65535) ++canTxFailStreak;
   if (canTxFailStreak >= kCanTxFailStreakBeforeOffline) {
     canOnline = false;
+    canRecoveryEnabled = true;
   }
 }
 
@@ -657,6 +661,7 @@ void printHelp() {
   Serial.println("  METH <liters>    - set methanol volume");
   Serial.println("  SHOW             - print current config/blend");
   Serial.println("  MODE OFF|BOOST|PRIME");
+  Serial.println("  CAN RETRY        - re-enable MCP2515 recovery attempts");
   Serial.println("  TEST <0-100>     - fire pump at duty% (bench test)");
   Serial.println("  TEST OFF         - stop bench test");
   KnockUi::printHelp(Serial);
@@ -923,6 +928,13 @@ void parseCommand(const String &line) {
     return;
   }
 
+  if (cmdUpper == "CAN RETRY") {
+    canRecoveryEnabled = true;
+    lastCanRecoveryAttemptMs = 0;
+    Serial.println("CAN recovery re-enabled.");
+    return;
+  }
+
   if (cmdUpper.startsWith("KNOCK")) {
     if (!KnockUi::handleCommand(cmd, config.knock, knockMonitor, Serial)) {
       Serial.println("Invalid KNOCK command. Use KNOCK SHOW for current settings.");
@@ -1007,7 +1019,10 @@ void setup() {
 
   loadBlend();
   mapSensor.begin(pins::MAP_SENSOR_ADC, config.map);
-  floatSensor.begin(pins::FLOAT_SENSOR_DIGITAL, config.floatActiveLow, config.floatDebounceMs);
+  floatSensor.begin(pins::FLOAT_SENSOR_DIGITAL,
+                    config.floatActiveLow,
+                    config.floatDebounceMs,
+                    config.floatLowShutdownDelayMs);
   configureAnalogSensors();
   knockMonitor.begin(pins::KNOCK_SENSOR_ADC, config.knock);
   pumpDriver.begin(pins::PUMP_PWM, config.pwmFrequencyHz, config.pwmResolutionBits);
@@ -1021,6 +1036,8 @@ void setup() {
     lastMasterRxMs = millis();
   } else {
     Serial.println("CAN: MCP2515 init failed - running serial-only");
+    canRecoveryEnabled = false;
+    Serial.println("CAN: auto-recovery paused (use 'CAN RETRY' after wiring MCP2515)");
   }
 
   printSetupSummary();

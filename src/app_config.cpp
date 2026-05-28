@@ -48,6 +48,7 @@ AppConfig defaultConfig() {
 
   config.floatActiveLow = true;
   config.floatDebounceMs = 100;
+  config.floatLowShutdownDelayMs = 2000;
 
   config.serialBaud = 115200;
   config.debugPeriodMs = 250;

@@ -50,7 +50,7 @@ private:
 
 class FloatSensor {
 public:
-  void begin(int digitalPin, bool activeLow, uint32_t debounceMs);
+  void begin(int digitalPin, bool activeLow, uint32_t debounceMs, uint32_t lowHoldMs);
   bool update();
   bool isLow() const;
 
@@ -60,9 +60,12 @@ private:
   int pin_{-1};
   bool activeLow_{true};
   uint32_t debounceMs_{100};
+  uint32_t lowHoldMs_{0};
   uint32_t lastChangeMs_{0};
+  uint32_t lowSinceMs_{0};
   bool lastRawLow_{true};
   bool debouncedLow_{true};
+  bool sustainedLow_{true};
 };
 
 // DS18B20 1-Wire temperature sensor.

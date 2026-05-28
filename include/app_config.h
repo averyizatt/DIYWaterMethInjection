@@ -153,11 +153,11 @@ struct AppConfig {
   uint16_t pwmFrequencyHz{100};
   uint8_t pwmResolutionBits{10};
 
-  // false = active-HIGH low signal means empty; i.e. pin HIGH (open) = empty,
-  // pin LOW (switch closed to GND) = full.  Matches a normally-open switch that
-  // shorts to GND when the tank is full (0 Ω full / open-circuit empty).
-  bool floatActiveLow{false};
+  // true = LOW at pin means low-fluid (switch closes to GND when level is low).
+  // With INPUT_PULLUP, a disconnected/open wire reads HIGH and is treated as full.
+  bool floatActiveLow{true};
   uint32_t floatDebounceMs{100};
+  uint32_t floatLowShutdownDelayMs{2000};
 
   uint32_t serialBaud{115200};
   uint32_t debugPeriodMs{250};

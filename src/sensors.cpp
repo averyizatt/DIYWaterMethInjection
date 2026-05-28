@@ -65,10 +65,11 @@ SensorReadings MapSensor::read() const {
 
 bool MapSensor::valid() const { return valid_; }
 
-void FloatSensor::begin(int digitalPin, bool activeLow, uint32_t debounceMs) {
+void FloatSensor::begin(int digitalPin, bool activeLow, uint32_t debounceMs, uint32_t lowHoldMs) {
   pin_ = digitalPin;
   activeLow_ = activeLow;
   debounceMs_ = debounceMs;
+  lowHoldMs_ = lowHoldMs;
 
   if (pin_ >= 0) {
     pinMode(pin_, INPUT_PULLUP);
@@ -76,12 +77,15 @@ void FloatSensor::begin(int digitalPin, bool activeLow, uint32_t debounceMs) {
 
   lastRawLow_ = rawIsLow();
   debouncedLow_ = lastRawLow_;
+  sustainedLow_ = lastRawLow_;
+  lowSinceMs_ = sustainedLow_ ? millis() : 0;
   lastChangeMs_ = millis();
 }
 
 bool FloatSensor::rawIsLow() const {
   if (pin_ < 0) {
-    return true;
+    // Unwired/disabled input is treated as full (not low).
+    return false;
   }
 
   const bool pinHigh = digitalRead(pin_) == HIGH;
@@ -101,10 +105,18 @@ bool FloatSensor::update() {
     debouncedLow_ = rawLow;
   }
 
-  return debouncedLow_;
+  if (debouncedLow_) {
+    if (lowSinceMs_ == 0) lowSinceMs_ = now;
+    sustainedLow_ = elapsed(now, lowSinceMs_, lowHoldMs_);
+  } else {
+    lowSinceMs_ = 0;
+    sustainedLow_ = false;
+  }
+
+  return sustainedLow_;
 }
 
-bool FloatSensor::isLow() const { return debouncedLow_; }
+bool FloatSensor::isLow() const { return sustainedLow_; }
 
 void TempSensor::begin(int dataPin) {
   pin_ = dataPin;
