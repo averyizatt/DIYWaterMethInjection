@@ -13,6 +13,10 @@ constexpr int KNOCK_SENSOR_ADC = A1;    // A1
 constexpr int CAN_SPI_CS = D10;  // D10
 constexpr int CAN_SPI_INT = D7;  // D7
 
+// Bench-test button: wire a momentary switch between D9 and GND.
+// Holding it fires the pump at benchTestDutyPercent (internal pull-up, active LOW).
+constexpr int BENCH_TEST_BUTTON = D9; // D9 / GPIO18
+
 // Thermistors (default disabled unless wired)
 constexpr int IAT_THERM_PIN = D4;       // D4
 constexpr int DHT11_PIN = D6;           // D6

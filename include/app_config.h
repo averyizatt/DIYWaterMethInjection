@@ -163,6 +163,9 @@ struct AppConfig {
   uint32_t debugPeriodMs{250};
   uint32_t loopPeriodMs{20};
 
+  // Duty applied when the bench-test button is held down.
+  uint8_t benchTestDutyPercent{50};
+
   KnockConfig knock{};
 };
 
