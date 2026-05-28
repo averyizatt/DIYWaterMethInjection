@@ -52,6 +52,7 @@ bool armed = false;
 bool pendingManualTest = false;
 uint8_t manualTestDuty = 0;
 bool benchButtonActive = false;       // true while physical button is held
+bool benchButtonOwnsTest = false;     // true when the button (not CAN) started pendingManualTest
 uint32_t benchButtonDebounceMs = 0;   // last edge time
 uint8_t remoteRatioPercent = 50;
 bool hasRemoteRatio = false;
@@ -221,6 +222,7 @@ void dispatchCanFrame(uint16_t id, uint8_t dlc, const uint8_t *data, uint32_t no
     if (cmd == meth_command::STOP_MANUAL_TEST) {
       pendingManualTest = false;
       manualTestDuty = 0;
+      benchButtonOwnsTest = false;
       armed = false;
       return;
     }
@@ -474,7 +476,9 @@ void printSetupSummary() {
   Serial.println(blend.methPercent, 1);
   Serial.print("Knock ADC pin: ");
   Serial.println(pins::KNOCK_SENSOR_ADC);
-  Serial.print("Bench test button: D9 (GPIO18) - hold to fire pump at ");
+  Serial.print("Bench test button: pin ");
+  Serial.print(pins::BENCH_TEST_BUTTON);
+  Serial.print(" (D9/GPIO18) - hold to fire pump at ");
   Serial.print(config.benchTestDutyPercent);
   Serial.println("%");
   Serial.println("CAN: MCP2515 SPI");
@@ -678,7 +682,7 @@ void parseCommand(const String &line) {
       Serial.println("Manual test stopped.");
     } else {
       float duty = 0.0f;
-      if (parsePositiveFloat(arg, duty) && duty >= 0.0f && duty <= 100.0f) {
+      if (parsePositiveFloat(arg, duty) && duty <= 100.0f) {
         manualTestDuty = static_cast<uint8_t>(duty);
         pendingManualTest = true;
         Serial.print("Manual test: pump at ");
@@ -706,27 +710,28 @@ void handleSerialCommands() {
 }
 
 // Poll the physical bench-test button (active LOW, internal pull-up).
-// Holding the button sets pendingManualTest; releasing clears it.
-// Only takes effect when a CAN-commanded manual test is not already active.
+// Holding the button sets pendingManualTest; releasing clears it only if
+// the button itself started the test (not a CAN-commanded manual test).
 void pollBenchButton(uint32_t nowMs) {
   constexpr uint32_t kDebounceMs = 30;
   const bool rawPressed = (digitalRead(pins::BENCH_TEST_BUTTON) == LOW);
 
   if (rawPressed != benchButtonActive) {
-    if (static_cast<uint32_t>(nowMs - benchButtonDebounceMs) >= kDebounceMs) {
+    if ((nowMs - benchButtonDebounceMs) >= kDebounceMs) {
       benchButtonActive = rawPressed;
       benchButtonDebounceMs = nowMs;
 
       if (benchButtonActive) {
         pendingManualTest = true;
+        benchButtonOwnsTest = true;
         manualTestDuty = config.benchTestDutyPercent;
         Serial.print("Bench test button pressed – pump duty ");
         Serial.print(manualTestDuty);
         Serial.println("%");
-      } else {
-        // Only release if the button started this test (not a CAN-commanded test).
+      } else if (benchButtonOwnsTest) {
         pendingManualTest = false;
         manualTestDuty = 0;
+        benchButtonOwnsTest = false;
         Serial.println("Bench test button released – pump off");
       }
     }
