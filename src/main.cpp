@@ -160,7 +160,7 @@ uint8_t toU8(float value, float scale = 1.0f) {
 }
 
 bool initCanBus() {
-  if (canBus.begin(MCP_ANY, CAN_500KBPS, MCP_8MHZ) != CAN_OK) {
+  if (canBus.begin(MCP_ANY, CAN_500KBPS, MCP_16MHZ) != CAN_OK) {
     canOnline = false;
     return false;
   }
@@ -1030,7 +1030,7 @@ void setup() {
   pinMode(pins::BENCH_TEST_BUTTON, INPUT_PULLUP);
 
   SPI.begin();
-  pinMode(pins::CAN_SPI_INT, INPUT);
+  pinMode(pins::CAN_SPI_INT, INPUT_PULLUP);
   if (initCanBus()) {
     Serial.println("CAN: MCP2515 online");
     lastMasterRxMs = millis();
