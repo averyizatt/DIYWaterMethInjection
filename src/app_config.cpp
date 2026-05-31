@@ -34,6 +34,10 @@ AppConfig defaultConfig() {
     config.map.kpaMax = 312.0f;
   }
   config.map.baroKpa = 101.325f;
+  config.boost.startPsi = 3.5f;
+  config.boost.fullPsi = 7.5f;
+  config.boost.overboostWarnPsi = 13.5f;
+  config.boost.overboostEmergencyPsi = 15.0f;
 
   // Gain chosen to be conservative for cooling/knock margin use.
   // At 25% meth and +4 psi over start, base duty is about 90%.
@@ -41,10 +45,10 @@ AppConfig defaultConfig() {
   config.gainK = 30.0f;
   config.dutyMinPercent = 18.0f;
   config.dutyMaxPercent = 100.0f;
+  config.overboostWarnDutyPercent = 85.0f;
 
-  // 50-200 Hz suggested pump PWM range; default at 100 Hz.
-  config.pwmFrequencyHz = 100;
-  config.pwmResolutionBits = 10;
+  // Relay switching period: 1 second per cycle (1 Hz), safe for all mechanical relays.
+  config.relayPeriodMs = 1000;
 
   config.floatActiveLow = true;
   config.floatDebounceMs = 100;
@@ -53,6 +57,7 @@ AppConfig defaultConfig() {
   config.serialBaud = 115200;
   config.debugPeriodMs = 250;
   config.loopPeriodMs = 20;
+  config.benchTestDutyPercent = 100;
 
   config.knock.enabled = true;
   config.knock.minRpmToArm = 0;

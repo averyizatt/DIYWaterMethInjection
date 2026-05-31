@@ -5,7 +5,8 @@ namespace pins {
 // Core controls (preserve established hardware defaults)
 constexpr int MAP_SENSOR_ADC = A0;      // A0
 constexpr int FLOAT_SENSOR_DIGITAL = D3; // D3
-constexpr int PUMP_PWM = D2;            // D2
+// Use explicit raw GPIO number for pump drive to avoid board-variant D-pin alias ambiguity.
+constexpr int PUMP_OUT = 5;             // GPIO5 (D2) — relay signal, HIGH = relay on
 constexpr int WARNING_LED = 17;         // GPIO17
 constexpr int KNOCK_SENSOR_ADC = A1;    // A1
 
