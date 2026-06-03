@@ -182,7 +182,8 @@ void sanitizeKnockConfig(KnockConfig &knock) {
   knock.minRpmToArm = constrain(knock.minRpmToArm, static_cast<uint16_t>(0), static_cast<uint16_t>(12000));
   knock.minMapKpaToArm = clampFloat(knock.minMapKpaToArm, 20.0f, 320.0f);
   knock.minLoadPercentToArm = clampFloat(knock.minLoadPercentToArm, 0.0f, 100.0f);
-  knock.sampleRateHz = constrain(knock.sampleRateHz, static_cast<uint16_t>(6000), static_cast<uint16_t>(25000));
+  knock.sampleRateHz =
+      constrain(knock.sampleRateHz, knock_sensor_specs::kMinSampleRateHz, knock_sensor_specs::kMaxSampleRateHz);
   knock.samplesPerUpdate = constrain(knock.samplesPerUpdate, static_cast<uint8_t>(16), static_cast<uint8_t>(128));
   knock.boreMm = clampFloat(knock.boreMm, 60.0f, 120.0f);
   knock.centerFreqHz =

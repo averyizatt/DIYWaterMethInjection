@@ -153,9 +153,10 @@ float temperatureScaleFor(float iatC, float bayC, const KnockDetectorConfig &cfg
 void KnockDetectorLogic::configure(const KnockDetectorConfig &config) {
   config_ = config;
 
-  const float maxAnalyzableHz = clampFloat(config_.sampleRateHz * 0.45f,
-                                           knock_sensor_specs::kFreqMinHz,
-                                           knock_sensor_specs::kFreqMaxHz);
+  const float maxAnalyzableHz = (config_.sampleRateHz * knock_sensor_specs::kNyquistSafetyFactor) <
+                                        knock_sensor_specs::kFreqMaxHz
+                                    ? (config_.sampleRateHz * knock_sensor_specs::kNyquistSafetyFactor)
+                                    : knock_sensor_specs::kFreqMaxHz;
   const float requestedCenter = config_.autoCenterFromBore ? estimateKnockCenterHz(config_.boreMm)
                                                             : config_.centerFreqHz;
   const float baseCenter = clampFloat(requestedCenter, knock_sensor_specs::kFreqMinHz, maxAnalyzableHz);
@@ -225,11 +226,17 @@ KnockDetectorFrame KnockDetectorLogic::processBlock(const uint16_t *samples,
 
   frame.loadPercent = clampFloat(loadPercent, 0.0f, 100.0f);
   frame.mapRateKpaPerSec = mapRateKpaPerSec;
-  frame.iatC = clampFloat(iatC, knock_sensor_specs::kOperatingTempMinC, knock_sensor_specs::kOperatingTempMaxC);
-  frame.bayC = clampFloat(bayC, knock_sensor_specs::kOperatingTempMinC, knock_sensor_specs::kOperatingTempMaxC);
-  frame.profile = detectProfile(mapKpa, frame.loadPercent, mapRateKpaPerSec, frame.iatC, frame.bayC, config_);
+  frame.iatC = iatC;
+  frame.bayC = bayC;
+  const float clampedIatC = clampFloat(iatC,
+                                       knock_sensor_specs::kOperatingTempMinC,
+                                       knock_sensor_specs::kOperatingTempMaxC);
+  const float clampedBayC = clampFloat(bayC,
+                                       knock_sensor_specs::kOperatingTempMinC,
+                                       knock_sensor_specs::kOperatingTempMaxC);
+  frame.profile = detectProfile(mapKpa, frame.loadPercent, mapRateKpaPerSec, clampedIatC, clampedBayC, config_);
   frame.profileScale = clampFloat(profileScaleFor(frame.profile, config_), 0.8f, 1.8f);
-  frame.tempScale = temperatureScaleFor(frame.iatC, frame.bayC, config_);
+  frame.tempScale = temperatureScaleFor(clampedIatC, clampedBayC, config_);
 
   for (uint8_t i = 0; i < sampleCount; ++i) {
     const float sample = static_cast<float>(samples[i]);

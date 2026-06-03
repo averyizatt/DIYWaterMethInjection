@@ -42,6 +42,10 @@ enum class KnockResponseMode : uint8_t {
 namespace knock_sensor_specs {
 constexpr float kFreqMinHz = 3000.0f;
 constexpr float kFreqMaxHz = 25000.0f;
+// Keep > 2x 3 kHz with Nyquist safety factor margin (0.45f usable band).
+constexpr uint16_t kMinSampleRateHz = 7000U;
+constexpr uint16_t kMaxSampleRateHz = 25000U;
+constexpr float kNyquistSafetyFactor = 0.45f;
 constexpr float kResonanceHz = 30000.0f;
 constexpr float kSensitivityAt5kMvPerG = 26.0f;
 constexpr float kSensitivityTempMvPerGC = 0.04f;
