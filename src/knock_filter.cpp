@@ -1,4 +1,5 @@
 #include "knock_filter.h"
+#include "app_config.h"
 
 #include <math.h>
 
@@ -14,8 +15,15 @@ float clampFloat(float value, float minValue, float maxValue) {
 
 void KnockFilterPipeline::configure(const KnockFilterConfig &config) {
   config_ = config;
-  config_.sampleRateHz = clampFloat(config_.sampleRateHz, 1000.0f, 25000.0f);
-  config_.centerFreqHz = clampFloat(config_.centerFreqHz, 1000.0f, config_.sampleRateHz * 0.45f);
+  config_.sampleRateHz = clampFloat(config_.sampleRateHz,
+                                    static_cast<float>(knock_sensor_specs::kMinSampleRateHz),
+                                    static_cast<float>(knock_sensor_specs::kMaxSampleRateHz));
+  const float maxCenterHz = (config_.sampleRateHz * knock_sensor_specs::kNyquistSafetyFactor) <
+                                    knock_sensor_specs::kFreqMaxHz
+                                ? (config_.sampleRateHz * knock_sensor_specs::kNyquistSafetyFactor)
+                                : knock_sensor_specs::kFreqMaxHz;
+  config_.centerFreqHz =
+      clampFloat(config_.centerFreqHz, knock_sensor_specs::kFreqMinHz, maxCenterHz);
   config_.bandwidthHz = clampFloat(config_.bandwidthHz, 300.0f, config_.sampleRateHz * 0.35f);
   config_.biasAlpha = clampFloat(config_.biasAlpha, 0.0001f, 0.05f);
   config_.envelopeAlpha = clampFloat(config_.envelopeAlpha, 0.01f, 0.8f);
