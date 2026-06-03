@@ -182,10 +182,11 @@ void sanitizeKnockConfig(KnockConfig &knock) {
   knock.minRpmToArm = constrain(knock.minRpmToArm, static_cast<uint16_t>(0), static_cast<uint16_t>(12000));
   knock.minMapKpaToArm = clampFloat(knock.minMapKpaToArm, 20.0f, 320.0f);
   knock.minLoadPercentToArm = clampFloat(knock.minLoadPercentToArm, 0.0f, 100.0f);
-  knock.sampleRateHz = constrain(knock.sampleRateHz, static_cast<uint16_t>(2000), static_cast<uint16_t>(20000));
+  knock.sampleRateHz = constrain(knock.sampleRateHz, static_cast<uint16_t>(6000), static_cast<uint16_t>(25000));
   knock.samplesPerUpdate = constrain(knock.samplesPerUpdate, static_cast<uint8_t>(16), static_cast<uint8_t>(128));
   knock.boreMm = clampFloat(knock.boreMm, 60.0f, 120.0f);
-  knock.centerFreqHz = clampFloat(knock.centerFreqHz, 1000.0f, 9000.0f);
+  knock.centerFreqHz =
+      clampFloat(knock.centerFreqHz, knock_sensor_specs::kFreqMinHz, knock_sensor_specs::kFreqMaxHz);
   knock.bandwidthHz = clampFloat(knock.bandwidthHz, 300.0f, 5000.0f);
   knock.multiBandSpread = clampFloat(knock.multiBandSpread, 0.05f, 0.35f);
   knock.fftMinSnrDb = clampFloat(knock.fftMinSnrDb, -6.0f, 20.0f);
@@ -206,9 +207,13 @@ void sanitizeKnockConfig(KnockConfig &knock) {
   knock.confidenceWeightFft = clampFloat(knock.confidenceWeightFft, 0.0f, 1.0f);
   knock.confidenceWeightHarmonic = clampFloat(knock.confidenceWeightHarmonic, 0.0f, 1.0f);
   knock.confidenceWeightTemplate = clampFloat(knock.confidenceWeightTemplate, 0.0f, 1.0f);
-  knock.iatTempCompStartC = clampFloat(knock.iatTempCompStartC, -20.0f, 120.0f);
+  knock.iatTempCompStartC = clampFloat(knock.iatTempCompStartC,
+                                       knock_sensor_specs::kOperatingTempMinC,
+                                       knock_sensor_specs::kOperatingTempMaxC);
   knock.iatTempCompPerC = clampFloat(knock.iatTempCompPerC, 0.0f, 0.05f);
-  knock.bayTempCompStartC = clampFloat(knock.bayTempCompStartC, -20.0f, 150.0f);
+  knock.bayTempCompStartC = clampFloat(knock.bayTempCompStartC,
+                                       knock_sensor_specs::kOperatingTempMinC,
+                                       knock_sensor_specs::kOperatingTempMaxC);
   knock.bayTempCompPerC = clampFloat(knock.bayTempCompPerC, 0.0f, 0.05f);
   knock.maxTempCompScale = clampFloat(knock.maxTempCompScale, 1.0f, 2.5f);
   knock.profileScaleIdle = clampFloat(knock.profileScaleIdle, 0.8f, 2.0f);

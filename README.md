@@ -140,6 +140,13 @@ Use this sequence when calibrating a new engine/setup:
 4. Test under different RPM and load ranges.
 5. Adjust center frequency and bandwidth until true knock is captured while false positives are minimized.
 
+The current knock path enforces knock-sensor datasheet constraints in firmware:
+
+- knock frequency window constrained to 3-25 kHz
+- runtime center frequency constrained to sensor range and ADC/Nyquist headroom
+- temperature compensation start points constrained to -40 to 150°C
+- default temperature compensation slope derived from 0.04 mV/g°C @ 26 mV/g sensitivity
+
 ## Build and upload
 
 ```bash
