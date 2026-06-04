@@ -67,7 +67,7 @@ AppConfig defaultConfig() {
   config.knock.samplesPerUpdate = 64;
   config.knock.autoCenterFromBore = true;
   config.knock.boreMm = 87.5f;
-  config.knock.centerFreqHz = 7200.0f;
+  config.knock.centerFreqHz = 5000.0f;
   config.knock.bandwidthHz = 1800.0f;
   config.knock.multiBandSpread = 0.14f;
   config.knock.fftEnabled = true;
@@ -87,9 +87,9 @@ AppConfig defaultConfig() {
   config.knock.confidenceWeightHarmonic = 0.20f;
   config.knock.confidenceWeightTemplate = 0.15f;
   config.knock.iatTempCompStartC = 40.0f;
-  config.knock.iatTempCompPerC = 0.010f;
+  config.knock.iatTempCompPerC = knock_sensor_specs::kSensitivityTempScalePerC;
   config.knock.bayTempCompStartC = 60.0f;
-  config.knock.bayTempCompPerC = 0.006f;
+  config.knock.bayTempCompPerC = knock_sensor_specs::kSensitivityTempScalePerC;
   config.knock.maxTempCompScale = 1.45f;
   config.knock.profileScaleIdle = 1.35f;
   config.knock.profileScaleSpool = 1.20f;
