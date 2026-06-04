@@ -116,10 +116,13 @@ constexpr uint8_t kCmdKnockSetIatCompPerCx1000 = 0x59;
 constexpr uint8_t kCmdKnockSetBayCompStartC = 0x5A;
 constexpr uint8_t kCmdKnockSetBayCompPerCx1000 = 0x5B;
 
-// When true, setup/loop are completely replaced by a dead-simple isolated test:
-// GPIO5 (pump pin) follows button on GPIO18 (D9). Nothing else initialises.
-// Set false to run normal firmware.
-constexpr bool kPumpDirectGpioBenchDebug = true;
+// Relay bench test (hardware confirmed working — keep false).
+// GPIO5 (pump pin) follows D9 button. Nothing else initialises.
+constexpr bool kPumpDirectGpioBenchDebug = false;
+
+// Sensor + CAN test mode. Inits MAP sensor, knock monitor, and CAN bus only.
+// Prints live readings to serial every 500ms. Set false for normal operation.
+constexpr bool kSensorTest = true;
 
 constexpr uint16_t kFaultIat = 1U << 0;
 constexpr uint16_t kFaultEngineBay = 1U << 1;
@@ -1085,6 +1088,23 @@ void setup() {
     return;
   }
 
+  if (kSensorTest) {
+    Serial.begin(115200);
+    delay(200);
+    Serial.println("\n=== SENSOR / CAN TEST MODE ===");
+    sanitizeKnockConfig(config.knock);
+    mapSensor.begin(pins::MAP_SENSOR_ADC, config.map);
+    knockMonitor.begin(pins::KNOCK_SENSOR_ADC, config.knock);
+    SPI.begin();
+    pinMode(pins::CAN_SPI_INT, INPUT);
+    if (initCanBus()) {
+      Serial.println("CAN:   MCP2515 online");
+    } else {
+      Serial.println("CAN:   MCP2515 INIT FAILED — check wiring/power");
+    }
+    return;
+  }
+
   Serial.begin(config.serialBaud);
   delay(200);
 
@@ -1125,10 +1145,60 @@ void setup() {
 
 void loop() {
   if (kPumpDirectGpioBenchDebug) {
-    // DEBUG: GPIO5 forced HIGH via ESP-IDF (bypasses Arduino framework entirely).
-    // Probe D2 pin — must read 3.3V. LED blinks to confirm loop is alive.
-    gpio_set_level(GPIO_NUM_5, gpio_get_level(GPIO_NUM_18) == 0 ? 1 : 0); // button LOW = relay ON
-    gpio_set_level(GPIO_NUM_17, gpio_get_level(GPIO_NUM_18) == 0 ? 1 : 0); // LED mirrors
+    // Fully isolated relay test. Button (D9/GPIO18) drives relay (D2/GPIO5) and LED (D8/GPIO17).
+    const bool pressed = (gpio_get_level(GPIO_NUM_18) == 0);
+    gpio_set_level(GPIO_NUM_5,  pressed ? 1 : 0); // relay
+    gpio_set_level(GPIO_NUM_17, pressed ? 1 : 0); // warning LED
+
+    static uint32_t lastPrint = 0;
+    const uint32_t ms = millis();
+    if (ms - lastPrint >= 1000) {
+      lastPrint = ms;
+      Serial.print("[BENCH] t="); Serial.print(ms / 1000);
+      Serial.print("s  button="); Serial.print(pressed ? "PRESSED" : "open");
+      Serial.print("  relay="); Serial.println(pressed ? "ON" : "OFF");
+    }
+    delay(10);
+    return;
+  }
+
+  if (kSensorTest) {
+    const uint32_t ms = millis();
+    pollCan(ms);
+
+    const SensorReadings readings = mapSensor.read();
+    // Pass zero RPM/load/rate — knock won't arm but raw signal is still visible.
+    const KnockStateSnapshot knock = knockMonitor.update(
+        readings.mapKpa, 0.0f, 0.0f, 0.0f, 0.0f, ms);
+
+    static uint32_t lastPrint = 0;
+    if (ms - lastPrint >= 500) {
+      lastPrint = ms;
+      Serial.println("---");
+      // MAP sensor
+      Serial.print("MAP:   ");
+      if (readings.mapValid) {
+        Serial.print(readings.mapKpa, 1); Serial.print(" kPa | ");
+        Serial.print(readings.boostPsi, 2); Serial.print(" psi boost | ");
+        Serial.print(readings.mapVoltage, 3); Serial.println(" V");
+      } else {
+        Serial.print(readings.mapKpa, 1); Serial.println(" kPa  [INVALID — check wiring]");
+      }
+      // Knock sensor
+      Serial.print("KNOCK: rawADC="); Serial.print(knock.rawAdc, 0);
+      Serial.print(" | envelope="); Serial.print(knock.envelope, 4);
+      Serial.print(" | rms="); Serial.print(knock.knockLevelRms, 4);
+      Serial.print(" | warn="); Serial.print(knock.warningActive ? "YES" : "no");
+      Serial.print(" | crit="); Serial.println(knock.criticalActive ? "YES" : "no");
+      // CAN
+      Serial.print("CAN:   "); Serial.print(canOnline ? "online" : "OFFLINE");
+      if (canOnline) {
+        Serial.print(" | last rx ");
+        Serial.print((ms - lastMasterRxMs) / 1000.0f, 1);
+        Serial.print("s ago");
+      }
+      Serial.println();
+    }
     delay(10);
     return;
   }
