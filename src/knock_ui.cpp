@@ -7,7 +7,7 @@ bool parseFloat(const String &token, float &out) {
   char buffer[32];
   token.toCharArray(buffer, sizeof(buffer));
   char *endPtr = nullptr;
-  const float parsed = strtof(buffer, &endPtr);
+  const float parsed = static_cast<float>(strtod(buffer, &endPtr));
   if (endPtr == buffer) return false;
   out = parsed;
   return true;

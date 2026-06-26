@@ -2,35 +2,34 @@
 #include <Arduino.h>
 
 namespace pins {
-// Core controls (preserve established hardware defaults)
-constexpr int MAP_SENSOR_ADC = A0;      // A0
-constexpr int FLOAT_SENSOR_DIGITAL = D3; // D3
-// Use explicit raw GPIO number for pump drive to avoid board-variant D-pin alias ambiguity.
-constexpr int PUMP_OUT = 5;             // GPIO5 (D2) — relay signal, HIGH = relay on
-constexpr int WARNING_LED = 17;         // GPIO17
-constexpr int KNOCK_SENSOR_ADC = A1;    // A1
+// Classic Nano wiring.
+// Wiring: MAP=A4, KNOCK=A5.
+constexpr int MAP_SENSOR_ADC = A4;
+constexpr int KNOCK_SENSOR_ADC = A5;
 
-// MCP2515 SPI CAN module control pins (when using MCP2515 profile)
-constexpr int CAN_SPI_CS = D10;  // D10
-constexpr int CAN_SPI_INT = D7;  // D7
+constexpr int FLOAT_SENSOR_DIGITAL = 3;
+constexpr int PUMP_OUT = 2;
+constexpr int WARNING_LED = 7;
 
-// Bench-test button: wire a momentary switch between D9 and GND.
-// Holding it fires the pump at benchTestDutyPercent (internal pull-up, active LOW).
-constexpr int BENCH_TEST_BUTTON = D9; // D9 / GPIO18
+// MCP2515 SPI CAN
+constexpr int CAN_SPI_CS = 10;
+constexpr int CAN_SPI_INT = 8;
 
-// Thermistors (default disabled unless wired)
-constexpr int IAT_THERM_PIN = D4;       // D4
-constexpr int DHT11_PIN = D6;           // D6
-constexpr int ENGINE_BAY_THERM_PIN = 8; // GPIO8
-constexpr int CABIN_THERM_PIN = 9;      // GPIO9
-// Disabled by default because GPIO10 maps to D10, which is used by MCP2515 CS.
+// Bench-test button active LOW with internal pull-up.
+constexpr int BENCH_TEST_BUTTON = 9;
+
+// Thermistors disabled until wired.
+constexpr int IAT_THERM_PIN = -1;
+constexpr int DHT11_PIN = -1;
+constexpr int ENGINE_BAY_THERM_PIN = -1;
+constexpr int CABIN_THERM_PIN = -1;
 constexpr int AMBIENT_THERM_PIN = -1;
 
-// Pressure transducers (divider-scaled to ADC)
-constexpr int OIL_PRESSURE_ADC = A4;       // A4
-constexpr int FUEL_PRESSURE_ADC = A5;      // A5
-constexpr int METH_PRESSURE_ADC = 13;      // GPIO13
-constexpr int BOOST_REF_PRESSURE_ADC = 14; // GPIO14
-constexpr int SPARE_PRESSURE_1_ADC = 15;   // GPIO15
-constexpr int SPARE_PRESSURE_2_ADC = 16;   // GPIO16
+// Pressure transducers disabled until dedicated hardware is wired.
+constexpr int OIL_PRESSURE_ADC = -1;
+constexpr int FUEL_PRESSURE_ADC = -1;
+constexpr int METH_PRESSURE_ADC = -1;
+constexpr int BOOST_REF_PRESSURE_ADC = -1;
+constexpr int SPARE_PRESSURE_1_ADC = -1;
+constexpr int SPARE_PRESSURE_2_ADC = -1;
 } // namespace pins

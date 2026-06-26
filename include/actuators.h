@@ -20,8 +20,6 @@ private:
   int pin_{-1};
   bool isRelay_{false};
   uint16_t relayPeriodMs_{1000};
-  // LEDC fields
-  int channel_{0};
   uint8_t resolutionBits_{10};
   uint32_t maxDutyCount_{1023};
 };

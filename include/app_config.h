@@ -140,7 +140,7 @@ struct KnockConfig {
 
   // Sensor sanity/fault detection controls.
   uint16_t clipLowAdc{5};
-  uint16_t clipHighAdc{4090};
+  uint16_t clipHighAdc{1018};
   uint8_t clipPercentForFault{30};
   uint16_t stuckAdcDelta{3};
   uint16_t faultHoldMs{1200};

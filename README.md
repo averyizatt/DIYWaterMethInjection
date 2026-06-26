@@ -1,6 +1,6 @@
 # DIY Water/Meth Injection Controller
 
-Standalone Nano ESP32 firmware for a water/meth controller with:
+Standalone Arduino Nano firmware for a water/meth controller with:
 
 - MCP2515 (SPI) CAN bus only
 - MAP/float/temperature/pressure analog sensing
@@ -149,7 +149,37 @@ The current knock path enforces knock-sensor datasheet constraints in firmware:
 
 ## Build and upload
 
+Nano environments:
+
+- `arduino_nano`: modern bootloader upload speed (115200)
+- `arduino_nano_old_bootloader`: clone/old bootloader upload speed (57600)
+
+Build/upload commands:
+
 ```bash
-platformio run -e arduino_nano_esp32
-platformio run -e arduino_nano_esp32 -t upload
+platformio run -e arduino_nano
+platformio run -e arduino_nano -t upload
 ```
+
+If upload fails on a clone Nano, use:
+
+```bash
+platformio run -e arduino_nano_old_bootloader -t upload
+```
+
+Nano wiring used by the firmware:
+
+- MAP analog input: `A4`
+- Knock analog input: `A5`
+- Float switch (active low): `D3`
+- Pump relay output: `D2`
+- Warning LED output: `D7`
+- MCP2515 CAN CS: `D10`
+- MCP2515 CAN INT: `D8`
+- MCP2515 CAN MOSI/SI: `D11`
+- MCP2515 CAN MISO/SO: `D12`
+- MCP2515 CAN SCK: `D13`
+
+The firmware initializes the MCP2515 at `500 kbps` with the common `8 MHz` CAN module crystal setting. It prints received CAN frames to serial and transmits a `0x300` heartbeat once per second for bus testing.
+
+The Nano profile builds a reduced firmware (`main_nano.cpp` + `sensors_nano.cpp`) so it fits ATmega328P flash/RAM.

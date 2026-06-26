@@ -17,6 +17,8 @@ private:
   int pin_{-1};
   MapCalibration calibration_{};
   bool valid_{false};
+  mutable bool filterInitialized_{false};
+  mutable float filteredVoltage_{0.0f};
 };
 
 class FloatSensor {
@@ -74,8 +76,8 @@ struct ThermistorConfig {
   bool enabled{false};
   int pin{-1};
   float pullupOhms{10000.0f};
-  float adcVref{3.3f};
-  uint16_t adcMaxCount{4095};
+  float adcVref{5.0f};
+  uint16_t adcMaxCount{1023};
   uint8_t oversampleCount{8};
   float filterAlpha{0.20f};
   uint16_t staleTimeoutMs{1000};
@@ -122,8 +124,8 @@ enum class PressureFault : uint8_t {
 struct PressureConfig {
   bool enabled{false};
   int pin{-1};
-  float adcVref{3.3f};
-  uint16_t adcMaxCount{4095};
+  float adcVref{5.0f};
+  uint16_t adcMaxCount{1023};
   uint8_t oversampleCount{8};
   float filterAlpha{0.20f};
   uint16_t staleTimeoutMs{1000};
