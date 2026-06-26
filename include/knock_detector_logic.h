@@ -110,7 +110,7 @@ struct KnockDetectorConfig {
   float sampleRateHz{8000.0f};
 
   uint16_t clipLowAdc{5};
-  uint16_t clipHighAdc{4090};
+  uint16_t clipHighAdc{1018};
   uint8_t clipPercentForFault{30};
   uint16_t stuckAdcDelta{3};
   uint16_t faultHoldMs{1200};
@@ -130,7 +130,7 @@ struct KnockDetectorFrame {
   bool baselineLearned{false};
 
   float rawAdc{0.0f};
-  float biasAdc{2048.0f};
+  float biasAdc{512.0f};
   float centered{0.0f};
   float filtered{0.0f};
   float envelope{0.0f};

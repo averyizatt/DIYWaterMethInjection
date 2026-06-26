@@ -3,7 +3,7 @@
 #include <stdint.h>
 
 struct KnockSamplerStats {
-  uint16_t minAdc{4095};
+  uint16_t minAdc{1023};
   uint16_t maxAdc{0};
   uint16_t clipLowCount{0};
   uint16_t clipHighCount{0};

@@ -39,6 +39,21 @@ enum class KnockResponseMode : uint8_t {
   SafetyShutdown = 3,
 };
 
+namespace knock_sensor_specs {
+constexpr float kFreqMinHz = 3000.0f;
+constexpr float kFreqMaxHz = 25000.0f;
+// Keep > 2x 3 kHz with Nyquist safety factor margin (0.45f usable band).
+constexpr uint16_t kMinSampleRateHz = 7000U;
+constexpr uint16_t kMaxSampleRateHz = 25000U;
+constexpr float kNyquistSafetyFactor = 0.45f;
+constexpr float kResonanceHz = 30000.0f;
+constexpr float kSensitivityAt5kMvPerG = 26.0f;
+constexpr float kSensitivityTempMvPerGC = 0.04f;
+constexpr float kOperatingTempMinC = -40.0f;
+constexpr float kOperatingTempMaxC = 150.0f;
+constexpr float kSensitivityTempScalePerC = kSensitivityTempMvPerGC / kSensitivityAt5kMvPerG;
+} // namespace knock_sensor_specs
+
 struct KnockConfig {
   bool enabled{true};
   // Detection is only active when both arming conditions are met.
@@ -51,11 +66,12 @@ struct KnockConfig {
   uint16_t sampleRateHz{20000};
   uint8_t samplesPerUpdate{64};
 
-  // Knock band targeting. If autoCenterFromBore is true, centerFreqHz is
+  // Knock band targeting. Sensor operating frequency range is 3-25 kHz.
+  // If autoCenterFromBore is true, centerFreqHz is
   // estimated from bore and harmonic assumptions at runtime.
   bool autoCenterFromBore{true};
   float boreMm{87.5f};
-  float centerFreqHz{7200.0f};
+  float centerFreqHz{5000.0f};
   float bandwidthHz{1800.0f};
   float multiBandSpread{0.14f};
   bool fftEnabled{true};
@@ -80,9 +96,9 @@ struct KnockConfig {
   float confidenceWeightTemplate{0.15f};
 
   float iatTempCompStartC{40.0f};
-  float iatTempCompPerC{0.010f};
+  float iatTempCompPerC{knock_sensor_specs::kSensitivityTempScalePerC};
   float bayTempCompStartC{60.0f};
-  float bayTempCompPerC{0.006f};
+  float bayTempCompPerC{knock_sensor_specs::kSensitivityTempScalePerC};
   float maxTempCompScale{1.45f};
 
   float profileScaleIdle{1.35f};
@@ -124,7 +140,7 @@ struct KnockConfig {
 
   // Sensor sanity/fault detection controls.
   uint16_t clipLowAdc{5};
-  uint16_t clipHighAdc{4090};
+  uint16_t clipHighAdc{1018};
   uint8_t clipPercentForFault{30};
   uint16_t stuckAdcDelta{3};
   uint16_t faultHoldMs{1200};

@@ -12,16 +12,11 @@ void PumpDriver::begin(int pwmPin, uint16_t frequencyHz, uint8_t resolutionBits)
   resolutionBits_ = resolutionBits;
   maxDutyCount_ = (1UL << resolutionBits_) - 1UL;
 
-  // arduino-esp32 v3.x: ledcAttach(pin, freq, resolution)
-  // arduino-esp32 v2.x: ledcSetup(channel, freq, resolution) + ledcAttachPin(pin, channel)
-#if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
-  ledcAttach(pin_, frequencyHz, resolutionBits_);
-  ledcWrite(pin_, 0);
-#else
-  ledcSetup(channel_, frequencyHz, resolutionBits_);
-  ledcAttachPin(pin_, channel_);
-  ledcWrite(channel_, 0);
-#endif
+  (void)frequencyHz;
+  (void)resolutionBits_;
+  maxDutyCount_ = 255;
+  pinMode(pin_, OUTPUT);
+  analogWrite(pin_, 0);
 }
 
 void PumpDriver::beginRelay(int pin, uint16_t periodMs) {
@@ -56,21 +51,13 @@ void PumpDriver::apply(const PumpCommand &command) {
 
   // LEDC path (not used with relay hardware)
   if (!command.enabled) {
-#if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
-    ledcWrite(pin_, 0);
-#else
-    ledcWrite(channel_, 0);
-#endif
+    analogWrite(pin_, 0);
     return;
   }
 
   const float clampedDuty = constrain(command.dutyPercent, 0.0f, 100.0f);
   const uint32_t dutyCount = static_cast<uint32_t>((clampedDuty / 100.0f) * static_cast<float>(maxDutyCount_));
-#if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
-  ledcWrite(pin_, dutyCount);
-#else
-  ledcWrite(channel_, dutyCount);
-#endif
+  analogWrite(pin_, static_cast<uint8_t>(dutyCount));
 }
 
 void WarningOutput::begin(int pin, bool activeHigh) {

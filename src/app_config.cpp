@@ -21,11 +21,11 @@ TankBlend computeTankBlend(float waterLiters, float methLiters) {
 AppConfig defaultConfig() {
   AppConfig config{};
 
-  // Common GM MAP sensors through a 47k/94k divider (ratio 0.6667).
-  // Sensor outputs 0.5-4.5 V; after divider: 0.333-3.000 V at ESP32 ADC.
+  // GM MAP sensor wired directly to the Nano ADC.
+  // Sensor outputs 0.5-4.5 V across the Nano's 0-5 V ADC range.
   config.mapType = MapSensorType::GM3Bar;
-  config.map.vMin = 0.333f;
-  config.map.vMax = 3.000f;
+  config.map.vMin = 0.500f;
+  config.map.vMax = 4.500f;
   if (config.mapType == MapSensorType::GM2Bar) {
     config.map.kpaMin = 10.0f;
     config.map.kpaMax = 200.0f;
@@ -33,7 +33,7 @@ AppConfig defaultConfig() {
     config.map.kpaMin = 20.0f;
     config.map.kpaMax = 312.0f;
   }
-  config.map.baroKpa = 101.325f;
+  config.map.baroKpa = 90.0f;
   config.boost.startPsi = 3.5f;
   config.boost.fullPsi = 7.5f;
   config.boost.overboostWarnPsi = 13.5f;
@@ -67,7 +67,7 @@ AppConfig defaultConfig() {
   config.knock.samplesPerUpdate = 64;
   config.knock.autoCenterFromBore = true;
   config.knock.boreMm = 87.5f;
-  config.knock.centerFreqHz = 7200.0f;
+  config.knock.centerFreqHz = 5000.0f;
   config.knock.bandwidthHz = 1800.0f;
   config.knock.multiBandSpread = 0.14f;
   config.knock.fftEnabled = true;
@@ -87,9 +87,9 @@ AppConfig defaultConfig() {
   config.knock.confidenceWeightHarmonic = 0.20f;
   config.knock.confidenceWeightTemplate = 0.15f;
   config.knock.iatTempCompStartC = 40.0f;
-  config.knock.iatTempCompPerC = 0.010f;
+  config.knock.iatTempCompPerC = knock_sensor_specs::kSensitivityTempScalePerC;
   config.knock.bayTempCompStartC = 60.0f;
-  config.knock.bayTempCompPerC = 0.006f;
+  config.knock.bayTempCompPerC = knock_sensor_specs::kSensitivityTempScalePerC;
   config.knock.maxTempCompScale = 1.45f;
   config.knock.profileScaleIdle = 1.35f;
   config.knock.profileScaleSpool = 1.20f;
@@ -120,7 +120,7 @@ AppConfig defaultConfig() {
   config.knock.criticalThresholdCount = 4;
   config.knock.baselineLearningEnabled = true;
   config.knock.clipLowAdc = 5;
-  config.knock.clipHighAdc = 4090;
+  config.knock.clipHighAdc = 1018;
   config.knock.clipPercentForFault = 30;
   config.knock.stuckAdcDelta = 3;
   config.knock.faultHoldMs = 1200;

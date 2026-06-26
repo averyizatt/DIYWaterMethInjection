@@ -231,6 +231,14 @@ KnockStateSnapshot KnockMonitor::update(float mapKpa, float loadPercent,
 
   state_.requestForceSpray = false;
   state_.requestSafetyShutdown = false;
+
+  // If ADC is railed high, treat the signal as invalid regardless of detector outcome.
+  if (state_.rawAdc >= static_cast<float>(config_.clipHighAdc)) {
+    state_.signalValid = false;
+    state_.sensorFault = true;
+    state_.clippingDetected = true;
+  }
+
   switch (config_.responseMode) {
   case KnockResponseMode::ForceSpray:
     state_.requestForceSpray = state_.criticalActive;

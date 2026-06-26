@@ -8,10 +8,6 @@ void KnockSampler::begin(int adcPin, uint16_t sampleRateHz) {
 
   if (adcPin_ >= 0) {
     pinMode(adcPin_, INPUT);
-    analogReadResolution(12);
-#if defined(ADC_11db)
-    analogSetPinAttenuation(adcPin_, ADC_11db);
-#endif
   }
 }
 
@@ -34,6 +30,7 @@ uint8_t KnockSampler::captureBlock(uint16_t *outSamples, uint8_t maxSamples,
     nextTick += periodUs;
 
     const uint16_t raw = static_cast<uint16_t>(analogRead(adcPin_));
+
     outSamples[i] = raw;
     if (raw < stats.minAdc) stats.minAdc = raw;
     if (raw > stats.maxAdc) stats.maxAdc = raw;
