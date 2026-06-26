@@ -4,6 +4,7 @@
 
 void PumpDriver::begin(int pwmPin, uint16_t frequencyHz, uint8_t resolutionBits) {
   pin_ = pwmPin;
+  isRelay_ = false;
   if (pin_ < 0) {
     return;
   }
@@ -23,11 +24,37 @@ void PumpDriver::begin(int pwmPin, uint16_t frequencyHz, uint8_t resolutionBits)
 #endif
 }
 
+void PumpDriver::beginRelay(int pin, uint16_t periodMs) {
+  pin_ = pin;
+  isRelay_ = true;
+  relayPeriodMs_ = (periodMs > 0) ? periodMs : 1000;
+  if (pin_ < 0) return;
+  pinMode(pin_, OUTPUT);
+  digitalWrite(pin_, LOW);
+}
+
 void PumpDriver::apply(const PumpCommand &command) {
   if (pin_ < 0) {
     return;
   }
 
+  if (isRelay_) {
+    if (!command.enabled || command.dutyPercent <= 0.0f) {
+      digitalWrite(pin_, LOW);
+      return;
+    }
+    if (command.dutyPercent >= 100.0f) {
+      digitalWrite(pin_, HIGH);
+      return;
+    }
+    // Time-sliced relay PWM: ON for dutyPercent% of each period cycle.
+    const uint32_t cyclePos = millis() % relayPeriodMs_;
+    const uint32_t onTime = static_cast<uint32_t>((command.dutyPercent / 100.0f) * relayPeriodMs_);
+    digitalWrite(pin_, cyclePos < onTime ? HIGH : LOW);
+    return;
+  }
+
+  // LEDC path (not used with relay hardware)
   if (!command.enabled) {
 #if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
     ledcWrite(pin_, 0);

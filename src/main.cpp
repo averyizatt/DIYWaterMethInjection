@@ -3,6 +3,7 @@
 #include <SPI.h>
 #include <mcp_can.h>
 #include <stdlib.h>
+#include "driver/gpio.h"  // ESP-IDF low-level GPIO (bypasses Arduino framework)
 
 #include "actuators.h"
 #include "app_config.h"
@@ -63,6 +64,7 @@ uint8_t lastConfigRatioPercent = 255;
 uint32_t lastCanRecoveryAttemptMs = 0;
 uint16_t canTxFailStreak = 0;
 bool analogSafetyLatched = false;
+bool overboostAssistFaultLatchedReported = false;
 
 constexpr char kPrefsNamespace[] = "wmix";
 constexpr char kPrefsKeyWater[] = "water_l";
@@ -113,6 +115,11 @@ constexpr uint8_t kCmdKnockSetIatCompStartC = 0x58;
 constexpr uint8_t kCmdKnockSetIatCompPerCx1000 = 0x59;
 constexpr uint8_t kCmdKnockSetBayCompStartC = 0x5A;
 constexpr uint8_t kCmdKnockSetBayCompPerCx1000 = 0x5B;
+
+// When true, setup/loop are completely replaced by a dead-simple isolated test:
+// GPIO5 (pump pin) follows button on GPIO18 (D9). Nothing else initialises.
+// Set false to run normal firmware.
+constexpr bool kPumpDirectGpioBenchDebug = true;
 
 constexpr uint16_t kFaultIat = 1U << 0;
 constexpr uint16_t kFaultEngineBay = 1U << 1;
@@ -550,6 +557,10 @@ void dispatchCanFrame(uint16_t id, uint8_t dlc, const uint8_t *data, uint32_t no
       sendConfigAck(cfg.version, 1, 4, lastConfigRatioPercent);
       return;
     }
+    if (!validateMethConfigChecksum(cfg)) {
+      sendConfigAck(cfg.version, 1, 3, lastConfigRatioPercent);
+      return;
+    }
 
     lastConfigVersion = cfg.version;
     if (cfg.ratio_percent <= 100 && cfg.ratio_percent != lastConfigRatioPercent) {
@@ -605,8 +616,11 @@ void sendStateIfDue(const SensorReadings &readings, const ControlResult &result,
   uint8_t faultFlags = 0;
   if (result.failsafe == FailsafeReason::LowFluid) faultFlags |= 0x01;
   if (result.failsafe == FailsafeReason::MapInvalid) faultFlags |= 0x02;
+  if (result.failsafe == FailsafeReason::BoostInvalid) faultFlags |= 0x02;
   if (result.failsafe == FailsafeReason::InvalidBlend) faultFlags |= 0x04;
   if (result.failsafe == FailsafeReason::InvalidBoostConfig) faultFlags |= 0x08;
+  if (result.overboostAssistActive) faultFlags |= 0x10;
+  if (result.overboostAssistFaultLatched) faultFlags |= 0x20;
 
   uint8_t payload[8] = {0};
   payload[0] = methState;
@@ -689,6 +703,8 @@ const char *failsafeName(FailsafeReason reason) {
     return "LOW_FLUID";
   case FailsafeReason::MapInvalid:
     return "MAP_INVALID";
+  case FailsafeReason::BoostInvalid:
+    return "BOOST_INVALID";
   case FailsafeReason::InvalidBlend:
     return "INVALID_BLEND";
   case FailsafeReason::InvalidBoostConfig:
@@ -729,6 +745,12 @@ void printSetupSummary() {
   Serial.print(config.boost.startPsi, 1);
   Serial.print(" / ");
   Serial.println(config.boost.fullPsi, 1);
+  Serial.print("Overboost warn/emergency (psi): ");
+  Serial.print(config.boost.overboostWarnPsi, 1);
+  Serial.print(" / ");
+  Serial.println(config.boost.overboostEmergencyPsi, 1);
+  Serial.print("Overboost warn duty (%): ");
+  Serial.println(config.overboostWarnDutyPercent, 1);
   Serial.print("Blend water/meth (L): ");
   Serial.print(blend.waterLiters, 2);
   Serial.print(" / ");
@@ -1009,9 +1031,64 @@ void pollBenchButton(uint32_t nowMs) {
     benchButtonDebounceMs = nowMs;
   }
 }
+
+void runBootOutputSelfTest() {
+  constexpr uint8_t kCycles = 6;
+  constexpr uint32_t kStepMs = 400;
+
+  Serial.println("BOOT SELF-TEST: pulsing pump output + warning LED");
+
+  PumpCommand onCmd{};
+  onCmd.enabled = true;
+  onCmd.dutyPercent = 100.0f;
+  PumpCommand offCmd{};
+
+  for (uint8_t i = 0; i < kCycles; ++i) {
+    if (kPumpDirectGpioBenchDebug) {
+      digitalWrite(pins::PUMP_OUT, HIGH);
+    } else {
+      pumpDriver.apply(onCmd);
+    }
+    warningOutput.set(true);
+    delay(kStepMs);
+
+    if (kPumpDirectGpioBenchDebug) {
+      digitalWrite(pins::PUMP_OUT, LOW);
+    } else {
+      pumpDriver.apply(offCmd);
+    }
+    warningOutput.set(false);
+    delay(kStepMs);
+  }
+
+  if (kPumpDirectGpioBenchDebug) {
+    digitalWrite(pins::PUMP_OUT, LOW);
+  } else {
+    pumpDriver.apply(offCmd);
+  }
+  warningOutput.set(false);
+  Serial.println("BOOT SELF-TEST: done");
+}
 } // namespace
 
 void setup() {
+  if (kPumpDirectGpioBenchDebug) {
+    // Fully isolated hardware test using raw ESP-IDF GPIO — no Arduino framework involvement.
+    Serial.begin(115200);
+    delay(100);
+    // Reset pins to known state then configure as outputs/input via ESP-IDF directly
+    gpio_reset_pin(GPIO_NUM_5);
+    gpio_set_direction(GPIO_NUM_5, GPIO_MODE_OUTPUT);
+    gpio_set_level(GPIO_NUM_5, 0);
+    gpio_reset_pin(GPIO_NUM_17);
+    gpio_set_direction(GPIO_NUM_17, GPIO_MODE_OUTPUT);
+    gpio_set_level(GPIO_NUM_17, 0);
+    gpio_reset_pin(GPIO_NUM_18);
+    gpio_set_direction(GPIO_NUM_18, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(GPIO_NUM_18, GPIO_PULLUP_ONLY);
+    return;
+  }
+
   Serial.begin(config.serialBaud);
   delay(200);
 
@@ -1025,12 +1102,18 @@ void setup() {
                     config.floatLowShutdownDelayMs);
   configureAnalogSensors();
   knockMonitor.begin(pins::KNOCK_SENSOR_ADC, config.knock);
-  pumpDriver.begin(pins::PUMP_PWM, config.pwmFrequencyHz, config.pwmResolutionBits);
   warningOutput.begin(pins::WARNING_LED, true);
   pinMode(pins::BENCH_TEST_BUTTON, INPUT_PULLUP);
 
+  // Hold bench button during boot to run a deterministic output pulse test.
+  if (digitalRead(pins::BENCH_TEST_BUTTON) == LOW) {
+    runBootOutputSelfTest();
+  }
+
   SPI.begin();
-  pinMode(pins::CAN_SPI_INT, INPUT_PULLUP);
+  // Init relay AFTER SPI.begin() so SPI cannot reclaim the pump pin.
+  pumpDriver.beginRelay(pins::PUMP_OUT, config.relayPeriodMs);
+  pinMode(pins::CAN_SPI_INT, INPUT);
   if (initCanBus()) {
     Serial.println("CAN: MCP2515 online");
     lastMasterRxMs = millis();
@@ -1045,10 +1128,20 @@ void setup() {
 }
 
 void loop() {
+  if (kPumpDirectGpioBenchDebug) {
+    // DEBUG: GPIO5 forced HIGH via ESP-IDF (bypasses Arduino framework entirely).
+    // Probe D2 pin — must read 3.3V. LED blinks to confirm loop is alive.
+    gpio_set_level(GPIO_NUM_5, gpio_get_level(GPIO_NUM_18) == 0 ? 1 : 0); // button LOW = relay ON
+    gpio_set_level(GPIO_NUM_17, gpio_get_level(GPIO_NUM_18) == 0 ? 1 : 0); // LED mirrors
+    delay(10);
+    return;
+  }
+
   handleSerialCommands();
 
   const uint32_t now = millis();
   pollBenchButton(now);
+  const bool directBenchButtonActive = (digitalRead(pins::BENCH_TEST_BUTTON) == LOW);
 
   if (!elapsed(now, lastLoopMs, config.loopPeriodMs)) return;
   lastLoopMs = now;
@@ -1059,8 +1152,11 @@ void loop() {
   if (canOnline && elapsed(now, lastMasterRxMs, kCanCommandTimeoutMs)) {
     // Fail safe to OFF if the master controller stops sending commands.
     armed = false;
-    pendingManualTest = false;
-    manualTestDuty = 0;
+    // Keep a local physical bench-button test alive even without CAN master traffic.
+    if (!benchButtonOwnsTest) {
+      pendingManualTest = false;
+      manualTestDuty = 0;
+    }
   }
 
   if (hasRemoteRatio) {
@@ -1072,6 +1168,8 @@ void loop() {
     lastFailsafe = FailsafeReason::None;
     lastReportedCanFault = FailsafeReason::None;
     analogSafetyLatched = false;
+    overboostAssistFaultLatchedReported = false;
+    controller.clearLatchedFaults();
     clearFaultsRequested = false;
   }
 
@@ -1109,7 +1207,13 @@ void loop() {
   if (canOnline && !armed) effectiveConfig.mode = InjectionMode::Off;
 
   ControlResult result{};
-  if (pendingManualTest) {
+  if (directBenchButtonActive) {
+    // Direct physical bench override for hardware bring-up:
+    // while button is held, force commanded pump duty regardless of CAN/sensor state.
+    result.pump.enabled = true;
+    result.pump.dutyPercent = constrain(config.benchTestDutyPercent, 0, 100);
+    result.finalDutyPercent = result.pump.dutyPercent;
+  } else if (pendingManualTest) {
     result.pump.enabled = true;
     result.pump.dutyPercent = constrain(manualTestDuty, 0, 100);
     result.finalDutyPercent = result.pump.dutyPercent;
@@ -1131,14 +1235,27 @@ void loop() {
 
   const uint16_t analogCriticalMask = static_cast<uint16_t>(kFaultIat | kFaultEngineBay | kFaultMeth);
   const bool analogCriticalFault = (readings.analogFaultFlags & analogCriticalMask) != 0;
+  const bool localBenchButtonTestActive = directBenchButtonActive || (pendingManualTest && benchButtonOwnsTest);
   if (analogCriticalFault) {
-    result.pump.enabled = false;
-    result.pump.dutyPercent = 0.0f;
-    result.finalDutyPercent = 0.0f;
+    // Allow direct physical bench-button testing with sparse bench wiring.
+    // Normal closed-loop/can/serial operation still obeys analog critical interlocks.
+    if (!localBenchButtonTestActive) {
+      result.pump.enabled = false;
+      result.pump.dutyPercent = 0.0f;
+      result.finalDutyPercent = 0.0f;
+    }
   }
 
-  pumpDriver.apply(result.pump);
-  warningOutput.set(result.failsafe != FailsafeReason::None || knockSafetyShutdown ||
+  if (kPumpDirectGpioBenchDebug) {
+    // In bench debug mode, make D2 a pure physical-button output for deterministic probing.
+    const bool pumpOn = directBenchButtonActive;
+    digitalWrite(pins::PUMP_OUT, pumpOn ? HIGH : LOW);
+  } else {
+    pumpDriver.apply(result.pump);
+  }
+  warningOutput.set(result.failsafe != FailsafeReason::None || result.overboostAssistFaultLatched ||
+                    localBenchButtonTestActive ||
+                    knockSafetyShutdown ||
                     knockState.warningActive || knockState.criticalActive);
 
   if (result.failsafe != lastReportedCanFault) {
@@ -1155,6 +1272,13 @@ void loop() {
 
   if (knockSafetyShutdown) {
     sendFault(can_protocol::meth_fault_code::SAFETY_SHUTDOWN, kFaultSeverityWarning, 0, 0);
+  }
+
+  if (result.overboostAssistFaultLatched && !overboostAssistFaultLatchedReported) {
+    sendFault(0x0C, kFaultSeverityWarning,
+              can_protocol::clampU8(static_cast<int>(readings.boostPsi)),
+              can_protocol::clampU8(static_cast<int>(result.finalDutyPercent)));
+    overboostAssistFaultLatchedReported = true;
   }
 
   if (analogCriticalFault && !analogSafetyLatched) {
@@ -1199,6 +1323,10 @@ void loop() {
   Serial.print(readings.methPressurePsi, 1);
   Serial.print(" dutyOut=");
   Serial.print(result.finalDutyPercent, 1);
+  Serial.print(" assist=");
+  Serial.print(result.overboostAssistActive ? "1" : "0");
+  Serial.print(" latched=");
+  Serial.print(result.overboostAssistFaultLatched ? "1" : "0");
   Serial.print(" fs=");
   Serial.print(failsafeName(result.failsafe));
   Serial.print(" knockRaw=");

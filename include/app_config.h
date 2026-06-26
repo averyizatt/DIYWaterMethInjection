@@ -22,8 +22,14 @@ struct MapCalibration {
 
 struct BoostThresholdsPsi {
   // Conservative defaults for a low-boost street setup.
+  // SPRAY_START_PSI
   float startPsi{3.5f};
+  // FULL_SPRAY_PSI
   float fullPsi{7.5f};
+  // OVERBOOST_WARN_PSI (assist warning/high-duty threshold)
+  float overboostWarnPsi{13.5f};
+  // OVERBOOST_EMERGENCY_PSI (latched overboost-assist fault threshold)
+  float overboostEmergencyPsi{15.0f};
 };
 
 enum class KnockResponseMode : uint8_t {
@@ -149,9 +155,12 @@ struct AppConfig {
   // Conservative minimum duty once injection is active.
   float dutyMinPercent{18.0f};
   float dutyMaxPercent{100.0f};
+  // High duty commanded while OVERBOOST_WARN_PSI is active.
+  float overboostWarnDutyPercent{85.0f};
 
-  uint16_t pwmFrequencyHz{100};
-  uint8_t pwmResolutionBits{10};
+  // Relay time-slice period in ms. 1000 = 1 Hz switching (safe for any relay).
+  // Lower = more responsive flow control but more wear. 500ms (2 Hz) is a reasonable max.
+  uint16_t relayPeriodMs{1000};
 
   // true = LOW at pin means low-fluid (switch closes to GND when level is low).
   // With INPUT_PULLUP, a disconnected/open wire reads HIGH and is treated as full.
@@ -164,7 +173,8 @@ struct AppConfig {
   uint32_t loopPeriodMs{20};
 
   // Duty applied when the bench-test button is held down.
-  uint8_t benchTestDutyPercent{50};
+  // Keep this at 100% by default so non-serial bench checks are easy to verify with a meter.
+  uint8_t benchTestDutyPercent{100};
 
   KnockConfig knock{};
 };
