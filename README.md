@@ -31,6 +31,40 @@ Existing controller frames:
 - `0x307` `ID_ENGINE_KNOCK_STATE`
 - `0x308` `ID_ENGINE_KNOCK_FAULT`
 
+Engine context input:
+
+- `0x309` `ID_ENGINE_RUNTIME`, received by this module for knock arming context
+
+`0x309` engine runtime payload:
+
+- `B0` RPM low byte
+- `B1` RPM high byte
+- `B2` optional absolute MAP kPa from the sender
+- `B3` optional validity flags: bit0 RPM valid, bit1 MAP valid
+- Remaining bytes reserved
+
+For `0x300` and knock event payloads, boost fields are gauge boost in kPa, clamped to `0` below local barometric pressure. Absolute MAP is used internally for sensor validation and knock arming, but is not sent as the CAN boost byte.
+
+`0x307` knock state payload, sent every 50 ms:
+
+- `B0` status flags: bit0 enabled, bit1 signal valid, bit2 warning active, bit3 critical active, bit4 baseline learned, bit5 sensor fault, bit6 clipping detected
+- `B1` knock energy, 0-255
+- `B2` baseline, 0-255
+- `B3` threshold, 0-255
+- `B4` event count, wraps 0-255
+- `B5` last event RPM / 100
+- `B6` last event boost kPa
+- `B7` reserved, sent as 0
+
+`0x308` knock fault payload:
+
+- `B0` fault code
+- `B1` severity
+- `B2` data0
+- `B3` data1
+
+On the Nano firmware, knock processing is local: raw ADC bias removal, tunable gain, rectified envelope tracking, learned noise baseline, and adaptive thresholding. CAN tuning commands update the live processor for enable, threshold offset, adaptive multiplier, debounce, gain, and related config broadcasts. RPM is received over CAN on `0x309`; local MAP plus CAN RPM are used as knock arming gates, and `0x307` byte 5 reports last-event RPM / 100.
+
 Added knock UI hook frames for remote display/debug:
 
 - `0x30B` knock live hook frame
@@ -83,6 +117,13 @@ Knock tuning commands are accepted on `ID_ENGINE_METH_COMMAND` (`0x301`) with th
 - `0x48` set bandwidth /100 Hz (`B1`)
 - `0x49` set auto frequency from bore (`B1`: 0/1)
 - `0x4A` clear knock events/fault latch
+
+Config requests sent on `0x305` trigger the module to rebroadcast `0x30C` and `0x30D`. Runtime command/config responses are sent on `0x306` as:
+
+- `B0` command byte
+- `B1` status (`0` OK, `1` unsupported, `2` invalid length, `3` value clamped)
+- `B2` applied value
+- `B3` schema version
 
 ## Knock DSP pipeline
 
@@ -179,7 +220,13 @@ Nano wiring used by the firmware:
 - MCP2515 CAN MOSI/SI: `D11`
 - MCP2515 CAN MISO/SO: `D12`
 - MCP2515 CAN SCK: `D13`
+- Oil pressure analog input: `A6`
+- Fuel pressure analog input: `A7`
 
-The firmware initializes the MCP2515 at `500 kbps` with the common `8 MHz` CAN module crystal setting. It prints received CAN frames to serial and transmits a `0x300` heartbeat once per second for bus testing.
+The firmware initializes the MCP2515 at `500 kbps` with the common `8 MHz` CAN module crystal setting. It prints received CAN frames to serial and transmits protocol-matched `0x300` meth state, `0x307` knock state, and `0x30B` knock hook frames every 50 ms, `0x303` extended sensor frames every 250 ms, and `0x30C`/`0x30D` knock config pages every 1 s.
+
+Pressure transducers default to 0.5-4.5 V, 0-100 PSI linear sensors through a 10k/20k divider, so 5 V sensor output becomes about 3.33 V at the Nano ADC.
+
+On a one-node bench setup, MCP2515 transmit can report failure because no other CAN node ACKs the frame. The firmware logs counted TX failures without reinitializing the controller, so it can keep servicing RX and will recover once a terminated, powered second node is present.
 
 The Nano profile builds a reduced firmware (`main_nano.cpp` + `sensors_nano.cpp`) so it fits ATmega328P flash/RAM.
