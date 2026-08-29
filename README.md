@@ -210,23 +210,39 @@ platformio run -e arduino_nano_old_bootloader -t upload
 
 Nano wiring used by the firmware:
 
-- MAP analog input: `A4`
-- Knock analog input: `A5`
-- Float switch (active low): `D3`
-- Pump relay output: `D2`
-- Warning LED output: `D7`
-- MCP2515 CAN CS: `D10`
-- MCP2515 CAN INT: `D8`
-- MCP2515 CAN MOSI/SI: `D11`
-- MCP2515 CAN MISO/SO: `D12`
-- MCP2515 CAN SCK: `D13`
-- Oil pressure analog input: `A6`
-- Fuel pressure analog input: `A7`
+| Signal | Nano pin | Wiring notes |
+| --- | --- | --- |
+| MAP analog input | `A0` | GM 3-bar MAP through 10k/20k divider. Avoid `A4` because it is SDA and can be biased by I2C pull-ups. |
+| Knock analog input | `A5` | Raw knock module/sensor signal into Nano ADC range. |
+| Oil pressure analog input | `A6` | 0.5-4.5 V, 0-100 psi sensor through 10k/20k divider. Analog-input only pin. |
+| Fuel pressure analog input | `A7` | 0.5-4.5 V, 0-100 psi sensor through 10k/20k divider. Analog-input only pin. |
+| Float switch | `D3` | Active low; wire switch to ground, firmware uses internal pull-up. |
+| Pump relay output | `D2` | Drives relay/control input. Use a relay/transistor module appropriate for the pump current. |
+| Warning LED output | `D7` | Active high warning output. |
+| Bench-test button | `D9` | Active low with internal pull-up; currently reserved for bench bring-up. |
+| MCP2515 CAN CS | `D10` | SPI chip select. |
+| MCP2515 CAN INT | `D8` | MCP2515 interrupt pin. Firmware also polls receive status. |
+| MCP2515 CAN MOSI/SI | `D11` | Nano hardware SPI MOSI to MCP2515 SI. |
+| MCP2515 CAN MISO/SO | `D12` | Nano hardware SPI MISO from MCP2515 SO. |
+| MCP2515 CAN SCK | `D13` | Nano hardware SPI clock. |
+| MCP2515 VCC/GND | `5V` / `GND` | Match your MCP2515 module requirements and share ground with the display/comfort module. |
+| CANH/CANL | MCP2515 transceiver | Wire CANH to CANH and CANL to CANL on the other module; use proper bus termination. |
 
-The firmware initializes the MCP2515 at `500 kbps` with the common `8 MHz` CAN module crystal setting. It prints received CAN frames to serial and transmits protocol-matched `0x300` meth state, `0x307` knock state, and `0x30B` knock hook frames every 50 ms, `0x303` extended sensor frames every 250 ms, and `0x30C`/`0x30D` knock config pages every 1 s.
+Disabled/unwired in the current Nano firmware:
+
+- Meth pressure input: disabled (`-1`)
+- Boost reference pressure input: disabled (`-1`)
+- Spare pressure inputs: disabled (`-1`)
+- IAT, engine bay, cabin, ambient, and DHT inputs: disabled (`-1`)
+
+The firmware initializes the MCP2515 at `500 kbps` with the common `8 MHz` CAN module crystal setting. It prints received CAN frames to serial and transmits protocol-matched `0x300` meth state, `0x307` knock state, and `0x30B` knock hook frames every 50 ms, `0x303` extended sensor frames every 250 ms, and `0x30C`/`0x30D` knock config pages every 1 s. The `0x303` pressure bytes use psi x2 encoding, so one count is 0.5 psi.
 
 Pressure transducers default to 0.5-4.5 V, 0-100 PSI linear sensors through a 10k/20k divider, so 5 V sensor output becomes about 3.33 V at the Nano ADC.
 
+The GM 3-bar MAP input also defaults to a 10k/20k divider. Firmware reconstructs the sensor-side 0.5-4.5 V signal before converting to absolute kPa.
+
 On a one-node bench setup, MCP2515 transmit can report failure because no other CAN node ACKs the frame. The firmware logs counted TX failures without reinitializing the controller, so it can keep servicing RX and will recover once a terminated, powered second node is present.
+
+For CAN debugging, the Nano firmware logs every RX frame, every TX attempt with result code, init bitrate/clock/mode results, and periodic MCP2515 health (`CANSTAT`, `INTF`, read `STAT`, `EFLG`, `REC`, `TEC`, INT pin level). A received `0x305` should immediately be followed by TX attempts for `0x30C` and `0x30D`.
 
 The Nano profile builds a reduced firmware (`main_nano.cpp` + `sensors_nano.cpp`) so it fits ATmega328P flash/RAM.

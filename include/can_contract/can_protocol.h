@@ -108,10 +108,11 @@ struct EngineMethState {
 
 struct EngineSensorExt {
   // 0x303, DLC 8
-  uint8_t oil_pressure_psi = 0;
-  uint8_t fuel_pressure_psi = 0;
-  uint8_t meth_pressure_psi = 0;
-  uint8_t boost_ref_pressure_psi = 0;
+  // Pressure bytes are psi * 2, so 1 count = 0.5 psi.
+  uint8_t oil_pressure_psi_x2 = 0;
+  uint8_t fuel_pressure_psi_x2 = 0;
+  uint8_t meth_pressure_psi_x2 = 0;
+  uint8_t boost_ref_pressure_psi_x2 = 0;
   int8_t ambient_temp_c = 0;
   int8_t cabin_temp_c = 0;
   uint16_t analog_fault_flags = 0;
@@ -190,10 +191,10 @@ inline CanFrame packEngineSensorExt(const EngineSensorExt &ext) {
   CanFrame frame{};
   frame.id = ID_ENGINE_SENSOR_EXT;
   frame.dlc = 8;
-  frame.data[0] = ext.oil_pressure_psi;
-  frame.data[1] = ext.fuel_pressure_psi;
-  frame.data[2] = ext.meth_pressure_psi;
-  frame.data[3] = ext.boost_ref_pressure_psi;
+  frame.data[0] = ext.oil_pressure_psi_x2;
+  frame.data[1] = ext.fuel_pressure_psi_x2;
+  frame.data[2] = ext.meth_pressure_psi_x2;
+  frame.data[3] = ext.boost_ref_pressure_psi_x2;
   frame.data[4] = tempToOffset40(ext.ambient_temp_c);
   frame.data[5] = tempToOffset40(ext.cabin_temp_c);
   frame.data[6] = static_cast<uint8_t>(ext.analog_fault_flags & 0xFFU);

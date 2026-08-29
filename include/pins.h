@@ -3,8 +3,9 @@
 
 namespace pins {
 // Classic Nano wiring.
-// Wiring: MAP=A4, KNOCK=A5.
-constexpr int MAP_SENSOR_ADC = A4;
+// Wiring: MAP=A0, KNOCK=A5.
+// Avoid A4 for MAP because A4 is SDA and can be biased by I2C pull-ups.
+constexpr int MAP_SENSOR_ADC = A0;
 constexpr int KNOCK_SENSOR_ADC = A5;
 
 constexpr int FLOAT_SENSOR_DIGITAL = 3;

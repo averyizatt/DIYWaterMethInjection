@@ -4,19 +4,53 @@
 #include <math.h>
 
 namespace {
-constexpr float kAdcRefVoltage = 5.0f;
+constexpr float kDefaultAdcRefVoltage = 5.0f;
 constexpr float kAdcMaxCount = 1023.0f;
 constexpr float kPsiPerKpa = 0.1450377f;
 
 inline bool elapsed(uint32_t now, uint32_t start, uint32_t intervalMs) {
   return static_cast<uint32_t>(now - start) >= intervalMs;
 }
+
+float readAvrVccVolts() {
+#if defined(__AVR__)
+  // Measure Vcc against the internal 1.1 V bandgap reference.
+  ADMUX = _BV(REFS0) | _BV(MUX3) | _BV(MUX2) | _BV(MUX1);
+  delay(2);
+  ADCSRA |= _BV(ADSC);
+  while (bit_is_set(ADCSRA, ADSC)) {
+  }
+  const uint16_t result = static_cast<uint16_t>(ADCL) |
+                          (static_cast<uint16_t>(ADCH) << 8U);
+  if (result == 0) return kDefaultAdcRefVoltage;
+  const float vccMillivolts = 1125300.0f / static_cast<float>(result);
+  return vccMillivolts / 1000.0f;
+#else
+  return kDefaultAdcRefVoltage;
+#endif
+}
+
+float adcReferenceVoltage() {
+  static float cachedVcc = kDefaultAdcRefVoltage;
+  static uint32_t lastSampleMs = 0;
+  const uint32_t now = millis();
+  if (elapsed(now, lastSampleMs, 250)) {
+    const float measured = readAvrVccVolts();
+    if (isfinite(measured) && measured > 3.0f && measured < 5.6f) {
+      cachedVcc = measured;
+    }
+    lastSampleMs = now;
+  }
+  return cachedVcc;
+}
 } // namespace
 
 void MapSensor::begin(int analogPin, const MapCalibration &calibration) {
   pin_ = analogPin;
   calibration_ = calibration;
-  valid_ = pin_ >= 0 && calibration_.vMax > calibration_.vMin && calibration_.kpaMax > calibration_.kpaMin;
+  valid_ = pin_ >= 0 && calibration_.vMax > calibration_.vMin &&
+           calibration_.kpaMax > calibration_.kpaMin &&
+           calibration_.dividerBottomOhms > 0.0f;
 
   if (pin_ >= 0) {
     pinMode(pin_, INPUT);
@@ -38,12 +72,15 @@ SensorReadings MapSensor::read() const {
   }
 
   const int raw = analogRead(pin_);
-  const float voltage = static_cast<float>(raw) * (kAdcRefVoltage / kAdcMaxCount);
-  const float mapKpa = kpaFromVoltage(voltage);
+  const float adcVoltage = static_cast<float>(raw) * (adcReferenceVoltage() / kAdcMaxCount);
+  const float dividerScale =
+      (calibration_.dividerTopOhms + calibration_.dividerBottomOhms) / calibration_.dividerBottomOhms;
+  const float sensorVoltage = adcVoltage * dividerScale;
+  const float mapKpa = kpaFromVoltage(sensorVoltage);
   const float boostPsi = (mapKpa - calibration_.baroKpa) * kPsiPerKpa;
 
   readings.mapRaw = raw;
-  readings.mapVoltage = voltage;
+  readings.mapVoltage = sensorVoltage;
   readings.mapKpa = mapKpa;
   readings.boostPsi = boostPsi;
   readings.mapValid = valid_;
@@ -109,6 +146,8 @@ void PressureSensor::begin(const PressureConfig &config) {
   valid_ = false;
   fault_ = config_.enabled ? PressureFault::None : PressureFault::Disabled;
   filteredPsi_ = NAN;
+  adcNodeVoltage_ = NAN;
+  sensorVoltage_ = NAN;
 
   if (config_.enabled && config_.pin >= 0) {
     pinMode(config_.pin, INPUT);
@@ -127,7 +166,8 @@ float PressureSensor::readAdcNodeVoltage() const {
   }
 
   const float raw = static_cast<float>(total) / static_cast<float>(samples);
-  return raw * (config_.adcVref / static_cast<float>(config_.adcMaxCount));
+  const float adcRef = adcReferenceVoltage();
+  return raw * (adcRef / static_cast<float>(config_.adcMaxCount));
 }
 
 void PressureSensor::update(uint32_t nowMs) {
@@ -136,6 +176,8 @@ void PressureSensor::update(uint32_t nowMs) {
   if (!config_.enabled || config_.pin < 0) {
     valid_ = false;
     fault_ = PressureFault::Disabled;
+    adcNodeVoltage_ = NAN;
+    sensorVoltage_ = NAN;
     return;
   }
 
@@ -145,6 +187,8 @@ void PressureSensor::update(uint32_t nowMs) {
       config_.adcMaxCount == 0) {
     valid_ = false;
     fault_ = PressureFault::InvalidConfig;
+    adcNodeVoltage_ = NAN;
+    sensorVoltage_ = NAN;
     return;
   }
 
@@ -152,9 +196,12 @@ void PressureSensor::update(uint32_t nowMs) {
   if (!isfinite(adcNodeVoltage)) {
     valid_ = false;
     fault_ = PressureFault::AdcError;
+    adcNodeVoltage_ = NAN;
+    sensorVoltage_ = NAN;
     return;
   }
 
+  adcNodeVoltage_ = adcNodeVoltage;
   const float dividerScale =
       (config_.dividerTopOhms + config_.dividerBottomOhms) / config_.dividerBottomOhms;
   sensorVoltage_ = adcNodeVoltage * dividerScale;
@@ -172,8 +219,11 @@ void PressureSensor::update(uint32_t nowMs) {
 
   const float normalized =
       (sensorVoltage_ - config_.sensorMinV) / (config_.sensorMaxV - config_.sensorMinV);
+  const float normalizedClamped = constrain(normalized, 0.0f, 1.0f);
+  const float normalizedMapped = config_.invertedOutput ? (1.0f - normalizedClamped)
+                                                        : normalizedClamped;
   float psi = config_.pressureMinPsi +
-              ((config_.pressureMaxPsi - config_.pressureMinPsi) * normalized);
+              ((config_.pressureMaxPsi - config_.pressureMinPsi) * normalizedMapped);
   psi = (psi * config_.calibrationScale) + config_.calibrationOffsetPsi;
 
   if (psi < config_.minValidPsi || psi > config_.maxValidPsi) {

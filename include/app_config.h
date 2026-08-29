@@ -12,6 +12,11 @@ struct MapCalibration {
   float vMin{0.50f};
   float vMax{4.50f};
 
+  // Optional divider between a 5 V sensor and the ADC input.
+  // sensorV = adcV * (top + bottom) / bottom. Set top=0, bottom=1 for no divider.
+  float dividerTopOhms{0.0f};
+  float dividerBottomOhms{1.0f};
+
   // Select based on sensor type (examples provided in defaultConfig()).
   float kpaMin{10.0f};
   float kpaMax{200.0f};

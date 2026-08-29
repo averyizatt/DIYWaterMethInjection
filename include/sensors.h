@@ -133,6 +133,9 @@ struct PressureConfig {
   float dividerBottomOhms{20000.0f};
   float sensorMinV{0.5f};
   float sensorMaxV{4.5f};
+  // false: higher voltage means higher pressure.
+  // true: higher voltage means lower pressure.
+  bool invertedOutput{false};
   float pressureMinPsi{0.0f};
   float pressureMaxPsi{100.0f};
   float calibrationScale{1.0f};
@@ -148,6 +151,8 @@ public:
   void begin(const PressureConfig &config);
   void update(uint32_t nowMs);
   float valuePsi() const { return filteredPsi_; }
+  float adcNodeVoltage() const { return adcNodeVoltage_; }
+  float sensorVoltage() const { return sensorVoltage_; }
   bool valid() const { return valid_; }
   PressureFault fault() const { return fault_; }
   const PressureConfig &config() const { return config_; }
@@ -157,6 +162,7 @@ private:
 
   PressureConfig config_{};
   float filteredPsi_{NAN};
+  float adcNodeVoltage_{0.0f};
   float sensorVoltage_{0.0f};
   bool valid_{false};
   PressureFault fault_{PressureFault::Disabled};

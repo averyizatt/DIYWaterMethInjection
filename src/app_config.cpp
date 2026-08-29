@@ -21,11 +21,13 @@ TankBlend computeTankBlend(float waterLiters, float methLiters) {
 AppConfig defaultConfig() {
   AppConfig config{};
 
-  // GM MAP sensor wired directly to the Nano ADC.
-  // Sensor outputs 0.5-4.5 V across the Nano's 0-5 V ADC range.
+  // GM MAP sensor through a 15k/20k divider, so a 5 V sensor output is
+  // about 2.86 V at the Nano ADC.
   config.mapType = MapSensorType::GM3Bar;
   config.map.vMin = 0.500f;
   config.map.vMax = 4.500f;
+  config.map.dividerTopOhms = 15000.0f;
+  config.map.dividerBottomOhms = 20000.0f;
   if (config.mapType == MapSensorType::GM2Bar) {
     config.map.kpaMin = 10.0f;
     config.map.kpaMax = 200.0f;

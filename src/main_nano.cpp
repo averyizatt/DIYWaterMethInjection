@@ -51,6 +51,7 @@ uint32_t lastCanCommandMs = 0;
 uint32_t lastCanTxFailureLogMs = 0;
 uint32_t lastEngineRuntimeRxMs = 0;
 uint32_t manualTestStartMs = 0;
+uint32_t lastCanHealthLogMs = 0;
 float knockBiasRaw = 0.0f;
 float knockEnvelopeRaw = 0.0f;
 float knockNoiseBaselineRaw = 0.0f;
@@ -96,12 +97,15 @@ constexpr uint32_t kCanRxFallbackPollMs = 50;
 constexpr uint32_t kCanCommandTimeoutMs = 3000;
 constexpr uint32_t kManualTestTimeoutMs = 5000;
 constexpr uint32_t kCanTxFailureLogMs = 1000;
+constexpr uint32_t kCanHealthLogMs = 1000;
 constexpr uint32_t kEngineRuntimeTimeoutMs = 500;
 constexpr uint32_t kMethStateTxMs = 50;
 constexpr uint32_t kSensorExtTxMs = 250;
 constexpr uint32_t kKnockStateTxMs = 50;
 constexpr uint32_t kKnockHookTxMs = 50;
 constexpr uint32_t kCanConfigTxMs = 1000;
+constexpr uint32_t kSerialHeartbeatMs = 1000;
+constexpr bool kSerialCanVerbose = false;
 constexpr uint8_t kBaroSampleCount = 16;
 constexpr float kMinStartupBaroKpa = 60.0f;
 constexpr float kMaxStartupBaroKpa = 110.0f;
@@ -114,10 +118,35 @@ inline bool elapsed(uint32_t now, uint32_t start, uint32_t intervalMs) {
   return static_cast<uint32_t>(now - start) >= intervalMs;
 }
 
+void printHexByte(uint8_t value);
+
 float clampFloatValue(float value, float minValue, float maxValue) {
   if (value < minValue) return minValue;
   if (value > maxValue) return maxValue;
   return value;
+}
+
+const char *pressureFaultName(PressureFault fault) {
+  switch (fault) {
+  case PressureFault::None:
+    return "none";
+  case PressureFault::Disabled:
+    return "disabled";
+  case PressureFault::OpenCircuit:
+    return "open";
+  case PressureFault::ShortToGround:
+    return "short";
+  case PressureFault::OutOfRange:
+    return "range";
+  case PressureFault::InvalidConfig:
+    return "cfg";
+  case PressureFault::StaleReading:
+    return "stale";
+  case PressureFault::AdcError:
+    return "adc";
+  default:
+    return "unknown";
+  }
 }
 
 float currentKnockThresholdRaw() {
@@ -126,23 +155,142 @@ float currentKnockThresholdRaw() {
   return clampFloatValue((knockNoiseBaselineRaw * multiplier) + offset, 1.0f, 255.0f);
 }
 
+const char *canSpeedName(uint8_t speed) {
+  switch (speed) {
+  case CAN_500KBPS:
+    return "500kbps";
+  case CAN_250KBPS:
+    return "250kbps";
+  case CAN_125KBPS:
+    return "125kbps";
+  case CAN_1000KBPS:
+    return "1000kbps";
+  default:
+    return "custom";
+  }
+}
+
+const char *canClockName(uint8_t clock) {
+  switch (clock) {
+  case MCP_8MHZ:
+    return "8MHz";
+  case MCP_16MHZ:
+    return "16MHz";
+  case MCP_20MHZ:
+    return "20MHz";
+  case MCP_10MHZ:
+    return "10MHz";
+  default:
+    return "unknown";
+  }
+}
+
+const char *canModeName(uint8_t modeBits) {
+  switch (modeBits & MODE_MASK) {
+  case MCP_NORMAL:
+    return "normal";
+  case MCP_SLEEP:
+    return "sleep";
+  case MCP_LOOPBACK:
+    return "loopback";
+  case MCP_LISTENONLY:
+    return "listen-only";
+  case MODE_CONFIG:
+    return "config";
+  default:
+    return "unknown";
+  }
+}
+
+uint8_t mcp2515DebugReadRegister(uint8_t address) {
+  digitalWrite(pins::CAN_SPI_CS, LOW);
+  SPI.transfer(MCP_READ);
+  SPI.transfer(address);
+  const uint8_t value = SPI.transfer(0x00);
+  digitalWrite(pins::CAN_SPI_CS, HIGH);
+  return value;
+}
+
+uint8_t mcp2515DebugReadStatus() {
+  digitalWrite(pins::CAN_SPI_CS, LOW);
+  SPI.transfer(MCP_READ_STATUS);
+  const uint8_t value = SPI.transfer(0x00);
+  digitalWrite(pins::CAN_SPI_CS, HIGH);
+  return value;
+}
+
+void runCanLoopbackSelfTest() {
+  const uint8_t loopbackModeResult = canBus.setMode(MCP_LOOPBACK);
+  uint8_t data[1] = {0xA5};
+  const uint8_t txResult = canBus.sendMsgBuf(can_protocol::ID_ENGINE_KNOCK_STATE, 0, 1, data);
+  bool rxMatched = false;
+  unsigned long rxId = 0;
+  byte len = 0;
+  byte rxData[8] = {};
+  const uint32_t start = millis();
+
+  while (elapsed(millis(), start, 25) == false) {
+    if (canBus.checkReceive() == CAN_MSGAVAIL &&
+        canBus.readMsgBuf(&rxId, &len, rxData) == CAN_OK) {
+      rxMatched = rxId == can_protocol::ID_ENGINE_KNOCK_STATE &&
+                  len == 1 &&
+                  rxData[0] == data[0];
+      break;
+    }
+  }
+
+  Serial.print(F("CAN SELFTEST loopbackMode="));
+  Serial.print(loopbackModeResult);
+  Serial.print(F(" tx="));
+  Serial.print(txResult);
+  Serial.print(F(" rx="));
+  Serial.print(rxMatched ? 1 : 0);
+  Serial.print(F(" id=0x"));
+  Serial.print(rxId, HEX);
+  Serial.print(F(" len="));
+  Serial.println(len);
+}
+
 bool initCanBus() {
+  pinMode(pins::CAN_SPI_CS, OUTPUT);
+  digitalWrite(pins::CAN_SPI_CS, HIGH);
   pinMode(pins::CAN_SPI_INT, INPUT_PULLUP);
   SPI.begin();
 
-  if (canBus.begin(MCP_ANY, CCM_CAN_SPEED, CCM_MCP2515_CLOCK) != CAN_OK) {
+  const uint8_t beginResult = canBus.begin(MCP_ANY, CCM_CAN_SPEED, CCM_MCP2515_CLOCK);
+  Serial.print(F("CAN INIT: begin result="));
+  Serial.print(beginResult);
+  Serial.print(F(" bitrate="));
+  Serial.print(canSpeedName(CCM_CAN_SPEED));
+  Serial.print(F(" clock="));
+  Serial.println(canClockName(CCM_MCP2515_CLOCK));
+
+  if (beginResult != CAN_OK) {
     Serial.println(F("CAN: MCP2515 init failed"));
     return false;
   }
 
-  if (canBus.setMode(MCP_NORMAL) != CAN_OK) {
+  runCanLoopbackSelfTest();
+
+  const uint8_t modeResult = canBus.setMode(MCP_NORMAL);
+  if (modeResult != CAN_OK) {
     Serial.println(F("CAN: MCP2515 normal mode failed"));
     return false;
   }
-  Serial.print(F("CAN: MCP2515 online speed="));
-  Serial.print(CCM_CAN_SPEED);
-  Serial.print(F(" clock="));
-  Serial.println(CCM_MCP2515_CLOCK);
+  const uint8_t canstat = mcp2515DebugReadRegister(MCP_CANSTAT);
+  const uint8_t canintf = mcp2515DebugReadRegister(MCP_CANINTF);
+  const uint8_t stat = mcp2515DebugReadStatus();
+  Serial.print(F("CAN INIT: set normal mode result="));
+  Serial.print(modeResult);
+  Serial.print(F(" mode="));
+  Serial.print(canModeName(canstat));
+  Serial.print(F(" CANSTAT=0x"));
+  printHexByte(canstat);
+  Serial.print(F(" INTF=0x"));
+  printHexByte(canintf);
+  Serial.print(F(" STAT=0x"));
+  printHexByte(stat);
+  Serial.println(F(" rxFilter=any txId=standard"));
   Serial.print(F("CAN: CS=D"));
   Serial.print(pins::CAN_SPI_CS);
   Serial.print(F(" INT=D"));
@@ -189,6 +337,7 @@ PressureConfig make100PsiDividerPressureConfig(int pin) {
   pressure.dividerBottomOhms = 20000.0f;
   pressure.sensorMinV = 0.5f;
   pressure.sensorMaxV = 4.5f;
+  pressure.invertedOutput = false;
   pressure.pressureMinPsi = 0.0f;
   pressure.pressureMaxPsi = 100.0f;
   pressure.openCircuitThresholdV = 4.85f;
@@ -244,6 +393,23 @@ void printCanFrame(unsigned long id, byte len, const byte *data) {
 }
 #endif
 
+void printCanTxFrame(const can_protocol::CanFrame &frame, uint8_t result) {
+  if (!kSerialCanVerbose) return;
+  Serial.print(F("CAN TX id=0x"));
+  Serial.print(frame.id, HEX);
+  Serial.print(F(" len="));
+  Serial.print(frame.dlc);
+  Serial.print(F(" result="));
+  Serial.print(result);
+  Serial.print(F(" data="));
+  for (byte i = 0; i < frame.dlc; ++i) {
+    if (frame.data[i] < 0x10) Serial.print('0');
+    Serial.print(frame.data[i], HEX);
+    if (i + 1 < frame.dlc) Serial.print(' ');
+  }
+  Serial.println();
+}
+
 void printHexByte(uint8_t value) {
   if (value < 0x10) Serial.print('0');
   Serial.print(value, HEX);
@@ -270,11 +436,13 @@ uint8_t sendCanFrame(const can_protocol::CanFrame &frame) {
 
 bool transmitCanFrame(const can_protocol::CanFrame &frame, const char *label) {
   const uint8_t result = sendCanFrame(frame);
+  printCanTxFrame(frame, result);
   if (result == CAN_OK) {
     consecutiveCanTxFailures = 0;
     return true;
   }
 
+  canBus.abortTX();
   if (consecutiveCanTxFailures < 255) ++consecutiveCanTxFailures;
   const uint32_t now = millis();
   if (consecutiveCanTxFailures == 1 || elapsed(now, lastCanTxFailureLogMs, kCanTxFailureLogMs)) {
@@ -299,7 +467,42 @@ bool transmitCanFrame(const can_protocol::CanFrame &frame, const char *label) {
     Serial.println();
   }
 
-  return true;
+  return false;
+}
+
+void logCanHealth(uint32_t now) {
+  if (!kSerialCanVerbose) return;
+  if (!elapsed(now, lastCanHealthLogMs, kCanHealthLogMs)) return;
+  lastCanHealthLogMs = now;
+
+  const uint8_t eflg = canBus.getError();
+  const uint8_t tec = canBus.errorCountTX();
+  const uint8_t rec = canBus.errorCountRX();
+  const uint8_t canstat = mcp2515DebugReadRegister(MCP_CANSTAT);
+  const uint8_t canintf = mcp2515DebugReadRegister(MCP_CANINTF);
+  const uint8_t stat = mcp2515DebugReadStatus();
+
+  Serial.print(F("CAN HEALTH online="));
+  Serial.print(canOnline ? 1 : 0);
+  Serial.print(F(" mode="));
+  Serial.print(canModeName(canstat));
+  Serial.print(F(" INT="));
+  Serial.print(digitalRead(pins::CAN_SPI_INT));
+  Serial.print(F(" CANSTAT=0x"));
+  printHexByte(canstat);
+  Serial.print(F(" INTF=0x"));
+  printHexByte(canintf);
+  Serial.print(F(" STAT=0x"));
+  printHexByte(stat);
+  Serial.print(F(" EFLG=0x"));
+  printHexByte(eflg);
+  Serial.print(F(" REC="));
+  Serial.print(rec);
+  Serial.print(F(" TEC="));
+  Serial.print(tec);
+  Serial.print(F(" flags:"));
+  printCanErrorFlags(eflg);
+  Serial.println();
 }
 
 bool serviceCanDiag(uint32_t now) {
@@ -397,20 +600,24 @@ bool sendKnockConfigPages() {
   page2.envelope_alpha_x100 = scaledU8(config.knock.envelopeAlpha, 100.0f);
   page2.bore_mm = can_protocol::clampU8(static_cast<int>(config.knock.boreMm + 0.5f));
 
-  return transmitCanFrame(can_protocol::packKnockConfigPage1(page1), "0x30C") &&
-         transmitCanFrame(can_protocol::packKnockConfigPage2(page2), "0x30D");
+  const bool page1Sent = transmitCanFrame(can_protocol::packKnockConfigPage1(page1), "0x30C");
+  const bool page2Sent = transmitCanFrame(can_protocol::packKnockConfigPage2(page2), "0x30D");
+  return page1Sent && page2Sent;
 }
 
 void applyCanCommandTimeout(uint32_t now) {
   if (!canCommandSeen || !elapsed(now, lastCanCommandMs, kCanCommandTimeoutMs)) return;
 
+  // Timeout only cancels remote manual test. Keep normal injection mode intact
+  // so periodic/non-periodic CAN traffic cannot force output oscillations.
+  if (!manualTestActive) return;
+
   if (!canCommandTimedOut) {
-    Serial.println(F("CAN: command timeout, disarming"));
+    Serial.println(F("CAN: command timeout, stopping manual test"));
   }
   canCommandTimedOut = true;
   manualTestActive = false;
   manualTestDuty = 0;
-  config.mode = InjectionMode::Off;
 }
 
 void markMasterActivity(uint32_t now) {
@@ -492,11 +699,17 @@ void handleCanFrame(unsigned long id, byte len, const byte *data) {
 
   if (id == can_protocol::ID_ENGINE_RUNTIME) {
     markMasterActivity(now);
+    if (kSerialCanVerbose) {
+      Serial.println(F("CAN RX: engine runtime 0x309"));
+    }
     handleEngineRuntimeFrame(len, data);
     return;
   }
 
   if (id == can_protocol::ID_METH_CONFIG_REQUEST) {
+    if (kSerialCanVerbose) {
+      Serial.println(F("CAN RX: config request 0x305, sending 0x30C/0x30D"));
+    }
     if (!sendKnockConfigPages()) {
       Serial.println(F("CAN: config request TX failed, will retry init"));
       canOnline = false;
@@ -510,8 +723,17 @@ void handleCanFrame(unsigned long id, byte len, const byte *data) {
   markMasterActivity(now);
 
   if (len < 1) {
+    if (kSerialCanVerbose) {
+      Serial.println(F("CAN RX: command 0x301 invalid length"));
+    }
     sendConfigAck(0, can_protocol::config_ack_status::INVALID_LENGTH, 0);
     return;
+  }
+
+  if (kSerialCanVerbose) {
+    Serial.print(F("CAN RX: command 0x301 cmd=0x"));
+    if (data[0] < 0x10) Serial.print('0');
+    Serial.println(data[0], HEX);
   }
 
   uint8_t ackStatus = can_protocol::config_ack_status::OK;
@@ -526,7 +748,9 @@ void handleCanFrame(unsigned long id, byte len, const byte *data) {
         manualTestActive = false;
         manualTestDuty = 0;
       }
-      Serial.println(data[1] ? F("CAN CMD: meth armed") : F("CAN CMD: meth disarmed"));
+      if (kSerialCanVerbose) {
+        Serial.println(data[1] ? F("CAN CMD: meth armed") : F("CAN CMD: meth disarmed"));
+      }
     } else {
       ackStatus = can_protocol::config_ack_status::INVALID_LENGTH;
     }
@@ -537,8 +761,10 @@ void handleCanFrame(unsigned long id, byte len, const byte *data) {
       manualTestDuty = constrainAndReport(data[1], 0, 100, ackStatus);
       manualTestStartMs = now;
       ackValue = manualTestDuty;
-      Serial.print(F("CAN CMD: manual duty="));
-      Serial.println(manualTestDuty);
+      if (kSerialCanVerbose) {
+        Serial.print(F("CAN CMD: manual duty="));
+        Serial.println(manualTestDuty);
+      }
     } else {
       ackStatus = can_protocol::config_ack_status::INVALID_LENGTH;
     }
@@ -546,15 +772,19 @@ void handleCanFrame(unsigned long id, byte len, const byte *data) {
   case can_protocol::meth_command::STOP_MANUAL_TEST:
     manualTestActive = false;
     manualTestDuty = 0;
-    Serial.println(F("CAN CMD: manual stop"));
+    if (kSerialCanVerbose) {
+      Serial.println(F("CAN CMD: manual stop"));
+    }
     break;
   case can_protocol::meth_command::SET_BOOST_TRIGGER:
     if (len >= 2) {
       const uint8_t boostKpa = constrainAndReport(data[1], 0, 250, ackStatus);
       config.boost.startPsi = static_cast<float>(boostKpa) * kPsiPerKpa;
       ackValue = boostKpa;
-      Serial.print(F("CAN CMD: boost trigger kPa="));
-      Serial.println(boostKpa);
+      if (kSerialCanVerbose) {
+        Serial.print(F("CAN CMD: boost trigger kPa="));
+        Serial.println(boostKpa);
+      }
     } else {
       ackStatus = can_protocol::config_ack_status::INVALID_LENGTH;
     }
@@ -562,7 +792,9 @@ void handleCanFrame(unsigned long id, byte len, const byte *data) {
   case can_protocol::meth_command::CLEAR_FAULTS:
     controller.clearLatchedFaults();
     canCommandTimedOut = false;
-    Serial.println(F("CAN CMD: clear faults"));
+    if (kSerialCanVerbose) {
+      Serial.println(F("CAN CMD: clear faults"));
+    }
     break;
   case can_protocol::meth_command::KNOCK_SET_ENABLE:
     if (len >= 2) {
@@ -664,8 +896,10 @@ void handleCanFrame(unsigned long id, byte len, const byte *data) {
     knockFaultPending = false;
     break;
   default:
-    Serial.print(F("CAN CMD: unsupported 0x"));
-    Serial.println(data[0], HEX);
+    if (kSerialCanVerbose) {
+      Serial.print(F("CAN CMD: unsupported 0x"));
+      Serial.println(data[0], HEX);
+    }
     ackStatus = can_protocol::config_ack_status::UNSUPPORTED_COMMAND;
     commandAccepted = false;
     break;
@@ -716,6 +950,10 @@ uint8_t boostGaugeKpaForCan(const SensorReadings &readings) {
   return can_protocol::clampU8(static_cast<int>(boostGaugeKpa > 0.0f ? boostGaugeKpa + 0.5f : 0.0f));
 }
 
+uint8_t pressurePsiX2ForCan(float pressurePsi) {
+  return can_protocol::clampU8(static_cast<int>((pressurePsi * 2.0f) + 0.5f));
+}
+
 void queueKnockFault(uint8_t code, uint8_t severity, uint8_t data0, uint8_t data1) {
   pendingKnockFaultCode = code;
   pendingKnockFaultSeverity = severity;
@@ -739,6 +977,8 @@ void serviceCanBus(uint32_t now,
   }
 
   if (!serviceCanDiag(now)) return;
+  logCanHealth(now);
+  applyCanCommandTimeout(now);
 
   const bool interruptActive = digitalRead(pins::CAN_SPI_INT) == LOW;
   const bool fallbackPollDue = elapsed(now, lastCanRxPollMs, kCanRxFallbackPollMs);
@@ -795,10 +1035,10 @@ void serviceCanBus(uint32_t now,
   if (elapsed(now, lastSensorExtTxMs, kSensorExtTxMs)) {
     lastSensorExtTxMs = now;
     can_protocol::EngineSensorExt ext{};
-    ext.oil_pressure_psi = can_protocol::clampU8(static_cast<int>(readings.oilPressurePsi + 0.5f));
-    ext.fuel_pressure_psi = can_protocol::clampU8(static_cast<int>(readings.fuelPressurePsi + 0.5f));
-    ext.meth_pressure_psi = can_protocol::clampU8(static_cast<int>(readings.methPressurePsi + 0.5f));
-    ext.boost_ref_pressure_psi = can_protocol::clampU8(static_cast<int>(readings.boostRefPressurePsi + 0.5f));
+    ext.oil_pressure_psi_x2 = pressurePsiX2ForCan(readings.oilPressurePsi);
+    ext.fuel_pressure_psi_x2 = pressurePsiX2ForCan(readings.fuelPressurePsi);
+    ext.meth_pressure_psi_x2 = pressurePsiX2ForCan(readings.methPressurePsi);
+    ext.boost_ref_pressure_psi_x2 = pressurePsiX2ForCan(readings.boostRefPressurePsi);
     ext.ambient_temp_c = static_cast<int8_t>(readings.ambientValid ? readings.ambientC : 0.0f);
     ext.cabin_temp_c = static_cast<int8_t>(readings.cabinValid ? readings.cabinC : 0.0f);
     ext.analog_fault_flags = readings.analogFaultFlags;
@@ -876,9 +1116,13 @@ void serviceCanBus(uint32_t now,
 
 void setup() {
   Serial.begin(config.serialBaud);
-  delay(100);
+  delay(250);
   // Fail safe until the comfort module explicitly arms this controller.
   config.mode = InjectionMode::Off;
+  Serial.println();
+  Serial.println(F("BOOT: Nano water-meth/knock firmware"));
+  Serial.print(F("BOOT: serial baud="));
+  Serial.println(config.serialBaud);
 
   mapSensor.begin(pins::MAP_SENSOR_ADC, config.map);
   calibrateStartupBaro();
@@ -996,48 +1240,70 @@ void loop() {
 
   serviceCanBus(now, readings, result, knockDetected, knockRaw);
 
-  if (elapsed(now, lastDebugMs, 500)) {
+  if (elapsed(now, lastDebugMs, kSerialHeartbeatMs)) {
     lastDebugMs = now;
-    Serial.print(F("METH armed="));
-    Serial.print(config.mode != InjectionMode::Off ? F("YES") : F("no"));
-    Serial.print(F(" state="));
-    Serial.print(methStateFor(result, readings));
-    Serial.print(F(" duty="));
-    Serial.print(result.finalDutyPercent, 0);
-    Serial.print(F(" mapKpa="));
+    const uint8_t commandedDuty = manualTestActive ? manualTestDuty :
+        can_protocol::clampU8(static_cast<int>(result.finalDutyPercent + 0.5f));
+    Serial.print(F("HB t="));
+    Serial.print(now);
+    Serial.print(F(" map="));
     Serial.print(readings.mapKpa, 1);
-    Serial.print(F(" tankLow="));
-    Serial.print(readings.tankLow ? F("YES") : F("no"));
-    Serial.print(F(" knockRaw="));
-    Serial.print(knockRaw);
-    Serial.print(F(" knockEnv="));
-    Serial.print(knockEnvelopeRaw, 1);
-    Serial.print(F(" gain="));
-    Serial.print(config.knock.signalGain, 1);
-    Serial.print(F(" noiseBase="));
-    Serial.print(knockNoiseBaselineRaw, 1);
-    Serial.print(F(" thresh="));
-    Serial.print(knockThresholdRaw, 1);
-    Serial.print(F(" detected="));
-    Serial.print(knockDetected ? F("YES") : F("no"));
-    Serial.print(F(" rpm="));
-    Serial.print(rpm);
-    if (!engineRpmValid) Serial.print('!');
-    Serial.print(F(" MAP="));
-    Serial.print(readings.mapKpa, 1);
-    Serial.print(F("kPa boost="));
-    Serial.print(readings.boostPsi, 1);
+    Serial.print(F(" boostPsi="));
+    Serial.print(readings.boostPsi, 2);
     Serial.print(F("psi canBoost="));
     Serial.print(boostGaugeKpaForCan(readings));
-    Serial.print(F("kPa oil="));
-    Serial.print(readings.oilPressurePsi, 1);
-    Serial.print(readings.oilPressureValid ? F("psi") : F("psi!"));
-    Serial.print(F(" fuel="));
-    Serial.print(readings.fuelPressurePsi, 1);
-    Serial.print(readings.fuelPressureValid ? F("psi") : F("psi!"));
-    Serial.print(F(" faults=0x"));
-    Serial.print(readings.analogFaultFlags, HEX);
+    Serial.print(F("kPa baro="));
+    Serial.print(config.map.baroKpa, 1);
+    Serial.print(F(" raw="));
+    Serial.print(readings.mapRaw);
+    Serial.print(F(" duty="));
+    Serial.print(commandedDuty);
+    Serial.print(F("% spray="));
+    Serial.print((result.pump.enabled && result.finalDutyPercent > 0.0f) ? 1 : 0);
+    Serial.print(F(" pumpOut="));
+    Serial.print(digitalRead(pins::PUMP_OUT));
+    Serial.print(F(" mode="));
+    Serial.print(static_cast<uint8_t>(config.mode));
+    Serial.print(F(" startPsi="));
+    Serial.print(config.boost.startPsi, 2);
+    Serial.print(F(" canTO="));
+    Serial.print(canCommandTimedOut ? 1 : 0);
+    Serial.print(F("% tankLow="));
+    Serial.print(readings.tankLow ? 1 : 0);
     Serial.print(F(" can="));
-    Serial.println(canOnline ? F("OK") : F("OFF"));
+    Serial.print(canOnline ? 1 : 0);
+    Serial.print(F(" rpm="));
+    Serial.print(rpm);
+    Serial.print(engineRpmValid ? "" : "!");
+    Serial.print(F(" knock="));
+    Serial.print(knockDetected ? 1 : 0);
+    Serial.print(F(" oilAdcV="));
+    Serial.print(oilPressureSensor.adcNodeVoltage(), 3);
+    Serial.print(F(" oilV="));
+    Serial.print(oilPressureSensor.sensorVoltage(), 3);
+    Serial.print(F(" oilPsi="));
+    Serial.print(readings.oilPressurePsi, 1);
+    Serial.print(F(" oilOk="));
+    Serial.print(readings.oilPressureValid ? 1 : 0);
+    Serial.print(F(" oilFault="));
+    Serial.print(pressureFaultName(oilPressureSensor.fault()));
+    Serial.print('(');
+    Serial.print(static_cast<uint8_t>(oilPressureSensor.fault()));
+    Serial.print(')');
+    Serial.print(F(" fuelAdcV="));
+    Serial.print(fuelPressureSensor.adcNodeVoltage(), 3);
+    Serial.print(F(" fuelV="));
+    Serial.print(fuelPressureSensor.sensorVoltage(), 3);
+    Serial.print(F(" fuelPsi="));
+    Serial.print(readings.fuelPressurePsi, 1);
+    Serial.print(F(" fuelOk="));
+    Serial.print(readings.fuelPressureValid ? 1 : 0);
+    Serial.print(F(" fuelFault="));
+    Serial.print(pressureFaultName(fuelPressureSensor.fault()));
+    Serial.print('(');
+    Serial.print(static_cast<uint8_t>(fuelPressureSensor.fault()));
+    Serial.print(')');
+    Serial.print(F(" faults=0x"));
+    Serial.println(readings.analogFaultFlags, HEX);
   }
 }
