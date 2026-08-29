@@ -25,9 +25,10 @@ constexpr int ENGINE_BAY_THERM_PIN = -1;
 constexpr int CABIN_THERM_PIN = -1;
 constexpr int AMBIENT_THERM_PIN = -1;
 
-// Pressure transducers disabled until dedicated hardware is wired.
-constexpr int OIL_PRESSURE_ADC = -1;
-constexpr int FUEL_PRESSURE_ADC = -1;
+// 0.5-4.5 V pressure transducers through 10k/20k dividers.
+// Nano A6/A7 are analog-input only pins.
+constexpr int OIL_PRESSURE_ADC = A6;
+constexpr int FUEL_PRESSURE_ADC = A7;
 constexpr int METH_PRESSURE_ADC = -1;
 constexpr int BOOST_REF_PRESSURE_ADC = -1;
 constexpr int SPARE_PRESSURE_1_ADC = -1;
