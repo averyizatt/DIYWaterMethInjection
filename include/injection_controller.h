@@ -23,6 +23,13 @@ struct ControlResult {
   bool overboostAssistFaultLatched{false};
 };
 
+inline bool manualPumpTestSafe(const SensorReadings& readings, const AppConfig& config,
+                               const ControlResult& result) {
+  return config.mode == InjectionMode::Off &&
+         (!config.tankProtectionEnabled || !readings.tankLow) && readings.mapValid &&
+         result.failsafe == FailsafeReason::None && !result.overboostAssistFaultLatched;
+}
+
 class InjectionController {
 public:
   ControlResult update(const SensorReadings &readings, const AppConfig &config, const TankBlend &blend);

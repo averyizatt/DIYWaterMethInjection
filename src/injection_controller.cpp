@@ -34,7 +34,7 @@ ControlResult InjectionController::update(const SensorReadings &readings, const 
     return result;
   }
 
-  if (readings.tankLow) {
+  if (config.tankProtectionEnabled && readings.tankLow) {
     sprayLatched_ = false;
     result.failsafe = FailsafeReason::LowFluid;
     result.overboostAssistFaultLatched = overboostAssistFaultLatched_;

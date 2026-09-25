@@ -363,16 +363,16 @@ void updatePressureReadings(SensorReadings &readings, uint32_t now) {
   readings.methPressurePsi = readings.methPressureValid ? methPressureSensor.valuePsi() : 0.0f;
   readings.boostRefPressurePsi = readings.boostRefPressureValid ? boostRefPressureSensor.valuePsi() : 0.0f;
 
-  if (!readings.oilPressureValid && oilPressureSensor.config().enabled) {
+  if (!readings.oilPressureValid) {
     readings.analogFaultFlags |= kAnalogFaultOilPressure;
   }
-  if (!readings.fuelPressureValid && fuelPressureSensor.config().enabled) {
+  if (!readings.fuelPressureValid) {
     readings.analogFaultFlags |= kAnalogFaultFuelPressure;
   }
-  if (!readings.methPressureValid && methPressureSensor.config().enabled) {
+  if (!readings.methPressureValid) {
     readings.analogFaultFlags |= kAnalogFaultMethPressure;
   }
-  if (!readings.boostRefPressureValid && boostRefPressureSensor.config().enabled) {
+  if (!readings.boostRefPressureValid) {
     readings.analogFaultFlags |= kAnalogFaultBoostRefPressure;
   }
 }
@@ -563,7 +563,7 @@ uint8_t constrainAndReport(uint8_t value, uint8_t minValue, uint8_t maxValue, ui
 bool sendConfigAck(uint8_t command, uint8_t status, uint8_t value) {
   return transmitCanFrame(can_protocol::packConfigAck(
       command, status, value,
-      static_cast<uint8_t>(can_protocol::CAN_PROTOCOL_SCHEMA_VERSION)), "0x306");
+      static_cast<uint8_t>(can_protocol::CAN_PROTOCOL_SCHEMA_VERSION)), "0x30A");
 }
 
 bool sendMethConfigAck(uint8_t version, uint8_t status, uint8_t rejectReason) {
@@ -637,7 +637,10 @@ void handleMethConfigBroadcast(byte len, const byte *data) {
   }
 
   config.mode = data[1] != 0U ? InjectionMode::BoostOnly : InjectionMode::Off;
-  if (config.mode == InjectionMode::Off) {
+  config.tankProtectionEnabled = (data[6] & 0x01U) != 0U;
+  // A disarmed periodic config must not cancel a deliberately started test.
+  // Arming cancels the test; explicit DISARM/STOP commands still stop it.
+  if (config.mode != InjectionMode::Off) {
     manualTestActive = false;
     manualTestDuty = 0;
   }
@@ -744,10 +747,8 @@ void handleCanFrame(unsigned long id, byte len, const byte *data) {
   case can_protocol::meth_command::ARM:
     if (len >= 2) {
       config.mode = data[1] ? InjectionMode::BoostOnly : InjectionMode::Off;
-      if (!data[1]) {
-        manualTestActive = false;
-        manualTestDuty = 0;
-      }
+      manualTestActive = false;
+      manualTestDuty = 0;
       if (kSerialCanVerbose) {
         Serial.println(data[1] ? F("CAN CMD: meth armed") : F("CAN CMD: meth disarmed"));
       }
@@ -757,6 +758,13 @@ void handleCanFrame(unsigned long id, byte len, const byte *data) {
     break;
   case can_protocol::meth_command::MANUAL_TEST_DUTY:
     if (len >= 2) {
+      // Repeated requests must not extend the five-second test window.
+      if (manualTestActive || config.mode != InjectionMode::Off ||
+          (config.tankProtectionEnabled && floatSensor.isLow())) {
+        ackStatus = can_protocol::config_ack_status::VALUE_CLAMPED;
+        ackValue = 0;
+        break;
+      }
       manualTestActive = true;
       manualTestDuty = constrainAndReport(data[1], 0, 100, ackStatus);
       manualTestStartMs = now;
@@ -925,7 +933,7 @@ uint8_t methStateFor(const ControlResult &result, const SensorReadings &readings
   if (result.pump.enabled && result.finalDutyPercent > 0.0f) {
     return static_cast<uint8_t>(can_protocol::MethState::SPRAYING);
   }
-  if (config.mode != InjectionMode::Off && !readings.tankLow) {
+  if (config.mode != InjectionMode::Off && (!config.tankProtectionEnabled || !readings.tankLow)) {
     return static_cast<uint8_t>(can_protocol::MethState::ARMED);
   }
   return static_cast<uint8_t>(can_protocol::MethState::OFF);
@@ -933,7 +941,7 @@ uint8_t methStateFor(const ControlResult &result, const SensorReadings &readings
 
 uint8_t methFaultFlagsFor(const ControlResult &result, const SensorReadings &readings) {
   uint8_t flags = 0;
-  if (readings.tankLow || result.failsafe == FailsafeReason::LowFluid) flags |= (1U << 0);
+  if ((config.tankProtectionEnabled && readings.tankLow) || result.failsafe == FailsafeReason::LowFluid) flags |= (1U << 0);
   if (!readings.mapValid || result.failsafe == FailsafeReason::MapInvalid) flags |= (1U << 1);
   if (result.overboostAssistActive) flags |= (1U << 2);
   if (result.overboostEmergencyActive || result.overboostAssistFaultLatched) flags |= (1U << 3);
@@ -1042,6 +1050,10 @@ void serviceCanBus(uint32_t now,
     ext.ambient_temp_c = static_cast<int8_t>(readings.ambientValid ? readings.ambientC : 0.0f);
     ext.cabin_temp_c = static_cast<int8_t>(readings.cabinValid ? readings.cabinC : 0.0f);
     ext.analog_fault_flags = readings.analogFaultFlags;
+    if (!readings.iatValid) ext.analog_fault_flags |= can_protocol::analog_sensor_fault::IAT;
+    if (!readings.engineBayValid) ext.analog_fault_flags |= can_protocol::analog_sensor_fault::ENGINE_BAY;
+    if (!readings.ambientValid) ext.analog_fault_flags |= can_protocol::analog_sensor_fault::AMBIENT;
+    if (!readings.cabinValid) ext.analog_fault_flags |= can_protocol::analog_sensor_fault::CABIN;
 
     if (!transmitCanFrame(can_protocol::packEngineSensorExt(ext), "0x303")) {
       return;
@@ -1221,11 +1233,18 @@ void loop() {
   lastKnockClippingDetected = knockClippingDetected;
 
   applyCanCommandTimeout(now);
-  if (manualTestActive && elapsed(now, manualTestStartMs, kManualTestTimeoutMs)) {
+  if (manualTestActive && (elapsed(now, manualTestStartMs, kManualTestTimeoutMs) ||
+                           (config.tankProtectionEnabled && readings.tankLow) || !readings.mapValid ||
+                           config.mode != InjectionMode::Off)) {
     manualTestActive = false;
     manualTestDuty = 0;
   }
   ControlResult result = controller.update(readings, config, blend);
+
+  if (manualTestActive && !manualPumpTestSafe(readings, config, result)) {
+    manualTestActive = false;
+    manualTestDuty = 0;
+  }
 
   if (manualTestActive) {
     result.pump.enabled = manualTestDuty > 0;
@@ -1270,6 +1289,10 @@ void loop() {
     Serial.print(canCommandTimedOut ? 1 : 0);
     Serial.print(F("% tankLow="));
     Serial.print(readings.tankLow ? 1 : 0);
+    Serial.print(F(" floatD3="));
+    Serial.print(digitalRead(pins::FLOAT_SENSOR_DIGITAL));
+    Serial.print(F(" lowWhen="));
+    Serial.print(config.floatActiveLow ? F("LOW") : F("HIGH"));
     Serial.print(F(" can="));
     Serial.print(canOnline ? 1 : 0);
     Serial.print(F(" rpm="));

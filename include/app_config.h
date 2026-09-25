@@ -186,6 +186,7 @@ struct AppConfig {
   // true = LOW at pin means low-fluid (switch closes to GND when level is low).
   // With INPUT_PULLUP, a disconnected/open wire reads HIGH and is treated as full.
   bool floatActiveLow{true};
+  bool tankProtectionEnabled{true};
   uint32_t floatDebounceMs{100};
   uint32_t floatLowShutdownDelayMs{2000};
 

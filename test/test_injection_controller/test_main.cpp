@@ -139,6 +139,30 @@ bool sensorFault_forcesPumpOff_evenDuringOverboost() {
          (!lowFluid.pump.enabled && lowFluid.failsafe == FailsafeReason::LowFluid);
 }
 
+bool tankBypass_keepsOtherInterlocks() {
+  InjectionController c;
+  AppConfig cfg = makeConfig();
+  const TankBlend blend = makeBlend();
+  const SensorReadings low = makeReadings(6.0f, true, true);
+  if (c.update(low, cfg, blend).pump.enabled) return false;
+  cfg.tankProtectionEnabled = false;
+  if (!c.update(low, cfg, blend).pump.enabled) return false;
+  if (c.update(makeReadings(6.0f, false, true), cfg, blend).pump.enabled) return false;
+  cfg.mode = InjectionMode::Off;
+  if (c.update(low, cfg, blend).pump.enabled) return false;
+  ControlResult result{};
+  if (!manualPumpTestSafe(low, cfg, result)) return false;
+  cfg.tankProtectionEnabled = true;
+  if (manualPumpTestSafe(low, cfg, result)) return false;
+  cfg.tankProtectionEnabled = false;
+  if (manualPumpTestSafe(makeReadings(0, false), cfg, result)) return false;
+  result.overboostAssistFaultLatched = true;
+  if (manualPumpTestSafe(low, cfg, result)) return false;
+  result.overboostAssistFaultLatched = false;
+  cfg.mode = InjectionMode::BoostOnly;
+  return !manualPumpTestSafe(low, cfg, result);
+}
+
 } // namespace
 
 int main() {
@@ -152,6 +176,7 @@ int main() {
   };
 
   check("belowSprayThreshold_pumpOff", belowSprayThreshold_pumpOff());
+  check("tankBypass_keepsOtherInterlocks", tankBypass_keepsOtherInterlocks());
   check("progressiveDuty_ramps", progressiveDuty_ramps());
   check("aboveFullSpray_usesMaxDuty", aboveFullSpray_usesMaxDuty());
   check("overboostWarning_commandsHighDuty", overboostWarning_commandsHighDuty());

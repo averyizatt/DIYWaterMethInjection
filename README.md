@@ -13,6 +13,42 @@ This device does not require a local display. Knock and system observability are
 
 ## Sensors and control
 
+### Controller UI pump test and tank protection
+
+Update both the ESP32 controller and Nano firmware for these controls. On the
+METH page, disarm injection and hold **HOLD: TEST 5s** to run the relay-driven
+pump at 100% for at most five seconds. **STOP PUMP** cancels the test and disarms
+normal injection. A three-second cooldown prevents immediate repeated tests.
+The Nano also enforces its own timeout if the UI or CAN connection fails.
+Route the nozzle into a suitable container before testing: this operates the
+real pump and sprays fluid.
+
+Hold **TANK GUARD** while stopped/disarmed to bypass only the float protection;
+the button then reads **BYPASS!**. Hold again to restore protection. The choice
+is not saved and defaults to protection enabled after restart. With bypass on,
+the pump can run with an empty tank; verify fluid yourself. MAP and other
+reported faults still block operation. Wait for fresh Nano status after changing
+the guard before arming/testing. Older Nano firmware ignores the bypass flag.
+
+The two-wire float is on **D3 to GND**, with an internal pull-up. The documented
+active-low setting means **closed/LOW = low fluid**, **open/HIGH = fluid OK**.
+This is a binary switch, not a percentage-level sender; the UI now displays
+**LOW / OK**, or **--** while offline. CAN still carries 0/100 for compatibility.
+If LOW never changes, inspect D3 and the switch continuity in both float positions.
+The Nano serial heartbeat at 115200 baud now prints `floatD3` and `lowWhen` beside
+`tankLow` to distinguish the electrical input from the debounced result. A switch
+that closes when full has the opposite polarity to this configuration; do not
+reverse the firmware setting without verifying both float positions.
+
+The previous controller Arm gate required IAT and meth-pressure validity even
+though both channels are disabled in the supplied Nano pin map. Arm now follows
+the Nano's boost-mode MAP/fault status and tank protection instead. Rejections
+are displayed as offline, low tank, or module fault.
+
+Periodic disarmed configuration broadcasts previously cancelled manual tests.
+They now preserve an active test; explicit ARM/DISARM/STOP and the local timeout
+still cancel it, and repeated test commands cannot restart its timer.
+
 Implemented analog channels:
 
 - MAP/boost sensor
@@ -23,6 +59,10 @@ Implemented analog channels:
 The firmware performs conversion, smoothing, and fault detection on all supported channels.
 
 ## CAN bus interface
+
+Schema 2 uses the canonical shared header. Command/knock ACKs are now on
+`0x30A`; `0x306` is reserved for configuration broadcast ACKs. Update the main
+controller and Nano together. See [CAN audit](../../docs/CAN_COMPATIBILITY_AUDIT.md).
 
 Existing controller frames:
 
@@ -118,7 +158,7 @@ Knock tuning commands are accepted on `ID_ENGINE_METH_COMMAND` (`0x301`) with th
 - `0x49` set auto frequency from bore (`B1`: 0/1)
 - `0x4A` clear knock events/fault latch
 
-Config requests sent on `0x305` trigger the module to rebroadcast `0x30C` and `0x30D`. Runtime command/config responses are sent on `0x306` as:
+Config requests sent on `0x305` trigger the module to rebroadcast `0x30C` and `0x30D`. Runtime command responses are sent on `0x30A` as:
 
 - `B0` command byte
 - `B1` status (`0` OK, `1` unsupported, `2` invalid length, `3` value clamped)
