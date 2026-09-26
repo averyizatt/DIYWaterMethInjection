@@ -208,7 +208,7 @@ Host-side unit tests were added for knock detector logic in [test/test_knock_det
 Run tests:
 
 ```bash
-platformio test -e native_knock_tests
+platformio test -c platformio-tests.ini -e native_knock_tests
 ```
 
 ## Knock tuning workflow
@@ -230,23 +230,15 @@ The current knock path enforces knock-sensor datasheet constraints in firmware:
 
 ## Build and upload
 
-Nano environments:
-
-- `arduino_nano`: modern bootloader upload speed (115200)
-- `arduino_nano_old_bootloader`: clone/old bootloader upload speed (57600)
-
-Build/upload commands:
+The single default environment is `arduino_nano` (115200 baud).
 
 ```bash
-platformio run -e arduino_nano
-platformio run -e arduino_nano -t upload
+platformio run
+platformio run -t upload
 ```
 
-If upload fails on a clone Nano, use:
-
-```bash
-platformio run -e arduino_nano_old_bootloader -t upload
-```
+For a clone with the old bootloader, change `upload_speed` in `platformio.ini`
+to `57600`. Host test environments live separately in `platformio-tests.ini`.
 
 Nano wiring used by the firmware:
 
