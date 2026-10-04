@@ -183,9 +183,11 @@ struct AppConfig {
   // Lower = more responsive flow control but more wear. 500ms (2 Hz) is a reasonable max.
   uint16_t relayPeriodMs{1000};
 
-  // true = LOW at pin means low-fluid (switch closes to GND when level is low).
-  // With INPUT_PULLUP, a disconnected/open wire reads HIGH and is treated as full.
-  bool floatActiveLow{true};
+  // Installed float switch closes to GND while the tank has fluid and opens when low,
+  // so HIGH at the pin means low-fluid (false here). With INPUT_PULLUP a disconnected
+  // or broken wire also reads HIGH and is treated as low: injection stops (fail-safe).
+  // Set true for a switch that closes to GND when the level is low.
+  bool floatActiveLow{false};
   bool tankProtectionEnabled{true};
   uint32_t floatDebounceMs{100};
   uint32_t floatLowShutdownDelayMs{2000};

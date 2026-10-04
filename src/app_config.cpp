@@ -52,7 +52,7 @@ AppConfig defaultConfig() {
   // Relay switching period: 1 second per cycle (1 Hz), safe for all mechanical relays.
   config.relayPeriodMs = 1000;
 
-  config.floatActiveLow = true;
+  config.floatActiveLow = false;  // Float closes to GND while fluid is present.
   config.floatDebounceMs = 100;
   config.floatLowShutdownDelayMs = 2000;
 
