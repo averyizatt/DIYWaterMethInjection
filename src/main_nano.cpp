@@ -22,6 +22,11 @@
 #define CCM_CAN_RX_TRACE 0
 #endif
 
+#ifdef CCM_CAN_PROTOCOL_VERSION
+static_assert(CCM_CAN_PROTOCOL_VERSION == can_protocol::CAN_PROTOCOL_SCHEMA_VERSION,
+              "platformio.ini CCM_CAN_PROTOCOL_VERSION does not match the shared CAN contract");
+#endif
+
 namespace {
 AppConfig config = defaultConfig();
 TankBlend blend = computeTankBlend(1.5f, 0.5f);
@@ -567,14 +572,9 @@ bool sendConfigAck(uint8_t command, uint8_t status, uint8_t value) {
 }
 
 bool sendMethConfigAck(uint8_t version, uint8_t status, uint8_t rejectReason) {
-  can_protocol::CanFrame frame{};
-  frame.id = can_protocol::ID_METH_CONFIG_ACK;
-  frame.dlc = 4;
-  frame.data[0] = version;
-  frame.data[1] = status;
-  frame.data[2] = rejectReason;
-  frame.data[3] = can_protocol::clampU8(static_cast<int>(blend.methPercent + 0.5f));
-  return transmitCanFrame(frame, "0x306-meth");
+  return transmitCanFrame(can_protocol::packMethConfigAck(
+      version, status, rejectReason,
+      can_protocol::clampU8(static_cast<int>(blend.methPercent + 0.5f))), "0x306-meth");
 }
 
 bool sendKnockConfigPages() {
