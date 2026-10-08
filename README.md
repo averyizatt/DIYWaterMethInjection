@@ -225,18 +225,37 @@ Config requests sent on `0x305` trigger the module to rebroadcast `0x30C` and `0
 - `B2` applied value
 - `B3` schema version
 
-## Knock DSP pipeline
+## Knock listening on the Nano
 
-The knock subsystem is modular and runs as:
+The Nano build uses [include/knock_band.h](include/knock_band.h). (The larger
+`knock_detector_logic` / `knock_monitor` sources in this repo are not part of the Nano
+build; see `build_src_filter` in platformio.ini.)
 
-- high-rate ADC block capture
-- bias removal
-- biquad bandpass filtering
-- rectified envelope plus RMS-like energy
-- adaptive threshold (`threshold = baseline * multiplier + offset`)
-- RPM/MAP arming gates
-- debounce/event window logic
-- clipping/missing/stuck sensor fault detection
+Each 20 ms loop pass takes one burst from the knock amplifier on `A5`: 64 samples at
+19.2 kHz (ADC free-running, /64 clock), 3.3 ms. The burst is measured with integer
+Goertzel filters:
+
+- **level**: amplitude in the knock band, five 300 Hz bins around the centre frequency
+- **share**: the band's share of the burst's total energy (ringing is narrow, engine
+  noise is broadband)
+- **peak** and **bias**: largest swing and resting level, for checking the amplifier
+
+The centre frequency comes from the bore, `f = 1800 / (pi * bore_mm)` kHz: about
+6.0 kHz for the 96 mm bore of the Ford 2.3 L Lima this build defaults to. It can be set
+over CAN in 300 Hz steps from 2.4 to 7.8 kHz.
+
+The detector learns the normal level per 1000 RPM and calls a hit only when the level
+exceeds `learned * multiplier + offset` and the share is high enough. Two hits within
+0.6 s raise a warning; a strong, clearly narrow hit is critical at once. Knock-like
+bursts are never learned as normal. Readings are judged only while armed (enabled,
+RPM and MAP above their minimums, sensor not clipping and resting near mid-scale).
+
+Limits: the bursts are not timed to combustion (the Nano has no crank or ignition
+signal), so single knock events are caught about one time in four and sustained knock
+within a fraction of a second. Nothing here retards timing.
+
+`0x307` carries level, learned level, threshold and, in its spare byte, the share.
+`0x30B` carries the resting level and the largest swing.
 
 ## Serial (optional)
 
@@ -269,6 +288,17 @@ Run tests:
 
 ```bash
 platformio test -c platformio-tests.ini -e native_knock_tests
+```
+
+The knock listening logic has a host test
+([test/test_knock_band/test_main.cpp](test/test_knock_band/test_main.cpp)) with
+synthetic engine noise and knock: frequency selectivity, integer overflow, learning
+per RPM, false alarms over twenty simulated minutes and catch rate.
+
+```bash
+platformio test -c platformio-tests.ini -e native_knock_band_tests
+# or directly:
+g++ -std=c++11 -I include test/test_knock_band/test_main.cpp -o knock_band_test && ./knock_band_test
 ```
 
 The pulse tuning logic has its own host test
@@ -316,7 +346,7 @@ Nano wiring used by the firmware:
 | Signal | Nano pin | Wiring notes |
 | --- | --- | --- |
 | MAP analog input | `A0` | GM 3-bar MAP through 10k/20k divider. Avoid `A4` because it is SDA and can be biased by I2C pull-ups. |
-| Knock analog input | `A5` | Raw knock module/sensor signal into Nano ADC range. |
+| Knock analog input | `A5` | Knock sensor through an amplifier that rests near 2.5 V and swings both ways (AC signal, not an envelope). |
 | Air temperature before the nozzle | `A1` | GM-style IAT thermistor to GND, 2.49 kohm pull-up to 5 V. |
 | Air temperature after the nozzle | `A2` | GM-style IAT thermistor to GND, 2.49 kohm pull-up to 5 V. |
 | Oil pressure analog input | `A6` | 0.5-4.5 V, 0-100 psi sensor through 10k/20k divider. Analog-input only pin. |

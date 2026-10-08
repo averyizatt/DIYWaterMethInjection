@@ -8,6 +8,7 @@
 #include "app_config.h"
 #include "can_contract/can_protocol.h"
 #include "injection_controller.h"
+#include "knock_band.h"
 #include "meth_tune.h"
 #include "pins.h"
 #include "sensors.h"
@@ -99,11 +100,10 @@ uint32_t lastCanTxFailureLogMs = 0;
 uint32_t lastEngineRuntimeRxMs = 0;
 uint32_t manualTestStartMs = 0;
 uint32_t lastCanHealthLogMs = 0;
-float knockBiasRaw = 0.0f;
-float knockEnvelopeRaw = 0.0f;
-float knockNoiseBaselineRaw = 0.0f;
-float knockThresholdRaw = 0.0f;
-uint16_t knockSamplesProcessed = 0;
+// Knock listening (knock_band.h): one fast burst per loop pass, judged by the detector.
+knock_band::Detector knockDetector;
+knock_band::Burst knockBurst;
+uint16_t knockSamples[knock_band::kSamples];
 bool canOnline = false;
 bool canCommandSeen = false;
 bool canCommandTimedOut = false;
@@ -134,10 +134,10 @@ uint8_t engineRuntimeMapKpa = 0;
 bool engineRpmValid = false;
 bool engineRuntimeMapValid = false;
 
-constexpr float kKnockAdcRefVoltage = 5.0f;
-constexpr float kKnockAdcMaxCount = 1023.0f;
 constexpr float kPsiPerKpa = 0.1450377f;
-constexpr uint16_t kKnockBaselineLearnSamples = 50;
+// The amplifier should rest near mid-scale; far from it the sensor is not being heard.
+constexpr uint16_t kKnockBiasLowAdc = 150;
+constexpr uint16_t kKnockBiasHighAdc = 870;
 constexpr uint32_t kCanRetryMs = 2000;
 constexpr uint32_t kCanDiagMs = 3000;
 constexpr uint32_t kCanRxFallbackPollMs = 50;
@@ -196,10 +196,47 @@ const char *pressureFaultName(PressureFault fault) {
   }
 }
 
-float currentKnockThresholdRaw() {
-  const float multiplier = clampFloatValue(config.knock.thresholdMultiplier, 0.5f, 10.0f);
-  const float offset = clampFloatValue(config.knock.thresholdOffset, 0.0f, 255.0f);
-  return clampFloatValue((knockNoiseBaselineRaw * multiplier) + offset, 1.0f, 255.0f);
+// The frequency the detector listens at: from the bore, or the value set over CAN.
+uint16_t knockCenterHz() {
+  if (config.knock.autoCenterFromBore) {
+    return knock_band::knockHzForBore(static_cast<uint8_t>(clampFloatValue(config.knock.boreMm, 40.0f, 200.0f) + 0.5f));
+  }
+  return static_cast<uint16_t>(clampFloatValue(config.knock.centerFreqHz, 2000.0f, 9000.0f));
+}
+
+knock_band::Settings knockSettings() {
+  knock_band::Settings s;
+  s.offset = static_cast<uint8_t>(clampFloatValue(config.knock.thresholdOffset, 0.0f, 255.0f));
+  s.multiplierX10 = static_cast<uint8_t>(clampFloatValue(config.knock.thresholdMultiplier, 0.5f, 10.0f) * 10.0f + 0.5f);
+  s.gainX16 = static_cast<uint8_t>(clampFloatValue(config.knock.signalGain, 0.1f, 15.9f) * 16.0f + 0.5f);
+  s.holdMs = config.knock.eventCooldownMs < 100 ? 100 : config.knock.eventCooldownMs;
+  return s;
+}
+
+// One burst from the knock amplifier: 64 samples at 19.2 kHz, 3.3 ms. The ADC runs
+// free with a /64 clock for the burst so the spacing is exact, then goes back to the
+// Arduino default for the other analog inputs.
+void captureKnockBurst(uint16_t *samples) {
+  const uint8_t savedAdcsra = ADCSRA;
+  ADMUX = static_cast<uint8_t>((1 << REFS0) | ((pins::KNOCK_SENSOR_ADC - A0) & 0x07));
+  ADCSRB = 0;
+  ADCSRA = static_cast<uint8_t>((1 << ADEN) | (1 << ADSC) | (1 << ADATE) | (1 << ADIF) | (1 << ADPS2) | (1 << ADPS1));
+  // The first conversions after switching input are discarded while it settles.
+  for (uint8_t skip = 0; skip < 3; ++skip) {
+    while (!(ADCSRA & (1 << ADIF))) {
+    }
+    ADCSRA |= (1 << ADIF);
+  }
+  for (uint8_t i = 0; i < knock_band::kSamples; ++i) {
+    while (!(ADCSRA & (1 << ADIF))) {
+    }
+    samples[i] = ADC;
+    ADCSRA |= (1 << ADIF);
+  }
+  ADCSRA = static_cast<uint8_t>((savedAdcsra & ~((1 << ADATE) | (1 << ADSC))) | (1 << ADIF));
+  // Let the conversion already under way finish, so the next analogRead starts clean.
+  while (ADCSRA & (1 << ADSC)) {
+  }
 }
 
 const char *canSpeedName(uint8_t speed) {
@@ -629,8 +666,7 @@ bool sendKnockConfigPages() {
   page1.min_map_kpa = can_protocol::clampU8(static_cast<int>(config.knock.minMapKpaToArm + 0.5f));
   page1.debounce_ms_div10 = can_protocol::clampU8(config.knock.eventCooldownMs / 10U);
   page1.gain_x10 = scaledU8(config.knock.signalGain, 10.0f);
-  page1.center_frequency_div100 = can_protocol::clampU8(
-      static_cast<int>(config.knock.centerFreqHz / 100.0f + 0.5f));
+  page1.center_frequency_div100 = can_protocol::clampU8((knockCenterHz() + 50U) / 100U);
 
   can_protocol::KnockConfigPage2 page2{};
   page2.bandwidth_div100 = can_protocol::clampU8(
@@ -1253,13 +1289,14 @@ void serviceCanBus(uint32_t now,
     state.status_flags |= knockBaselineLearned ? (1U << 4) : 0U;
     state.status_flags |= knockSensorFault ? (1U << 5) : 0U;
     state.status_flags |= knockClippingDetected ? (1U << 6) : 0U;
-    state.energy = can_protocol::clampU8(static_cast<int>(knockEnvelopeRaw + 0.5f));
-    state.baseline = can_protocol::clampU8(static_cast<int>(knockNoiseBaselineRaw + 0.5f));
-    state.threshold = can_protocol::clampU8(static_cast<int>(knockThresholdRaw + 0.5f));
+    state.energy = knockDetector.level();
+    state.baseline = knockDetector.baseline();
+    state.threshold = knockDetector.threshold();
     state.event_count = knockEventCount;
     state.last_event_rpm_div100 = lastKnockRpmDiv100;
     state.last_event_boost_kpa = lastKnockBoostKpa;
-    state.reserved = 0;
+    // Spare byte: how much of the signal sits at the knock frequency, 0..255.
+    state.reserved = knockDetector.share();
 
     if (!transmitCanFrame(can_protocol::packEngineKnockState(state), "0x307")) {
       return;
@@ -1287,13 +1324,14 @@ void serviceCanBus(uint32_t now,
     hook.flags |= knockWarningActive ? (1U << 5) : 0U;
     hook.flags |= knockCriticalActive ? (1U << 6) : 0U;
     hook.flags |= knockBaselineLearned ? (1U << 7) : 0U;
-    hook.live_knock_rms = can_protocol::clampU8(static_cast<int>(knockEnvelopeRaw + 0.5f));
-    hook.adaptive_threshold = can_protocol::clampU8(static_cast<int>(knockThresholdRaw + 0.5f));
-    hook.adaptive_baseline = can_protocol::clampU8(static_cast<int>(knockNoiseBaselineRaw + 0.5f));
+    hook.live_knock_rms = knockDetector.level();
+    hook.adaptive_threshold = knockDetector.threshold();
+    hook.adaptive_baseline = knockDetector.baseline();
     hook.event_count = knockEventCount;
-    hook.bias_adc_div16 = can_protocol::clampU8(static_cast<int>(knockBiasRaw / 16.0f + 0.5f));
+    hook.bias_adc_div16 = can_protocol::clampU8(knockBurst.bias / 16);
     hook.raw_adc_div16 = can_protocol::clampU8(knockRaw / 16);
-    hook.envelope_level = can_protocol::clampU8(static_cast<int>(knockEnvelopeRaw + 0.5f));
+    // Largest swing in the burst, in half counts: for setting the amplifier gain.
+    hook.envelope_level = can_protocol::clampU8(knockBurst.peak / 2);
 
     if (!transmitCanFrame(can_protocol::packKnockLiveHook(hook), "0x30B")) {
       return;
@@ -1394,52 +1432,34 @@ void loop() {
   updateIntakeTemps(now);
   const uint16_t rpm = currentEngineRpm(now);
 
-  const int knockRaw = analogRead(pins::KNOCK_SENSOR_ADC);
-  const uint16_t knockRawCount = static_cast<uint16_t>(knockRaw < 0 ? 0 : knockRaw);
-  if (knockBiasRaw <= 0.0f) {
-    knockBiasRaw = static_cast<float>(knockRaw);
-  } else {
-    const float biasAlpha = clampFloatValue(config.knock.biasAlpha, 0.0001f, 0.2f);
-    knockBiasRaw += (static_cast<float>(knockRaw) - knockBiasRaw) * biasAlpha;
-  }
-  if (knockSamplesProcessed < 65535U) ++knockSamplesProcessed;
-
-  const float knockDeltaRaw = static_cast<float>(knockRaw) - knockBiasRaw;
-  const float knockGain = clampFloatValue(config.knock.signalGain, 0.05f, 20.0f);
-  const float knockDeltaGained = knockDeltaRaw * knockGain;
-  const float knockAbsGained = fabs(knockDeltaGained);
-  const float envelopeAlpha = clampFloatValue(config.knock.envelopeAlpha, 0.01f, 0.8f);
-  knockEnvelopeRaw += (knockAbsGained - knockEnvelopeRaw) * envelopeAlpha;
-
-  if (knockNoiseBaselineRaw <= 0.0f) {
-    knockNoiseBaselineRaw = knockEnvelopeRaw;
-  } else if (!knockWarningActive) {
-    const float learnAlpha = clampFloatValue(config.knock.baselineLearnAlpha, 0.001f, 0.2f);
-    knockNoiseBaselineRaw += (knockEnvelopeRaw - knockNoiseBaselineRaw) * learnAlpha;
-  }
-  knockThresholdRaw = currentKnockThresholdRaw();
-  knockBaselineLearned = knockSamplesProcessed >= kKnockBaselineLearnSamples;
-  knockClippingDetected =
-      knockRawCount <= config.knock.clipLowAdc || knockRawCount >= config.knock.clipHighAdc;
-  knockSensorFault = knockClippingDetected;
+  // Knock: one fast burst per pass. It is judged only while armed (enough RPM and
+  // manifold pressure for knock to matter), but measured and learned all the time.
+  captureKnockBurst(knockSamples);
+  knockBurst = knock_band::analyze(knockSamples, knock_band::centerBinFor(knockCenterHz()),
+                                   config.knock.bandwidthHz < 1000.0f ? 1 : 2);
+  const int knockRaw = knockSamples[knock_band::kSamples - 1];
+  knockClippingDetected = knockBurst.railed >= knock_band::kSamples / 3;
+  knockSensorFault = knockClippingDetected || knockBurst.bias < kKnockBiasLowAdc || knockBurst.bias > kKnockBiasHighAdc;
   const bool rpmArmed = config.knock.minRpmToArm == 0 || rpm >= config.knock.minRpmToArm;
   const bool mapArmed = readings.mapKpa >= config.knock.minMapKpaToArm;
-  knockSignalValid = config.knock.enabled && knockBaselineLearned && !knockSensorFault &&
-                     rpmArmed && mapArmed;
-  knockWarningActive = knockSignalValid && knockEnvelopeRaw >= knockThresholdRaw;
-  knockCriticalActive = knockSignalValid && knockEnvelopeRaw >= (knockThresholdRaw * 1.6f);
+  const bool knockArmed = config.knock.enabled && rpmArmed && mapArmed && !knockSensorFault;
+  knockDetector.update(now, knockBurst, knockSettings(), knockArmed, engineRpmValid ? rpm : 0);
+  knockBaselineLearned = knockDetector.learned();
+  knockSignalValid = knockArmed && knockBaselineLearned;
+  knockWarningActive = knockDetector.warning();
+  knockCriticalActive = knockDetector.critical();
   const bool knockDetected = knockWarningActive;
 
   if (knockWarningActive && !lastKnockWarningActive) {
     queueKnockFault(can_protocol::knock_fault_code::KNOCK_WARNING,
                     static_cast<uint8_t>(can_protocol::FaultSeverity::WARNING),
-                    can_protocol::clampU8(static_cast<int>(knockEnvelopeRaw + 0.5f)),
+                    knockDetector.level(),
                     boostGaugeKpaForCan(readings));
   }
   if (knockCriticalActive && !lastKnockCriticalActive) {
     queueKnockFault(can_protocol::knock_fault_code::KNOCK_CRITICAL,
                     static_cast<uint8_t>(can_protocol::FaultSeverity::CRITICAL),
-                    can_protocol::clampU8(static_cast<int>(knockEnvelopeRaw + 0.5f)),
+                    knockDetector.level(),
                     boostGaugeKpaForCan(readings));
   }
   if (knockSensorFault && !lastKnockSensorFault) {

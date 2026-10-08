@@ -65,11 +65,12 @@ AppConfig defaultConfig() {
   config.knock.minRpmToArm = 0;
   config.knock.minMapKpaToArm = 120.0f;
   config.knock.minLoadPercentToArm = 35.0f;
-  config.knock.sampleRateHz = 20000;
+  config.knock.sampleRateHz = 19231;  // What the Nano's ADC actually delivers (knock_band.h).
   config.knock.samplesPerUpdate = 64;
   config.knock.autoCenterFromBore = true;
-  config.knock.boreMm = 87.5f;
-  config.knock.centerFreqHz = 5000.0f;
+  // Ford 2.3 L Lima: 96.0 mm (3.780 in) bore, so knock rings at about 6.0 kHz.
+  config.knock.boreMm = 96.0f;
+  config.knock.centerFreqHz = 6000.0f;
   config.knock.bandwidthHz = 1800.0f;
   config.knock.multiBandSpread = 0.14f;
   config.knock.fftEnabled = true;

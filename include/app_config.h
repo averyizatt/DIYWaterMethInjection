@@ -68,15 +68,15 @@ struct KnockConfig {
   float minLoadPercentToArm{30.0f};
 
   // Front-end ADC sampling and analysis block sizing.
-  uint16_t sampleRateHz{20000};
+  uint16_t sampleRateHz{19231};
   uint8_t samplesPerUpdate{64};
 
   // Knock band targeting. Sensor operating frequency range is 3-25 kHz.
   // If autoCenterFromBore is true, centerFreqHz is
   // estimated from bore and harmonic assumptions at runtime.
   bool autoCenterFromBore{true};
-  float boreMm{87.5f};
-  float centerFreqHz{5000.0f};
+  float boreMm{96.0f};
+  float centerFreqHz{6000.0f};
   float bandwidthHz{1800.0f};
   float multiBandSpread{0.14f};
   bool fftEnabled{true};
