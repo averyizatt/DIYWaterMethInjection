@@ -360,6 +360,126 @@ void thermistorCurve() {
   check(!thermistorC(1023, 2490.0f, c) && !thermistorC(1015, 2490.0f, c), "unplugged sensor is invalid");
   check(!thermistorC(0, 2490.0f, c) && !thermistorC(5, 2490.0f, c), "shorted sensor is invalid");
 }
+// Armed and healthy but below start boost: what the controller reports while waiting.
+Inputs waiting(float boostPsi, uint16_t rpm) {
+  Inputs in = idle(kHoldBelowBoost);
+  in.boostPsi = boostPsi;
+  in.mapKpa = 85.0f + boostPsi * 6.895f;
+  in.rpmValid = true;
+  in.rpm = rpm;
+  return in;
+}
+
+void earlyStartAtHighRpmBeforeBoost() {
+  Settings s = defaults();  // Early start from 3500 RPM
+  check(s.value[kEarlyRpm] == 3500, "default: early start from 3500 RPM");
+  Governor g;
+  check(!g.update(0, s, waiting(-0.5f, 3000)) && g.hold() == kHoldBelowBoost, "below the early RPM: still waiting for boost");
+  check(g.update(20, s, waiting(-0.5f, 3600)) && g.hold() == kHoldNone && g.earlyStart(), "3600 RPM, throttle open, no boost: injects");
+  check(g.onMs() == 1000, "early start uses the minimum run time");
+  // Throttle shut at high RPM is deep vacuum: never an early start.
+  Governor g2;
+  check(!g2.update(0, s, waiting(-9.0f, 5500)) && !g2.earlyStart(), "coasting at 5500 RPM with the throttle shut: nothing");
+  check(!g2.update(20, s, waiting(-2.0f, 5500)), "part throttle: nothing");
+  // Hysteresis: a small RPM or pressure wobble does not drop it, a real lift does.
+  Governor g3;
+  g3.update(0, s, waiting(-1.0f, 3600));
+  g3.update(20, s, waiting(-2.0f, 3400));
+  check(g3.earlyStart(), "small wobble keeps the early start");
+  g3.update(40, s, waiting(-6.0f, 3600));
+  check(!g3.earlyStart() && g3.hold() == kHoldBelowBoost, "lifting off ends it");
+  // Disarmed, tank low or a fault are never overridden.
+  Governor g4;
+  Inputs disarmed = waiting(-0.5f, 5000);
+  disarmed.idleHold = kHoldDisarmed;
+  check(!g4.update(0, s, disarmed) && g4.hold() == kHoldDisarmed, "disarmed: no early start");
+  disarmed.idleHold = kHoldTankLow;
+  check(!g4.update(20, s, disarmed) && g4.hold() == kHoldTankLow, "tank low: no early start");
+  disarmed.idleHold = kHoldFault;
+  check(!g4.update(40, s, disarmed) && g4.hold() == kHoldFault, "fault: no early start");
+  // No RPM message: nothing, as always.
+  Inputs noRpm = waiting(-0.5f, 5000);
+  noRpm.rpmValid = false;
+  Governor g5;
+  check(!g5.update(0, s, noRpm) && !g5.earlyStart(), "no RPM message: no early start");
+  // Off when set to 0, and it hands over to boost without a break.
+  change(s, kEarlyRpm, 0);
+  Governor g6;
+  check(!g6.update(0, s, waiting(-0.5f, 6000)), "early start off: waits for boost");
+  s = defaults();
+  change(s, kRampMs, 0);
+  change(s, kRestS, 0);
+  Governor g7;
+  uint32_t on = 0;
+  for (uint32_t now = 0; now < 16000; now += 20) {
+    const bool state = now < 8000 ? g7.update(now, s, waiting(-0.5f, 4500)) : g7.update(now, s, spraying(12.0f, 4500));
+    on += state ? 20 : 0;
+  }
+  check(on == 2 * 1000 + 2 * 2000, "early start runs the minimum, then boost takes over on the same cycle clock");
+  // The dose limit still applies: at 3500 RPM and atmospheric pressure 10% of fuel is 26 ml/min.
+  s = defaults();
+  change(s, kMinOnMs, 2000);
+  change(s, kMaxOnMs, 3000);
+  Governor g8;
+  g8.update(0, s, waiting(0.0f, 3500));
+  check(g8.onMs() > 1600 && g8.onMs() < 1800, "early start is held to the dose limit");
+}
+
+void hotIntakeAirAddsRunTime() {
+  Settings s = defaults();
+  check(s.value[kHotStartC] == 0, "hot-air addition is off by default");
+  change(s, kRampMs, 0);
+  change(s, kHotFullC, 80);
+  change(s, kHotStartC, 40);
+  check(hotAirOnMs(s, true, 30.0f) == 0 && hotAirOnMs(s, true, 40.0f) == 0, "cooler than the start: no addition");
+  check(hotAirOnMs(s, true, 60.0f) == 1500 && hotAirOnMs(s, true, 80.0f) == 2000 && hotAirOnMs(s, true, 150.0f) == 2000, "rises to the full run time");
+  check(hotAirOnMs(s, false, 90.0f) == 0, "no sensor reading: no addition");
+  // At start boost with cool air it runs the minimum; hot air raises it.
+  Inputs in = spraying(5.0f);
+  in.preValid = true;
+  in.preC = 25.0f;
+  Governor g;
+  g.update(0, s, in);
+  check(g.onMs() == 1000 && !g.hotAir(), "cool air: boost alone decides");
+  in.preC = 80.0f;
+  Governor g2;
+  g2.update(0, s, in);
+  check(g2.onMs() == 2000 && g2.hotAir(), "hot air at low boost: full run time");
+  // Whichever asks for more wins; hot air never reduces what boost asks for.
+  Inputs boost = spraying(12.0f);
+  boost.preValid = true;
+  boost.preC = 45.0f;
+  Governor g3;
+  g3.update(0, s, boost);
+  check(g3.onMs() == 2000 && !g3.hotAir(), "boost asks for more than the air temperature");
+  // Hot air alone never starts injection.
+  Inputs hotIdle = idle(kHoldBelowBoost);
+  hotIdle.preValid = true;
+  hotIdle.preC = 120.0f;
+  hotIdle.rpmValid = true;
+  hotIdle.rpm = 2000;
+  hotIdle.boostPsi = -8.0f;
+  hotIdle.mapKpa = 30.0f;
+  Governor g4;
+  check(!g4.update(0, s, hotIdle) && g4.hold() == kHoldBelowBoost && !g4.hotAir(), "heat-soaked air at light load: nothing");
+  // It adds to an early start too, and the dose limit still has the last word.
+  Inputs early = waiting(-0.5f, 5500);
+  early.preValid = true;
+  early.preC = 80.0f;
+  Governor g5;
+  g5.update(0, s, early);
+  check(g5.earlyStart() && g5.hotAir() && g5.onMs() == 2000, "early start with hot air: full run time");
+  early.rpm = 3500;
+  change(s, kMaxOnMs, 4000);
+  Governor g6;
+  g6.update(0, s, early);
+  check(g6.onMs() < 1800, "the dose limit still caps it");
+  // The pair stays ordered, and off stays off.
+  uint16_t applied = 0;
+  check(set(s, kHotStartC, 79, applied) == kSetClamped && applied == 75, "start stays 5 degrees under full");
+  check(set(s, kHotFullC, 30, applied) == kSetClamped && applied == 80, "full stays 5 degrees above start");
+  check(set(s, kHotStartC, 0, applied) == kSetOk && set(s, kHotFullC, 20, applied) == kSetOk && valid(s), "with the feature off, full can be anything in range");
+}
 } // namespace
 
 int main() {
@@ -377,6 +497,8 @@ int main() {
   overboostAssistOnlyWhenEnabledAndCapsApply();
   pumpTestUsesTheSameRelayRules();
   thermistorCurve();
+  earlyStartAtHighRpmBeforeBoost();
+  hotIntakeAirAddsRunTime();
   if (failures) {
     printf("%d meth tune test(s) failed\n", failures);
     return 1;

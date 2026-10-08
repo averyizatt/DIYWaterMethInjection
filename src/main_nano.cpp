@@ -36,6 +36,7 @@ static_assert(meth_tune::kCount == can_protocol::meth_tune_setting::COUNT &&
               meth_tune::kPeriodMs == can_protocol::meth_tune_setting::PERIOD_MS &&
               meth_tune::kOverboostAssist == can_protocol::meth_tune_setting::OVERBOOST_ASSIST &&
               meth_tune::kMaxDosePct == can_protocol::meth_tune_setting::MAX_DOSE_PCT &&
+              meth_tune::kHotFullC == can_protocol::meth_tune_setting::HOT_FULL_C &&
               meth_tune::kHoldDoseLimit == can_protocol::meth_hold::DOSE_LIMIT &&
               meth_tune::kHoldFault == can_protocol::meth_hold::FAULT &&
               meth_tune::kSetClamped == can_protocol::config_ack_status::VALUE_CLAMPED,
@@ -72,7 +73,7 @@ bool preTempValid = false;
 bool postTempValid = false;
 constexpr int kTuneEepromAddress = 0;
 constexpr uint8_t kTuneEepromMagic = 0x4D;
-constexpr uint8_t kTuneEepromVersion = 1;
+constexpr uint8_t kTuneEepromVersion = 2;
 constexpr uint32_t kIntakeTempSampleMs = 50;
 
 uint32_t lastLoopMs = 0;
@@ -1297,6 +1298,8 @@ void serviceCanBus(uint32_t now,
     if (preTempValid) flags |= flag::PRE_VALID;
     if (postTempValid) flags |= flag::POST_VALID;
     if (digitalRead(pins::PUMP_OUT) == HIGH) flags |= flag::PUMP_ON;
+    if (governor.earlyStart()) flags |= flag::EARLY_START;
+    if (governor.hotAir()) flags |= flag::HOT_AIR;
     if (!transmitCanFrame(can_protocol::packMethTuneStatus(tuneRevision, flags, governor.hold(), governor.onMs(),
                                                            tune.value[meth_tune::kPeriodMs]), "0x30F-status")) {
       return;

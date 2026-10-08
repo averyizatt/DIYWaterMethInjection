@@ -31,6 +31,14 @@ Fixed rules, not adjustable:
 - Changing one setting never raises another; values outside the limits are clamped
   and the applied value is acknowledged.
 
+Two optional triggers for cooling, both inside every rule above:
+
+- Early start: from a set RPM, injection begins before boost while the throttle is
+  open (manifold pressure within 1.5 psi of atmospheric), at the start-boost on-time.
+- Hot air: air before the nozzle above a set temperature lengthens the on-time,
+  reaching the full on-time at a second temperature. It only adds to injection that
+  is already active.
+
 | Setting | Range | Default |
 | --- | --- | --- |
 | Cycle length | 1000-10000 ms | 4000 |
@@ -47,6 +55,9 @@ Fixed rules, not adjustable:
 | Methanol in the tank | 0-100 % | 0 |
 | Nozzle flow | 20-1000 ml/min | 60 |
 | Most fluid as a share of fuel flow (0 = off) | 0-40 % | 10 |
+| Early start RPM (0 = off) | 0-8000 | 3500 |
+| Hot air adds on-time from (0 = off) | 0-145 C | 0 |
+| Hot air reaches full on-time at | 20-150 C | 70 |
 
 Settings apply at once and are kept in RAM until a SAVE action writes them to EEPROM.
 A blank or corrupt EEPROM loads the defaults above. The older boost-start command
@@ -258,8 +269,8 @@ platformio test -c platformio-tests.ini -e native_knock_tests
 
 The pulse tuning logic has its own host test
 ([test/test_meth_tune/test_main.cpp](test/test_meth_tune/test_main.cpp)): relay rate
-rules, RPM and temperature gates, dose limit, spray time limit, ramp, setting limits
-and the thermistor curve.
+rules, RPM and temperature gates, dose limit, spray time limit, ramp, early start,
+hot-air addition, setting limits and the thermistor curve.
 
 ```bash
 platformio test -c platformio-tests.ini -e native_meth_tune_tests

@@ -30,8 +30,18 @@ enum Key : uint8_t {
   kMethPercent = 12, // Methanol in the tank by volume; 0 = water only
   kNozzleMlMin = 13, // Nozzle flow with the pump running
   kMaxDosePct = 14,  // Most fluid allowed, as a percentage of estimated fuel flow; 0 = off
+  kEarlyRpm = 15,    // Inject from this RPM with the throttle open, before boost; 0 = off
+  kHotStartC = 16,   // Air before the nozzle hotter than this adds on-time; 0 = off
+  kHotFullC = 17,    // Air temperature where on-time reaches kMaxOnMs
 };
-constexpr uint8_t kCount = 14;
+constexpr uint8_t kCount = 17;
+
+// The high-RPM early start needs an open throttle: manifold pressure close to
+// atmospheric. Coasting at high RPM with the throttle shut is deep vacuum and never
+// triggers it. The second value is where an active early start lets go.
+constexpr float kEarlyStartPsi = -1.5f;
+constexpr float kEarlyStopPsi = -2.5f;
+constexpr uint16_t kEarlyRpmHysteresis = 200;
 
 // The relay's hard limits, whatever the settings say.
 constexpr uint16_t kShortestPulseMs = 500; // Pump runs at least this long, or not at all.
@@ -86,6 +96,9 @@ inline Range rangeOf(uint8_t key) {
   case kMethPercent: return {0, 100, 0};
   case kNozzleMlMin: return {20, 1000, 60};
   case kMaxDosePct: return {0, 40, 10};
+  case kEarlyRpm: return {0, 8000, 3500};
+  case kHotStartC: return {0, 145, 0};
+  case kHotFullC: return {20, 150, 70};
   default: return {0, 0, 0};
   }
 }
@@ -106,7 +119,8 @@ inline bool valid(const Settings &s) {
     if (s.value[key] < r.min || s.value[key] > r.max) return false;
   }
   return s.value[kMinOnMs] <= s.value[kMaxOnMs] && s.value[kMaxOnMs] <= s.value[kPeriodMs] &&
-         s.value[kFullPsiX10] >= s.value[kStartPsiX10] + 10;
+         s.value[kFullPsiX10] >= s.value[kStartPsiX10] + 10 &&
+         (s.value[kHotStartC] == 0 || s.value[kHotFullC] >= s.value[kHotStartC] + 5);
 }
 
 // Change one setting. The edited value is clamped to its range and against its
@@ -126,6 +140,8 @@ inline uint8_t set(Settings &s, uint8_t key, uint16_t requested, uint16_t &appli
   }
   if (key == kStartPsiX10 && v + 10 > s.value[kFullPsiX10]) v = s.value[kFullPsiX10] - 10;
   if (key == kFullPsiX10 && v < s.value[kStartPsiX10] + 10) v = s.value[kStartPsiX10] + 10;
+  if (key == kHotStartC && v > 0 && v + 5 > s.value[kHotFullC]) v = s.value[kHotFullC] - 5;
+  if (key == kHotFullC && s.value[kHotStartC] > 0 && v < s.value[kHotStartC] + 5) v = s.value[kHotStartC] + 5;
   s.value[key] = v;
   if (key == kPeriodMs) {
     if (s.value[kMaxOnMs] > v) s.value[kMaxOnMs] = v;
@@ -146,6 +162,18 @@ inline uint16_t targetOnMs(const Settings &s, float boostPsi) {
   const uint16_t minOn = s.value[kMinOnMs];
   const uint16_t maxOn = s.value[kMaxOnMs];
   return static_cast<uint16_t>(minOn + static_cast<uint16_t>((maxOn - minOn) * fraction + 0.5f));
+}
+
+// On-time asked for by hot intake air: kMinOnMs at kHotStartC rising to kMaxOnMs at
+// kHotFullC. Zero when the feature is off, the sensor is not reading or the air is cooler.
+inline uint16_t hotAirOnMs(const Settings &s, bool preValid, float preC) {
+  const float start = s.value[kHotStartC];
+  if (s.value[kHotStartC] == 0 || !preValid || !(preC > start)) return 0;
+  const float full = s.value[kHotFullC];
+  float fraction = full > start ? (preC - start) / (full - start) : 1.0f;
+  if (fraction > 1.0f) fraction = 1.0f;
+  const uint16_t minOn = s.value[kMinOnMs];
+  return static_cast<uint16_t>(minOn + static_cast<uint16_t>((s.value[kMaxOnMs] - minOn) * fraction + 0.5f));
 }
 
 // Estimated fuel flow (g/min) at this engine speed and manifold absolute pressure.
@@ -205,8 +233,22 @@ public:
     lastMs_ = now;
     started_ = true;
 
+    // Early start: armed and healthy but below start boost, with the engine turning
+    // fast and the throttle open. It only ever asks for the minimum on-time (boost is
+    // below the start of the ramp); hot air below can add to it like any injection.
+    const bool waitingForBoost = !in.wantSpray && in.idleHold == kHoldBelowBoost;
+    const uint16_t earlyRpm = s.value[kEarlyRpm];
+    if (!waitingForBoost || earlyRpm == 0 || !in.rpmValid) {
+      early_ = false;
+    } else if (early_) {
+      early_ = in.rpm + kEarlyRpmHysteresis >= earlyRpm && in.boostPsi > kEarlyStopPsi;
+    } else {
+      early_ = in.rpm >= earlyRpm && in.boostPsi >= kEarlyStartPsi;
+    }
+    const bool wanted = in.wantSpray || early_;
+
     uint8_t hold = kHoldNone;
-    if (!in.wantSpray) hold = in.idleHold == kHoldNone ? static_cast<uint8_t>(kHoldBelowBoost) : in.idleHold;
+    if (!wanted) hold = in.idleHold == kHoldNone ? static_cast<uint8_t>(kHoldBelowBoost) : in.idleHold;
     else if (!in.rpmValid) hold = kHoldRpmMissing;
     else if (in.rpm < s.value[kMinRpm]) hold = kHoldRpmLow;
     else if (s.value[kMinPreTempC] > 0 && !in.preValid) hold = kHoldTempSensor;
@@ -234,6 +276,9 @@ public:
 
     const uint16_t period = s.value[kPeriodMs];
     uint16_t target = targetOnMs(s, in.boostPsi);
+    const uint16_t hot = hotAirOnMs(s, in.preValid, in.preC);
+    hotAir_ = hot > target;
+    if (hotAir_) target = hot;
     uint16_t ramp = s.value[kRampMs];
     if (in.assistActive && s.value[kOverboostAssist]) {
       const uint16_t assist = onFromDuty(in.assistDutyPercent, period);
@@ -266,6 +311,9 @@ public:
 
   uint8_t hold() const { return hold_; }
   bool resting() const { return resting_; }
+  // Injecting now because of the high-RPM start, or with on-time raised by hot air.
+  bool earlyStart() const { return early_ && hold_ == kHoldNone; }
+  bool hotAir() const { return hotAir_ && hold_ == kHoldNone; }
   // On-time of the cycle now running; 0 while not injecting.
   uint16_t onMs() const { return cycleActive_ && !cut_ ? cycleOn_ : 0; }
 
@@ -326,6 +374,8 @@ private:
   bool everCycled_{false};
   bool cut_{false};
   bool out_{false};
+  bool early_{false};
+  bool hotAir_{false};
   bool resting_{false};
 };
 
