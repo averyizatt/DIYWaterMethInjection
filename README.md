@@ -39,6 +39,10 @@ Two optional triggers for cooling, both inside every rule above:
   reaching the full on-time at a second temperature. It only adds to injection that
   is already active.
 
+Until the thermistor before the nozzle is fitted, the temperature features use the
+ECU's intake air temperature, which the dash forwards about four times a second
+(`0x301` command `0x12`, not acknowledged, stale after 1.5 s).
+
 | Setting | Range | Default |
 | --- | --- | --- |
 | Cycle length | 1000-10000 ms | 4000 |

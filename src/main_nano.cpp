@@ -71,6 +71,14 @@ float preTempC = 0.0f;
 float postTempC = 0.0f;
 bool preTempValid = false;
 bool postTempValid = false;
+// Intake temperature forwarded from the ECU by the dash, used for the temperature
+// features until the sensor before the nozzle is fitted.
+float ecuIntakeC = 0.0f;
+uint32_t ecuIntakeSeenMs = 0;
+bool ecuIntakeSeen = false;
+bool usingEcuTemp = false;
+bool lastPumpOn = false;
+constexpr uint32_t kEcuIntakeTimeoutMs = 1500;
 constexpr int kTuneEepromAddress = 0;
 constexpr uint8_t kTuneEepromMagic = 0x4D;
 constexpr uint8_t kTuneEepromVersion = 2;
@@ -898,6 +906,16 @@ void handleCanFrame(unsigned long id, byte len, const byte *data) {
     Serial.println(data[0], HEX);
   }
 
+  if (data[0] == can_protocol::meth_tune_command::LIVE_INTAKE_TEMP) {
+    // Live data, sent several times a second: taken silently, no acknowledgement.
+    if (len == 3) {
+      ecuIntakeC = static_cast<int16_t>((static_cast<uint16_t>(data[1]) << 8) | data[2]) / 10.0f;
+      ecuIntakeSeenMs = now;
+      ecuIntakeSeen = true;
+    }
+    return;
+  }
+
   if (data[0] == can_protocol::meth_tune_command::SET_SETTING ||
       data[0] == can_protocol::meth_tune_command::SETTINGS_ACTION) {
     handleTuneCommand(len, data);
@@ -1300,6 +1318,7 @@ void serviceCanBus(uint32_t now,
     if (digitalRead(pins::PUMP_OUT) == HIGH) flags |= flag::PUMP_ON;
     if (governor.earlyStart()) flags |= flag::EARLY_START;
     if (governor.hotAir()) flags |= flag::HOT_AIR;
+    if (usingEcuTemp) flags |= flag::ECU_TEMP;
     if (!transmitCanFrame(can_protocol::packMethTuneStatus(tuneRevision, flags, governor.hold(), governor.onMs(),
                                                            tune.value[meth_tune::kPeriodMs]), "0x30F-status")) {
       return;
@@ -1470,8 +1489,12 @@ void loop() {
     inputs.mapKpa = readings.mapKpa;
     inputs.rpmValid = engineRpmValid;
     inputs.rpm = rpm;
-    inputs.preValid = preTempValid;
-    inputs.preC = preTempC;
+    // The controller's own sensor before the nozzle when it is fitted; otherwise the
+    // ECU's intake temperature while the dash keeps sending it.
+    const bool ecuTempFresh = ecuIntakeSeen && !elapsed(now, ecuIntakeSeenMs, kEcuIntakeTimeoutMs);
+    usingEcuTemp = !preTempValid && ecuTempFresh;
+    inputs.preValid = preTempValid || ecuTempFresh;
+    inputs.preC = preTempValid ? preTempC : ecuIntakeC;
     inputs.assistActive = result.overboostAssistActive;
     inputs.assistDutyPercent = result.finalDutyPercent;
     inputs.capDutyPercent = config.dutyMaxPercent;
@@ -1483,6 +1506,11 @@ void loop() {
   }
 
   pumpDriver.setRelay(pumpOn);
+  if (pumpOn != lastPumpOn) {
+    // Send the status frame on this pass, not up to half a second later.
+    lastPumpOn = pumpOn;
+    lastTuneStatusTxMs = now - can_protocol::METH_TUNE_STATUS_TX_MS;
+  }
   // A pulse ends on a loop pass, so anything slow would stretch it. Defer the EEPROM
   // write and the long serial line while a timed pulse is running.
   const bool pulseRunning = pumpOn && governor.onMs() < tune.value[meth_tune::kPeriodMs];
