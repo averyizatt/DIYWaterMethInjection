@@ -19,6 +19,12 @@ constexpr int CAN_SPI_INT = 8;
 // Bench-test button active LOW with internal pull-up.
 constexpr int BENCH_TEST_BUTTON = 9;
 
+// Intake air thermistors (GM-style open-element IAT), one each side of the nozzle.
+// Each: 5 V -> 2.49k resistor -> pin -> sensor -> GND. See meth_tune::thermistorC.
+constexpr int PRE_INJECTION_TEMP_ADC = A1;
+constexpr int POST_INJECTION_TEMP_ADC = A2;
+constexpr float INTAKE_TEMP_PULLUP_OHMS = 2490.0f;
+
 // Thermistors disabled until wired.
 constexpr int IAT_THERM_PIN = -1;
 constexpr int DHT11_PIN = -1;

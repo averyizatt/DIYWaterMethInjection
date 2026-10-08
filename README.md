@@ -11,6 +11,51 @@ Standalone Arduino Nano firmware for a water/meth controller with:
 
 This device does not require a local display. Knock and system observability are exposed over CAN so a separate main controller can render UI and issue tuning commands.
 
+## Pulse tuning (pump switched by a mechanical relay)
+
+The pump is switched directly by a mechanical relay, so flow is set by how long the
+pump runs in each slow cycle, not by PWM. The logic is in
+[include/meth_tune.h](include/meth_tune.h) and is adjustable over CAN (shared contract
+extension 4): commands `0x10` (set one setting) and `0x11` (save / revert / defaults /
+report) on `0x301`, with acknowledgements, settings, status and the two intake
+temperatures reported on `0x30F`.
+
+Fixed rules, not adjustable:
+
+- The pump runs for at least 500 ms or not at all, rests for at least 500 ms or stays
+  on continuously, and starts at most once per cycle. The cycle cannot be set below
+  1000 ms. A pulse that is blocked part-way stays off until the next cycle.
+- No injection without a fresh engine RPM message (`0x309`) at or above the minimum.
+- Dose limit: fluid is held to a set percentage of estimated fuel flow, from RPM and
+  manifold pressure (`kFuelGPerMinPerRpmKpa` in meth_tune.h is for a 2.3 L engine).
+- Changing one setting never raises another; values outside the limits are clamped
+  and the applied value is acknowledged.
+
+| Setting | Range | Default |
+| --- | --- | --- |
+| Cycle length | 1000-10000 ms | 4000 |
+| Pump on-time at start boost | 500-10000 ms | 1000 |
+| Pump on-time at full boost | 500-10000 ms (= cycle: continuous) | 2000 |
+| Start boost | 1.0-30.0 psi | 5.0 |
+| Full boost | 2.0-35.0 psi | 10.0 |
+| Minimum engine RPM | 0-8000 | 2500 |
+| Longest continuous spray | 1-120 s | 12 |
+| Rest after that (0 = no limit) | 0-60 s | 6 |
+| On-time growth per cycle (0 = none) | 0-5000 ms | 500 |
+| Minimum air temperature before the nozzle (0 = off) | 0-120 C | 0 |
+| Overboost assist (the older 85% / 100% forcing) | 0-1 | 0 |
+| Methanol in the tank | 0-100 % | 0 |
+| Nozzle flow | 20-1000 ml/min | 60 |
+| Most fluid as a share of fuel flow (0 = off) | 0-40 % | 10 |
+
+Settings apply at once and are kept in RAM until a SAVE action writes them to EEPROM.
+A blank or corrupt EEPROM loads the defaults above. The older boost-start command
+(`0x301/0x04`) and the `0x304` configuration frame set the same start-boost value.
+
+Two intake air thermistors (GM-style open-element IAT) report the air temperature
+before (`A1`) and after (`A2`) the nozzle. Wire each as 5 V -> 2.49 kohm -> pin ->
+sensor -> GND.
+
 ## Sensors and control
 
 ### Controller UI pump test and tank protection
@@ -211,6 +256,17 @@ Run tests:
 platformio test -c platformio-tests.ini -e native_knock_tests
 ```
 
+The pulse tuning logic has its own host test
+([test/test_meth_tune/test_main.cpp](test/test_meth_tune/test_main.cpp)): relay rate
+rules, RPM and temperature gates, dose limit, spray time limit, ramp, setting limits
+and the thermistor curve.
+
+```bash
+platformio test -c platformio-tests.ini -e native_meth_tune_tests
+# or directly:
+g++ -std=c++11 -I include test/test_meth_tune/test_main.cpp -o meth_tune_test && ./meth_tune_test
+```
+
 ## Knock tuning workflow
 
 Use this sequence when calibrating a new engine/setup:
@@ -246,6 +302,8 @@ Nano wiring used by the firmware:
 | --- | --- | --- |
 | MAP analog input | `A0` | GM 3-bar MAP through 10k/20k divider. Avoid `A4` because it is SDA and can be biased by I2C pull-ups. |
 | Knock analog input | `A5` | Raw knock module/sensor signal into Nano ADC range. |
+| Air temperature before the nozzle | `A1` | GM-style IAT thermistor to GND, 2.49 kohm pull-up to 5 V. |
+| Air temperature after the nozzle | `A2` | GM-style IAT thermistor to GND, 2.49 kohm pull-up to 5 V. |
 | Oil pressure analog input | `A6` | 0.5-4.5 V, 0-100 psi sensor through 10k/20k divider. Analog-input only pin. |
 | Fuel pressure analog input | `A7` | 0.5-4.5 V, 0-100 psi sensor through 10k/20k divider. Analog-input only pin. |
 | Float switch | `D3` | Active low; wire switch to ground, firmware uses internal pull-up. |

@@ -60,6 +60,11 @@ void PumpDriver::apply(const PumpCommand &command) {
   analogWrite(pin_, static_cast<uint8_t>(dutyCount));
 }
 
+void PumpDriver::setRelay(bool on) {
+  if (pin_ < 0) return;
+  digitalWrite(pin_, on ? HIGH : LOW);
+}
+
 void WarningOutput::begin(int pin, bool activeHigh) {
   pin_ = pin;
   activeHigh_ = activeHigh;

@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <EEPROM.h>
 #include <SPI.h>
 #include <math.h>
 #include <mcp_can.h>
@@ -7,6 +8,7 @@
 #include "app_config.h"
 #include "can_contract/can_protocol.h"
 #include "injection_controller.h"
+#include "meth_tune.h"
 #include "pins.h"
 #include "sensors.h"
 
@@ -27,6 +29,18 @@ static_assert(CCM_CAN_PROTOCOL_VERSION == can_protocol::CAN_PROTOCOL_SCHEMA_VERS
               "platformio.ini CCM_CAN_PROTOCOL_VERSION does not match the shared CAN contract");
 #endif
 
+#ifndef CAN_PROTOCOL_HAS_METH_TUNE
+#error "Update DIYComfortControlModule: the shared CAN contract needs water/meth tuning (extension 4)."
+#endif
+static_assert(meth_tune::kCount == can_protocol::meth_tune_setting::COUNT &&
+              meth_tune::kPeriodMs == can_protocol::meth_tune_setting::PERIOD_MS &&
+              meth_tune::kOverboostAssist == can_protocol::meth_tune_setting::OVERBOOST_ASSIST &&
+              meth_tune::kMaxDosePct == can_protocol::meth_tune_setting::MAX_DOSE_PCT &&
+              meth_tune::kHoldDoseLimit == can_protocol::meth_hold::DOSE_LIMIT &&
+              meth_tune::kHoldFault == can_protocol::meth_hold::FAULT &&
+              meth_tune::kSetClamped == can_protocol::config_ack_status::VALUE_CLAMPED,
+              "meth_tune.h does not match the shared CAN contract");
+
 namespace {
 AppConfig config = defaultConfig();
 TankBlend blend = computeTankBlend(1.5f, 0.5f);
@@ -41,6 +55,25 @@ PumpDriver pumpDriver;
 WarningOutput warningOutput;
 InjectionController controller;
 MCP_CAN canBus(pins::CAN_SPI_CS);
+
+// Pulse tuning (meth_tune.h): adjustable over CAN, saved in EEPROM on request.
+meth_tune::Settings tune;
+meth_tune::Governor governor;
+uint8_t tuneRevision = 0;     // Bumped whenever a setting changes.
+bool tuneUnsaved = false;
+bool tuneSavePending = false; // SAVE waits until the pump is not in the middle of a pulse.
+uint8_t tuneReportNext = 0;   // Next setting to report; 0 = no report running.
+uint32_t lastTuneStatusTxMs = 0;
+uint32_t lastTuneTempsTxMs = 0;
+uint32_t lastIntakeTempMs = 0;
+float preTempC = 0.0f;
+float postTempC = 0.0f;
+bool preTempValid = false;
+bool postTempValid = false;
+constexpr int kTuneEepromAddress = 0;
+constexpr uint8_t kTuneEepromMagic = 0x4D;
+constexpr uint8_t kTuneEepromVersion = 1;
+constexpr uint32_t kIntakeTempSampleMs = 50;
 
 uint32_t lastLoopMs = 0;
 uint32_t lastDebugMs = 0;
@@ -605,6 +638,134 @@ bool sendKnockConfigPages() {
   return page1Sent && page2Sent;
 }
 
+// Boost thresholds and the relay period live in the tune; the controller reads copies.
+void syncTuneToConfig() {
+  config.boost.startPsi = tune.value[meth_tune::kStartPsiX10] / 10.0f;
+  config.boost.fullPsi = tune.value[meth_tune::kFullPsiX10] / 10.0f;
+  config.relayPeriodMs = tune.value[meth_tune::kPeriodMs];
+  // The tank blend is reported in the config acknowledgement and checked by the controller.
+  const float meth = static_cast<float>(tune.value[meth_tune::kMethPercent]);
+  blend = computeTankBlend(100.0f - meth, meth);
+}
+
+void tuneChanged() {
+  ++tuneRevision;
+  tuneUnsaved = true;
+  syncTuneToConfig();
+}
+
+// EEPROM: magic, version, the settings as little-endian u16, XOR checksum.
+bool loadTune() {
+  meth_tune::Settings saved;
+  saved.value[0] = 0;
+  int address = kTuneEepromAddress;
+  uint8_t checksum = EEPROM.read(address) ^ EEPROM.read(address + 1);
+  const bool header = EEPROM.read(address) == kTuneEepromMagic && EEPROM.read(address + 1) == kTuneEepromVersion;
+  address += 2;
+  for (uint8_t key = 1; key <= meth_tune::kCount; ++key, address += 2) {
+    const uint8_t low = EEPROM.read(address);
+    const uint8_t high = EEPROM.read(address + 1);
+    checksum ^= low ^ high;
+    saved.value[key] = static_cast<uint16_t>(low | (static_cast<uint16_t>(high) << 8));
+  }
+  if (!header || checksum != EEPROM.read(address) || !meth_tune::valid(saved)) return false;
+  tune = saved;
+  return true;
+}
+
+void saveTune() {
+  int address = kTuneEepromAddress;
+  uint8_t checksum = kTuneEepromMagic ^ kTuneEepromVersion;
+  EEPROM.update(address, kTuneEepromMagic);
+  EEPROM.update(address + 1, kTuneEepromVersion);
+  address += 2;
+  for (uint8_t key = 1; key <= meth_tune::kCount; ++key, address += 2) {
+    const uint8_t low = static_cast<uint8_t>(tune.value[key] & 0xFF);
+    const uint8_t high = static_cast<uint8_t>(tune.value[key] >> 8);
+    checksum ^= low ^ high;
+    EEPROM.update(address, low);
+    EEPROM.update(address + 1, high);
+  }
+  EEPROM.update(address, checksum);
+}
+
+// The older boost-start commands set the same value the tune holds.
+// Repeated frames with the same value must not count as a settings change.
+void setStartPsiFromLegacy(float startPsi) {
+  meth_tune::Settings next = tune;
+  uint16_t applied = 0;
+  const float x10 = startPsi * 10.0f + 0.5f;
+  meth_tune::set(next, meth_tune::kStartPsiX10, x10 < 0.0f ? 0 : static_cast<uint16_t>(x10), applied);
+  if (applied == tune.value[meth_tune::kStartPsiX10]) return;
+  tune = next;
+  tuneChanged();
+}
+
+void handleTuneCommand(byte len, const byte *data) {
+  namespace ack = can_protocol::config_ack_status;
+  uint8_t status = ack::OK;
+  uint8_t subject = len >= 2 ? data[1] : 0;
+  uint16_t value = 0;
+  if (data[0] == can_protocol::meth_tune_command::SET_SETTING) {
+    if (len != 4) {
+      status = ack::INVALID_LENGTH;
+    } else {
+      status = meth_tune::set(tune, data[1], static_cast<uint16_t>((data[2] << 8) | data[3]), value);
+      if (status != ack::UNSUPPORTED_COMMAND) tuneChanged();
+    }
+  } else if (len != 2) {
+    status = ack::INVALID_LENGTH;
+  } else if (data[1] == can_protocol::meth_tune_action::SAVE) {
+    // Writing EEPROM blocks for tens of ms; loop() does it between pulses. The status
+    // keeps reporting UNSAVED until it has really been written.
+    tuneSavePending = true;
+  } else if (data[1] == can_protocol::meth_tune_action::REVERT) {
+    if (!loadTune()) meth_tune::loadDefaults(tune);
+    tuneChanged();
+    tuneUnsaved = false;
+    tuneSavePending = false;
+  } else if (data[1] == can_protocol::meth_tune_action::DEFAULTS) {
+    meth_tune::loadDefaults(tune);
+    tuneChanged();
+  } else if (data[1] == can_protocol::meth_tune_action::REPORT) {
+    tuneReportNext = 1;
+  } else {
+    status = ack::UNSUPPORTED_COMMAND;
+  }
+  if (!transmitCanFrame(can_protocol::packMethTuneAck(data[0], status, subject, value, tuneRevision), "0x30F-ack")) {
+    canOnline = false;
+  }
+}
+
+void updateIntakeTemps(uint32_t now) {
+  if (!elapsed(now, lastIntakeTempMs, kIntakeTempSampleMs)) return;
+  lastIntakeTempMs = now;
+  float sample = 0.0f;
+  // Light smoothing only: these sensors are there to show each pulse cooling the air.
+  if (meth_tune::thermistorC(static_cast<uint16_t>(analogRead(pins::PRE_INJECTION_TEMP_ADC)),
+                             pins::INTAKE_TEMP_PULLUP_OHMS, sample)) {
+    preTempC = preTempValid ? preTempC + (sample - preTempC) * 0.3f : sample;
+    preTempValid = true;
+  } else {
+    preTempValid = false;
+  }
+  if (meth_tune::thermistorC(static_cast<uint16_t>(analogRead(pins::POST_INJECTION_TEMP_ADC)),
+                             pins::INTAKE_TEMP_PULLUP_OHMS, sample)) {
+    postTempC = postTempValid ? postTempC + (sample - postTempC) * 0.3f : sample;
+    postTempValid = true;
+  } else {
+    postTempValid = false;
+  }
+}
+
+// Why the controller is not asking for injection, for the dash's status line.
+uint8_t idleHoldFor(const ControlResult &result) {
+  if (config.mode == InjectionMode::Off) return meth_tune::kHoldDisarmed;
+  if (result.failsafe == FailsafeReason::LowFluid) return meth_tune::kHoldTankLow;
+  if (result.failsafe != FailsafeReason::None) return meth_tune::kHoldFault;
+  return meth_tune::kHoldBelowBoost;
+}
+
 void applyCanCommandTimeout(uint32_t now) {
   if (!canCommandSeen || !elapsed(now, lastCanCommandMs, kCanCommandTimeoutMs)) return;
 
@@ -644,16 +805,13 @@ void handleMethConfigBroadcast(byte len, const byte *data) {
     manualTestActive = false;
     manualTestDuty = 0;
   }
-  if (data[2] <= 100U) {
-    blend = computeTankBlend(100.0f - static_cast<float>(data[2]),
-                             static_cast<float>(data[2]));
+  if (data[2] <= 100U && data[2] != tune.value[meth_tune::kMethPercent]) {
+    tune.value[meth_tune::kMethPercent] = data[2];
+    tuneChanged();
   }
   if (data[3] > 0U) {
     const float startPsi = (static_cast<float>(data[3]) - config.map.baroKpa) * kPsiPerKpa;
-    config.boost.startPsi = startPsi > 0.0f ? startPsi : 0.0f;
-    if (config.boost.fullPsi <= config.boost.startPsi) {
-      config.boost.fullPsi = config.boost.startPsi + 4.0f;
-    }
+    setStartPsiFromLegacy(startPsi);
   }
   if (data[5] > 0U && data[5] <= 100U) {
     config.dutyMaxPercent = static_cast<float>(data[5]);
@@ -739,6 +897,12 @@ void handleCanFrame(unsigned long id, byte len, const byte *data) {
     Serial.println(data[0], HEX);
   }
 
+  if (data[0] == can_protocol::meth_tune_command::SET_SETTING ||
+      data[0] == can_protocol::meth_tune_command::SETTINGS_ACTION) {
+    handleTuneCommand(len, data);
+    return;
+  }
+
   uint8_t ackStatus = can_protocol::config_ack_status::OK;
   uint8_t ackValue = len >= 2 ? data[1] : 0;
   bool commandAccepted = true;
@@ -787,7 +951,7 @@ void handleCanFrame(unsigned long id, byte len, const byte *data) {
   case can_protocol::meth_command::SET_BOOST_TRIGGER:
     if (len >= 2) {
       const uint8_t boostKpa = constrainAndReport(data[1], 0, 250, ackStatus);
-      config.boost.startPsi = static_cast<float>(boostKpa) * kPsiPerKpa;
+      setStartPsiFromLegacy(static_cast<float>(boostKpa) * kPsiPerKpa);
       ackValue = boostKpa;
       if (kSerialCanVerbose) {
         Serial.print(F("CAN CMD: boost trigger kPa="));
@@ -1123,6 +1287,41 @@ void serviceCanBus(uint32_t now,
       return;
     }
   }
+
+  if (elapsed(now, lastTuneStatusTxMs, can_protocol::METH_TUNE_STATUS_TX_MS)) {
+    lastTuneStatusTxMs = now;
+    namespace flag = can_protocol::meth_tune_flag;
+    uint8_t flags = 0;
+    if (tuneUnsaved) flags |= flag::UNSAVED;
+    if (engineRpmValid && engineRpm >= tune.value[meth_tune::kMinRpm]) flags |= flag::RPM_OK;
+    if (preTempValid) flags |= flag::PRE_VALID;
+    if (postTempValid) flags |= flag::POST_VALID;
+    if (digitalRead(pins::PUMP_OUT) == HIGH) flags |= flag::PUMP_ON;
+    if (!transmitCanFrame(can_protocol::packMethTuneStatus(tuneRevision, flags, governor.hold(), governor.onMs(),
+                                                           tune.value[meth_tune::kPeriodMs]), "0x30F-status")) {
+      return;
+    }
+  }
+
+  if (elapsed(now, lastTuneTempsTxMs, can_protocol::METH_TUNE_TEMPS_TX_MS)) {
+    lastTuneTempsTxMs = now;
+    const uint8_t validBits = (preTempValid ? 1U : 0U) | (postTempValid ? 2U : 0U);
+    if (!transmitCanFrame(can_protocol::packMethTuneTemps(
+            static_cast<int16_t>(preTempValid ? preTempC * 10.0f : 0.0f),
+            static_cast<int16_t>(postTempValid ? postTempC * 10.0f : 0.0f), validBits), "0x30F-temps")) {
+      return;
+    }
+  }
+
+  // One setting per pass, so a full report never delays the pump timing.
+  if (tuneReportNext != 0) {
+    const uint8_t key = tuneReportNext;
+    if (transmitCanFrame(can_protocol::packMethTuneSettingReport(
+            key, tune.value[key], tuneRevision,
+            tuneUnsaved ? can_protocol::meth_tune_flag::UNSAVED : 0), "0x30F-setting")) {
+      tuneReportNext = key < meth_tune::kCount ? key + 1 : 0;
+    }
+  }
 }
 } // namespace
 
@@ -1146,6 +1345,11 @@ void setup() {
                     config.floatActiveLow,
                     config.floatDebounceMs,
                     config.floatLowShutdownDelayMs);
+  // Saved pulse tuning, or the conservative defaults on a new or corrupt EEPROM.
+  if (!loadTune()) meth_tune::loadDefaults(tune);
+  syncTuneToConfig();
+  pinMode(pins::PRE_INJECTION_TEMP_ADC, INPUT);
+  pinMode(pins::POST_INJECTION_TEMP_ADC, INPUT);
   pumpDriver.beginRelay(pins::PUMP_OUT, config.relayPeriodMs);
   warningOutput.begin(pins::WARNING_LED, true);
   pinMode(pins::KNOCK_SENSOR_ADC, INPUT);
@@ -1165,6 +1369,7 @@ void loop() {
   SensorReadings readings = mapSensor.read();
   readings.tankLow = floatSensor.update();
   updatePressureReadings(readings, now);
+  updateIntakeTemps(now);
   const uint16_t rpm = currentEngineRpm(now);
 
   const int knockRaw = analogRead(pins::KNOCK_SENSOR_ADC);
@@ -1246,20 +1451,50 @@ void loop() {
     manualTestDuty = 0;
   }
 
+  // The controller decides whether injection is wanted; the governor turns that into
+  // relay pulses within the tuned limits (RPM, air temperature, spray time, ramp).
+  bool pumpOn = false;
   if (manualTestActive) {
     result.pump.enabled = manualTestDuty > 0;
     result.pump.dutyPercent = manualTestDuty;
     result.finalDutyPercent = manualTestDuty;
+    pumpOn = governor.manual(now, tune, manualTestDuty);
+  } else {
+    meth_tune::Inputs inputs;
+    inputs.wantSpray = result.pump.enabled;
+    inputs.idleHold = idleHoldFor(result);
+    inputs.boostPsi = readings.boostPsi;
+    inputs.mapKpa = readings.mapKpa;
+    inputs.rpmValid = engineRpmValid;
+    inputs.rpm = rpm;
+    inputs.preValid = preTempValid;
+    inputs.preC = preTempC;
+    inputs.assistActive = result.overboostAssistActive;
+    inputs.assistDutyPercent = result.finalDutyPercent;
+    inputs.capDutyPercent = config.dutyMaxPercent;
+    pumpOn = governor.update(now, tune, inputs);
+    // Telemetry shows what the pump is really doing, not the old duty model.
+    result.pump.enabled = governor.onMs() > 0;
+    result.finalDutyPercent = governor.onMs() * 100.0f / tune.value[meth_tune::kPeriodMs];
+    result.pump.dutyPercent = result.finalDutyPercent;
   }
 
-  pumpDriver.apply(result.pump);
+  pumpDriver.setRelay(pumpOn);
+  // A pulse ends on a loop pass, so anything slow would stretch it. Defer the EEPROM
+  // write and the long serial line while a timed pulse is running.
+  const bool pulseRunning = pumpOn && governor.onMs() < tune.value[meth_tune::kPeriodMs];
+  if (tuneSavePending && !pulseRunning) {
+    saveTune();
+    tuneSavePending = false;
+    tuneUnsaved = false;
+  }
   warningOutput.set(result.failsafe != FailsafeReason::None ||
                     result.overboostAssistFaultLatched ||
                     knockDetected);
 
   serviceCanBus(now, readings, result, knockDetected, knockRaw);
 
-  if (elapsed(now, lastDebugMs, kSerialHeartbeatMs)) {
+  if (!pulseRunning && elapsed(now, lastDebugMs, kSerialHeartbeatMs)) {
     lastDebugMs = now;
     const uint8_t commandedDuty = manualTestActive ? manualTestDuty :
         can_protocol::clampU8(static_cast<int>(result.finalDutyPercent + 0.5f));

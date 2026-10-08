@@ -15,6 +15,8 @@ public:
   // periodMs controls how fast the relay switches (e.g. 1000 = 1 Hz cycle).
   void beginRelay(int pin, uint16_t periodMs);
   void apply(const PumpCommand &command);
+  // Relay mode: direct on/off, timed by meth_tune::Governor.
+  void setRelay(bool on);
 
 private:
   int pin_{-1};
