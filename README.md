@@ -1,5 +1,13 @@
 # DIY Water/Meth Injection Controller
 
+Two boards run this controller, with the same CAN messages:
+
+- **Arduino Nano** (`src/main_nano.cpp`): pump on a mechanical relay, its own MAP sensor.
+- **ESP32-S3** (`src/main_esp32.cpp`, the replacement): pump on a MOSFET with PWM,
+  manifold pressure and RPM from the MicroSquirt over CAN, firmware updates from the
+  dash over CAN. See [ESP32-S3 board](#esp32-s3-board-pump-on-a-mosfet-with-pwm) and
+  [docs/ESP32_HARDWARE.md](docs/ESP32_HARDWARE.md).
+
 Standalone Arduino Nano firmware for a water/meth controller with:
 
 - MCP2515 (SPI) CAN bus only
@@ -70,6 +78,49 @@ A blank or corrupt EEPROM loads the defaults above. The older boost-start comman
 Two intake air thermistors (GM-style open-element IAT) report the air temperature
 before (`A1`) and after (`A2`) the nozzle. Wire each as 5 V -> 2.49 kohm -> pin ->
 sensor -> GND.
+
+## ESP32-S3 board: pump on a MOSFET with PWM
+
+Wiring, parts and first start-up checks: [docs/ESP32_HARDWARE.md](docs/ESP32_HARDWARE.md).
+
+What the board does differently, and only this:
+
+- **Pump speed instead of pulses.** The pump runs continuously while injecting, at a
+  duty that follows boost: the lowest duty at start boost, a straight line up to the
+  highest duty at full boost (`PwmGovernor` in [include/meth_tune.h](include/meth_tune.h)).
+  Two settings were added for it (shared contract extension 5); the Nano stores them
+  and ignores them, and the ESP32 ignores the three pulse settings.
+
+  | Setting | Range | Default |
+  | --- | --- | --- |
+  | Lowest pump duty (18) | 10-100 % | 25 |
+  | Highest pump duty (19) | 10-100 % | 50 |
+
+- **Flow is not proportional to duty.** Pressure at the nozzle rises roughly with
+  duty and flow with the square root of pressure, so flow is taken as
+  `nozzle flow x sqrt(duty)`: 25 % duty is about half the nozzle's rating. The dose
+  limit uses the same rule, and when it would need less than the lowest duty the
+  pump stays off (`hold` = dose limit) rather than dribbling.
+- Every other rule is the same: minimum RPM, air-temperature gate, longest spray and
+  rest, early start and hot air (they ask for duty, not on-time), overboost assist,
+  dose limit and the cap from the dash. "On-time growth" becomes the time the duty may
+  take to climb from lowest to highest.
+- The status frame on `0x30F` reports the pump as on-time out of a period of 1000:
+  the duty in tenths of a percent.
+- **Manifold pressure, RPM, barometric pressure and intake temperature come straight
+  from the MicroSquirt's CAN broadcast** ([include/ecu_broadcast.h](include/ecu_broadcast.h):
+  0x5E8/0x5E9, or 0x5F0/0x5F2). A value older than half a second is not used, and
+  without fresh manifold pressure and RPM the controller does not inject. The dash's
+  `0x309` RPM is the backup for RPM only.
+- Knock, pressures and temperatures are sampled by the ADC's own timer
+  ([src/adc_sampler.cpp](src/adc_sampler.cpp)): the knock input at 19.2 kHz, the same
+  rate the Nano used, so the knock settings mean the same thing.
+- Settings are saved in the ESP32's flash instead of EEPROM.
+- **Firmware updates over CAN** from the dash (`0x680`/`0x681`, module 3), refused
+  while the pump runs or boost is near, with the pump held off during the transfer.
+- If the main loop stops, the pump is switched off within 0.25 s; a watchdog then
+  restarts the board. An optional master relay output opens the pump's 12 V feed
+  whenever no spray is under way, against a MOSFET that has failed switched on.
 
 ## Sensors and control
 
@@ -290,6 +341,16 @@ Run tests:
 platformio test -c platformio-tests.ini -e native_knock_tests
 ```
 
+The ESP32 board's logic has host tests too: the PWM pump rules
+([test/test_meth_pwm/test_main.cpp](test/test_meth_pwm/test_main.cpp)) and the ECU
+broadcast decoding and sensor scaling
+([test/test_esp32_inputs/test_main.cpp](test/test_esp32_inputs/test_main.cpp)).
+
+```bash
+g++ -std=c++11 -I include test/test_meth_pwm/test_main.cpp -o meth_pwm_test && ./meth_pwm_test
+g++ -std=c++11 -I include test/test_esp32_inputs/test_main.cpp -o esp32_inputs_test && ./esp32_inputs_test
+```
+
 The knock listening logic has a host test
 ([test/test_knock_band/test_main.cpp](test/test_knock_band/test_main.cpp)) with
 synthetic engine noise and knock: frequency selectivity, integer overflow, learning
@@ -331,7 +392,15 @@ The current knock path enforces knock-sensor datasheet constraints in firmware:
 
 ## Build and upload
 
-The single default environment is `arduino_nano` (115200 baud).
+The default environment is `arduino_nano` (115200 baud). The ESP32-S3 board is the
+environment `esp32s3_water_meth`: pick it in the PlatformIO toolbar, or
+
+```bash
+platformio run -e esp32s3_water_meth -t upload
+```
+
+Both need DIYComfortControlModule checked out next to this repository (the shared CAN
+contract is read from it).
 
 ```bash
 platformio run

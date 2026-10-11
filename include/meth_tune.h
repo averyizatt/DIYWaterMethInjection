@@ -33,8 +33,12 @@ enum Key : uint8_t {
   kEarlyRpm = 15,    // Inject from this RPM with the throttle open, before boost; 0 = off
   kHotStartC = 16,   // Air before the nozzle hotter than this adds on-time; 0 = off
   kHotFullC = 17,    // Air temperature where on-time reaches kMaxOnMs
+  // For a pump driven through a MOSFET with PWM (PwmGovernor below). These two take
+  // the place of kPeriodMs, kMinOnMs and kMaxOnMs; a relay controller ignores them.
+  kMinDutyPct = 18,  // Pump duty at start boost: the least that still atomises
+  kMaxDutyPct = 19,  // Pump duty at full boost
 };
-constexpr uint8_t kCount = 17;
+constexpr uint8_t kCount = 19;
 
 // The high-RPM early start needs an open throttle: manifold pressure close to
 // atmospheric. Coasting at high RPM with the throttle shut is deep vacuum and never
@@ -99,6 +103,8 @@ inline Range rangeOf(uint8_t key) {
   case kEarlyRpm: return {0, 8000, 3500};
   case kHotStartC: return {0, 145, 0};
   case kHotFullC: return {20, 150, 70};
+  case kMinDutyPct: return {10, 100, 25};
+  case kMaxDutyPct: return {10, 100, 50};
   default: return {0, 0, 0};
   }
 }
@@ -119,6 +125,7 @@ inline bool valid(const Settings &s) {
     if (s.value[key] < r.min || s.value[key] > r.max) return false;
   }
   return s.value[kMinOnMs] <= s.value[kMaxOnMs] && s.value[kMaxOnMs] <= s.value[kPeriodMs] &&
+         s.value[kMinDutyPct] <= s.value[kMaxDutyPct] &&
          s.value[kFullPsiX10] >= s.value[kStartPsiX10] + 10 &&
          (s.value[kHotStartC] == 0 || s.value[kHotFullC] >= s.value[kHotStartC] + 5);
 }
@@ -138,6 +145,8 @@ inline uint8_t set(Settings &s, uint8_t key, uint16_t requested, uint16_t &appli
     if (v > s.value[kPeriodMs]) v = s.value[kPeriodMs];
     if (v < s.value[kMinOnMs]) v = s.value[kMinOnMs];
   }
+  if (key == kMinDutyPct && v > s.value[kMaxDutyPct]) v = s.value[kMaxDutyPct];
+  if (key == kMaxDutyPct && v < s.value[kMinDutyPct]) v = s.value[kMinDutyPct];
   if (key == kStartPsiX10 && v + 10 > s.value[kFullPsiX10]) v = s.value[kFullPsiX10] - 10;
   if (key == kFullPsiX10 && v < s.value[kStartPsiX10] + 10) v = s.value[kStartPsiX10] + 10;
   if (key == kHotStartC && v > 0 && v + 5 > s.value[kHotFullC]) v = s.value[kHotFullC] - 5;
@@ -374,6 +383,165 @@ private:
   bool everCycled_{false};
   bool cut_{false};
   bool out_{false};
+  bool early_{false};
+  bool hotAir_{false};
+  bool resting_{false};
+};
+
+// ---------------------------------------------------------------------------
+// PWM drive: the pump runs through a MOSFET at a duty that rises with boost, as
+// commercial progressive kits do. Everything that decides WHETHER to inject is the
+// same as the relay governor above (RPM, air temperature, spray time, early start,
+// hot air, dose limit); only how the answer reaches the pump differs.
+//
+// Flow is not proportional to duty. A diaphragm pump far larger than the nozzle is
+// limited by the pressure it can hold, which follows motor torque and so duty; a
+// nozzle passes fluid as the square root of pressure. So flow is taken as
+//   nozzle rating x sqrt(duty)
+// which overestimates rather than underestimates at part duty: the safe direction
+// for the dose limit. Measure the real flow with the pump test before trusting it.
+// ---------------------------------------------------------------------------
+inline float flowFraction(float dutyPercent) {
+  if (!(dutyPercent > 0.0f)) return 0.0f;
+  return dutyPercent >= 100.0f ? 1.0f : static_cast<float>(sqrt(dutyPercent / 100.0f));
+}
+
+// Duty for this boost: kMinDutyPct at start boost, a straight line to kMaxDutyPct at
+// full boost, flat above it.
+inline float targetDuty(const Settings &s, float boostPsi) {
+  const float start = s.value[kStartPsiX10] / 10.0f;
+  const float full = s.value[kFullPsiX10] / 10.0f;
+  float fraction = full > start ? (boostPsi - start) / (full - start) : 1.0f;
+  if (!(fraction > 0.0f)) fraction = 0.0f;  // Also catches NaN.
+  if (fraction > 1.0f) fraction = 1.0f;
+  const float low = s.value[kMinDutyPct];
+  return low + (s.value[kMaxDutyPct] - low) * fraction;
+}
+
+// Duty asked for by hot intake air; 0 when the feature is off or the air is cooler.
+inline float hotAirDuty(const Settings &s, bool preValid, float preC) {
+  const float start = s.value[kHotStartC];
+  if (s.value[kHotStartC] == 0 || !preValid || !(preC > start)) return 0.0f;
+  const float full = s.value[kHotFullC];
+  float fraction = full > start ? (preC - start) / (full - start) : 1.0f;
+  if (fraction > 1.0f) fraction = 1.0f;
+  const float low = s.value[kMinDutyPct];
+  return low + (s.value[kMaxDutyPct] - low) * fraction;
+}
+
+// Highest duty the dose limit allows; 100 when the limit is off or not reached.
+inline float doseLimitDuty(const Settings &s, uint16_t rpm, float mapKpa) {
+  if (s.value[kMaxDosePct] == 0) return 100.0f;
+  const float allowedMlMin = fuelGPerMin(rpm, mapKpa) * s.value[kMaxDosePct] / 100.0f;
+  const float fraction = allowedMlMin / s.value[kNozzleMlMin];
+  return fraction >= 1.0f ? 100.0f : fraction * fraction * 100.0f;
+}
+
+class PwmGovernor {
+public:
+  // Normal injection. Returns the pump duty in percent for this instant; 0 = off.
+  float update(uint32_t now, const Settings &s, const Inputs &in) {
+    const uint32_t dt = started_ ? (now - lastMs_ > 1000UL ? 1000UL : now - lastMs_) : 0;
+    lastMs_ = now;
+    started_ = true;
+
+    const bool waitingForBoost = !in.wantSpray && in.idleHold == kHoldBelowBoost;
+    const uint16_t earlyRpm = s.value[kEarlyRpm];
+    if (!waitingForBoost || earlyRpm == 0 || !in.rpmValid) {
+      early_ = false;
+    } else if (early_) {
+      early_ = in.rpm + kEarlyRpmHysteresis >= earlyRpm && in.boostPsi > kEarlyStopPsi;
+    } else {
+      early_ = in.rpm >= earlyRpm && in.boostPsi >= kEarlyStartPsi;
+    }
+    const bool wanted = in.wantSpray || early_;
+
+    uint8_t hold = kHoldNone;
+    if (!wanted) hold = in.idleHold == kHoldNone ? static_cast<uint8_t>(kHoldBelowBoost) : in.idleHold;
+    else if (!in.rpmValid) hold = kHoldRpmMissing;
+    else if (in.rpm < s.value[kMinRpm]) hold = kHoldRpmLow;
+    else if (s.value[kMinPreTempC] > 0 && !in.preValid) hold = kHoldTempSensor;
+    else if (s.value[kMinPreTempC] > 0 && in.preC < static_cast<float>(s.value[kMinPreTempC])) hold = kHoldAirCold;
+
+    // Spray time budget: fills while injecting, drains while not. A full rest refills it.
+    const uint32_t maxMs = static_cast<uint32_t>(s.value[kMaxSprayS]) * 1000UL;
+    const uint16_t restS = s.value[kRestS];
+    const bool injecting = hold == kHoldNone && !resting_;
+    if (restS == 0) {
+      usedMs_ = 0;
+      resting_ = false;
+    } else if (injecting) {
+      usedMs_ += dt;
+      if (usedMs_ >= maxMs) {
+        usedMs_ = maxMs;
+        resting_ = true;
+      }
+    } else {
+      const uint32_t drain = dt * s.value[kMaxSprayS] / restS;
+      usedMs_ = usedMs_ > drain ? usedMs_ - drain : 0;
+      if (usedMs_ == 0) resting_ = false;
+    }
+    if (hold == kHoldNone && resting_) hold = kHoldResting;
+
+    const float low = s.value[kMinDutyPct];
+    float target = targetDuty(s, in.boostPsi);
+    const float hot = hotAirDuty(s, in.preValid, in.preC);
+    hotAir_ = hot > target;
+    if (hotAir_) target = hot;
+    bool ramped = s.value[kRampMs] > 0;
+    if (in.assistActive && s.value[kOverboostAssist]) {
+      if (in.assistDutyPercent > target) target = in.assistDutyPercent;
+      ramped = false;
+    }
+    // Limits come last, so nothing above can exceed them.
+    const float dose = doseLimitDuty(s, in.rpm, in.mapKpa);
+    if (target > dose) target = dose;
+    if (in.capDutyPercent < 100.0f && target > in.capDutyPercent) target = in.capDutyPercent;
+    if (target > 100.0f) target = 100.0f;
+    // Below the minimum duty the nozzle dribbles instead of atomising: nothing, not a little.
+    if (hold == kHoldNone && target < low) hold = kHoldDoseLimit;
+    hold_ = hold;
+
+    if (hold != kHoldNone) {
+      duty_ = 0.0f;
+      return 0.0f;
+    }
+    // Starting from rest: begin at the minimum duty and climb. kRampMs is the time the
+    // climb from minimum to maximum duty may take.
+    if (ramped) {
+      const float span = static_cast<float>(s.value[kMaxDutyPct]) - low;
+      const float step = span > 0.0f ? span * dt / s.value[kRampMs] : 100.0f;
+      const float from = duty_ > 0.0f ? duty_ : low - step;
+      if (target > from + step) target = from + step;
+      if (target < low) target = low;
+    }
+    duty_ = target;
+    return duty_;
+  }
+
+  // Pump test: no RPM, temperature, dose or time gates. Any test above 0% runs the
+  // pump at no less than the lowest duty that can be set, so it always turns.
+  float manual(uint32_t now, const Settings &, uint8_t dutyPercent) {
+    lastMs_ = now;
+    started_ = true;
+    hold_ = kHoldNone;
+    const float floor = rangeOf(kMinDutyPct).min;
+    duty_ = dutyPercent == 0 ? 0.0f : dutyPercent > 100 ? 100.0f : dutyPercent < floor ? floor : static_cast<float>(dutyPercent);
+    return duty_;
+  }
+
+  uint8_t hold() const { return hold_; }
+  bool resting() const { return resting_; }
+  bool earlyStart() const { return early_ && hold_ == kHoldNone; }
+  bool hotAir() const { return hotAir_ && hold_ == kHoldNone; }
+  float duty() const { return duty_; }
+
+private:
+  uint32_t lastMs_{0};
+  uint32_t usedMs_{0};
+  float duty_{0.0f};
+  uint8_t hold_{kHoldDisarmed};
+  bool started_{false};
   bool early_{false};
   bool hotAir_{false};
   bool resting_{false};

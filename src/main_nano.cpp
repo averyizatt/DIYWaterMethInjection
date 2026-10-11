@@ -82,7 +82,11 @@ bool lastPumpOn = false;
 constexpr uint32_t kEcuIntakeTimeoutMs = 1500;
 constexpr int kTuneEepromAddress = 0;
 constexpr uint8_t kTuneEepromMagic = 0x4D;
-constexpr uint8_t kTuneEepromVersion = 2;
+constexpr uint8_t kTuneEepromVersion = 3;  // 3: two PWM duty settings added (unused by the relay)
+// A tune saved by the firmware before that (17 settings) is still read, so flashing
+// this firmware does not reset the tune.
+constexpr uint8_t kTuneEepromVersionBeforeDuty = 2;
+constexpr uint8_t kTuneCountBeforeDuty = 17;
 constexpr uint32_t kIntakeTempSampleMs = 50;
 
 uint32_t lastLoopMs = 0;
@@ -702,12 +706,15 @@ void tuneChanged() {
 // EEPROM: magic, version, the settings as little-endian u16, XOR checksum.
 bool loadTune() {
   meth_tune::Settings saved;
-  saved.value[0] = 0;
+  meth_tune::loadDefaults(saved);  // Settings an older save does not hold keep their defaults.
   int address = kTuneEepromAddress;
-  uint8_t checksum = EEPROM.read(address) ^ EEPROM.read(address + 1);
-  const bool header = EEPROM.read(address) == kTuneEepromMagic && EEPROM.read(address + 1) == kTuneEepromVersion;
+  const uint8_t version = EEPROM.read(address + 1);
+  uint8_t checksum = EEPROM.read(address) ^ version;
+  const bool header = EEPROM.read(address) == kTuneEepromMagic &&
+                      (version == kTuneEepromVersion || version == kTuneEepromVersionBeforeDuty);
+  const uint8_t count = version == kTuneEepromVersionBeforeDuty ? kTuneCountBeforeDuty : meth_tune::kCount;
   address += 2;
-  for (uint8_t key = 1; key <= meth_tune::kCount; ++key, address += 2) {
+  for (uint8_t key = 1; key <= count; ++key, address += 2) {
     const uint8_t low = EEPROM.read(address);
     const uint8_t high = EEPROM.read(address + 1);
     checksum ^= low ^ high;

@@ -1,0 +1,87 @@
+# Builds both boards' firmware on every change, so neither is broken by work on the
+# other: the Arduino Nano (relay pump) and the ESP32-S3 (PWM pump). The ESP32 image and
+# its manifest are kept with the run as an artifact, in the form the dash installs over CAN.
+name: Firmware
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'include/**'
+      - 'test/**'
+      - 'platformio.ini'
+      - '.github/workflows/firmware.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: firmware
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      # The shared CAN contract is read from DIYComfortControlModule, checked out next to this repository.
+      - uses: actions/checkout@v4
+        with:
+          path: DIYWaterMethInjection
+      - uses: actions/checkout@v4
+        with:
+          repository: averyizatt/DIYComfortControlModule
+          path: DIYComfortControlModule
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: platformio-water-meth-${{ hashFiles('DIYWaterMethInjection/platformio.ini') }}
+
+      - name: Install PlatformIO
+        run: pip install platformio
+
+      - name: Host tests
+        working-directory: DIYWaterMethInjection
+        run: |
+          for name in test_meth_tune test_meth_pwm test_esp32_inputs test_knock_band; do
+            g++ -std=c++11 -Wall -I include test/$name/test_main.cpp -o /tmp/$name && /tmp/$name
+          done
+
+      - name: Build the Nano firmware
+        working-directory: DIYWaterMethInjection
+        run: pio run -e arduino_nano
+
+      # The build number the controller reports to the dash: the first eight hex digits of the commit.
+      - name: Build the ESP32-S3 firmware
+        working-directory: DIYWaterMethInjection
+        run: |
+          BUILD=$(git rev-parse HEAD | cut -c1-8)
+          echo "BUILD=$BUILD" >> "$GITHUB_ENV"
+          PLATFORMIO_BUILD_FLAGS="-DMETH_FW_BUILD=0x$BUILD" pio run -e esp32s3_water_meth
+
+      - name: Package
+        working-directory: DIYWaterMethInjection
+        run: |
+          mkdir out
+          cp .pio/build/esp32s3_water_meth/firmware.bin out/watermeth-firmware.bin
+          cp .pio/build/arduino_nano/firmware.hex out/nano-firmware.hex
+          python3 - <<'EOF'
+          import hashlib, json, os, pathlib
+          data = pathlib.Path('out/watermeth-firmware.bin').read_bytes()
+          assert 0 < len(data) <= 0x330000, len(data)   # Must fit one application slot.
+          manifest = {'build': os.environ['BUILD'], 'size': len(data),
+                      'sha256': hashlib.sha256(data).hexdigest(), 'commit': os.environ['GITHUB_SHA']}
+          pathlib.Path('out/watermeth-firmware.json').write_text(json.dumps(manifest) + '\n')
+          print(manifest)
+          EOF
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: water-meth-firmware
+          path: DIYWaterMethInjection/out/
