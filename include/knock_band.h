@@ -31,11 +31,20 @@ constexpr uint8_t kRpmBins = 8;            // Noise level learned per 1000 RPM
 // that the power sum below stays inside 32 bits.
 constexpr int16_t kStateLimit = 22000;
 
-// 2*cos(2*pi*bin/64) in Q14 for bins 6..28.
+// 2*cos(2*pi*bin/64) in Q14 for bins 6..28. On the Nano the table is kept in flash:
+// a constant table otherwise takes 46 bytes of its 2 KB of RAM.
+#if defined(ARDUINO_ARCH_AVR)
+#include <avr/pgmspace.h>
+#define KNOCK_BAND_TABLE PROGMEM
+#define KNOCK_BAND_READ(address) static_cast<int16_t>(pgm_read_word(address))
+#else
+#define KNOCK_BAND_TABLE
+#define KNOCK_BAND_READ(address) (*(address))
+#endif
 inline int16_t coefficient(uint8_t bin) {
-  static const int16_t table[] = {27246, 25330, 23170, 20788, 18205, 15447, 12540, 9512, 6393, 3212, 0, -3212,
-                                  -6393, -9512, -12540, -15447, -18205, -20788, -23170, -25330, -27246, -28899, -30274};
-  return table[bin - 6];
+  static const int16_t table[] KNOCK_BAND_TABLE = {27246, 25330, 23170, 20788, 18205, 15447, 12540, 9512, 6393, 3212, 0, -3212,
+                                                   -6393, -9512, -12540, -15447, -18205, -20788, -23170, -25330, -27246, -28899, -30274};
+  return KNOCK_BAND_READ(&table[bin - 6]);
 }
 
 // Knock frequency for a cylinder bore: f = 1800 / (pi * bore_mm) kHz (first resonance).

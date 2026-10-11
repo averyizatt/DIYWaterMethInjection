@@ -410,6 +410,26 @@ platformio run -t upload
 For a clone with the old bootloader, change `upload_speed` in `platformio.ini`
 to `57600`. Host test environments live separately in `platformio-tests.ini`.
 
+### The Nano is full
+
+With pulse tuning and knock listening the Nano firmware is close to the board's limits
+(30,720 bytes of flash, 2,048 bytes of RAM). Three things keep it inside them:
+
+- Build options in `platformio.ini` (no function inlining, shared entry/exit code,
+  short jumps, small serial buffers). Leave them in place.
+- The long serial diagnostics (CAN register dumps, the loopback self-test, the full
+  once-a-second line) are compiled only with `-DNANO_VERBOSE_SERIAL=1`, which does not
+  fit a Nano. The default prints short lines: `CAN: MCP2515 ready`, a line for each
+  failed transmission, and once a second
+  `HB map=98 boostX10=-3 baro=100 rpm=850 pump=0 hold=1 mode=0 tankLow=0 can=1 oil=42 fuel=40 knock=0`
+  (map and baro in kPa, boost in tenths of a psi, pressures in psi, `!` after a value
+  that is not valid).
+- The two pressure sensors that were never fitted (meth pressure, boost reference) no
+  longer have objects in RAM; they are reported as not fitted, as before.
+
+After a build PlatformIO prints the flash and RAM used. If flash passes about 97% or
+RAM about 82%, something has to go before adding more to this board.
+
 Nano wiring used by the firmware:
 
 | Signal | Nano pin | Wiring notes |

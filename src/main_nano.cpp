@@ -21,6 +21,14 @@
 #define CCM_MCP2515_CLOCK MCP_8MHZ
 #endif
 
+// The long serial diagnostics (CAN register dumps, loopback self-test, the full
+// once-a-second line) do not fit a Nano together with the tuning and knock code.
+// Build with -DNANO_VERBOSE_SERIAL=1 for bench work on a board with more memory;
+// the default prints short lines and behaves the same on CAN and at the pump.
+#ifndef NANO_VERBOSE_SERIAL
+#define NANO_VERBOSE_SERIAL 0
+#endif
+
 #ifndef CCM_CAN_RX_TRACE
 #define CCM_CAN_RX_TRACE 0
 #endif
@@ -51,8 +59,9 @@ MapSensor mapSensor;
 FloatSensor floatSensor;
 PressureSensor oilPressureSensor;
 PressureSensor fuelPressureSensor;
-PressureSensor methPressureSensor;
-PressureSensor boostRefPressureSensor;
+// The meth-pressure and boost-reference sensors were never fitted (no pin), and each
+// sensor object costs 83 bytes of the Nano's 2 KB of RAM: they are reported as not
+// fitted without keeping an object for them.
 PumpDriver pumpDriver;
 WarningOutput warningOutput;
 InjectionController controller;
@@ -169,7 +178,9 @@ inline bool elapsed(uint32_t now, uint32_t start, uint32_t intervalMs) {
   return static_cast<uint32_t>(now - start) >= intervalMs;
 }
 
+#if NANO_VERBOSE_SERIAL
 void printHexByte(uint8_t value);
+#endif
 
 float clampFloatValue(float value, float minValue, float maxValue) {
   if (value < minValue) return minValue;
@@ -177,6 +188,7 @@ float clampFloatValue(float value, float minValue, float maxValue) {
   return value;
 }
 
+#if NANO_VERBOSE_SERIAL
 const char *pressureFaultName(PressureFault fault) {
   switch (fault) {
   case PressureFault::None:
@@ -199,6 +211,7 @@ const char *pressureFaultName(PressureFault fault) {
     return "unknown";
   }
 }
+#endif  // NANO_VERBOSE_SERIAL
 
 // The frequency the detector listens at: from the bore, or the value set over CAN.
 uint16_t knockCenterHz() {
@@ -243,6 +256,7 @@ void captureKnockBurst(uint16_t *samples) {
   }
 }
 
+#if NANO_VERBOSE_SERIAL
 const char *canSpeedName(uint8_t speed) {
   switch (speed) {
   case CAN_500KBPS:
@@ -338,6 +352,7 @@ void runCanLoopbackSelfTest() {
   Serial.print(F(" len="));
   Serial.println(len);
 }
+#endif  // NANO_VERBOSE_SERIAL
 
 bool initCanBus() {
   pinMode(pins::CAN_SPI_CS, OUTPUT);
@@ -346,25 +361,30 @@ bool initCanBus() {
   SPI.begin();
 
   const uint8_t beginResult = canBus.begin(MCP_ANY, CCM_CAN_SPEED, CCM_MCP2515_CLOCK);
+#if NANO_VERBOSE_SERIAL
   Serial.print(F("CAN INIT: begin result="));
   Serial.print(beginResult);
   Serial.print(F(" bitrate="));
   Serial.print(canSpeedName(CCM_CAN_SPEED));
   Serial.print(F(" clock="));
   Serial.println(canClockName(CCM_MCP2515_CLOCK));
+#endif
 
   if (beginResult != CAN_OK) {
     Serial.println(F("CAN: MCP2515 init failed"));
     return false;
   }
 
+#if NANO_VERBOSE_SERIAL
   runCanLoopbackSelfTest();
+#endif
 
   const uint8_t modeResult = canBus.setMode(MCP_NORMAL);
   if (modeResult != CAN_OK) {
     Serial.println(F("CAN: MCP2515 normal mode failed"));
     return false;
   }
+#if NANO_VERBOSE_SERIAL
   const uint8_t canstat = mcp2515DebugReadRegister(MCP_CANSTAT);
   const uint8_t canintf = mcp2515DebugReadRegister(MCP_CANINTF);
   const uint8_t stat = mcp2515DebugReadStatus();
@@ -383,6 +403,9 @@ bool initCanBus() {
   Serial.print(pins::CAN_SPI_CS);
   Serial.print(F(" INT=D"));
   Serial.println(pins::CAN_SPI_INT);
+#else
+  Serial.println(F("CAN: MCP2515 ready"));
+#endif
   return true;
 }
 
@@ -401,7 +424,7 @@ void calibrateStartupBaro() {
 
   if (validSamples == 0) {
     Serial.print(F("MAP baro kept at "));
-    Serial.print(config.map.baroKpa, 1);
+    Serial.print(static_cast<int>(config.map.baroKpa + 0.5f));
     Serial.println(F(" kPa"));
     return;
   }
@@ -409,7 +432,7 @@ void calibrateStartupBaro() {
   config.map.baroKpa = mapTotalKpa / static_cast<float>(validSamples);
   mapSensor.begin(pins::MAP_SENSOR_ADC, config.map);
   Serial.print(F("MAP baro calibrated to "));
-  Serial.print(config.map.baroKpa, 1);
+  Serial.print(static_cast<int>(config.map.baroKpa + 0.5f));
   Serial.println(F(" kPa"));
 }
 
@@ -438,18 +461,16 @@ PressureConfig make100PsiDividerPressureConfig(int pin) {
 void updatePressureReadings(SensorReadings &readings, uint32_t now) {
   oilPressureSensor.update(now);
   fuelPressureSensor.update(now);
-  methPressureSensor.update(now);
-  boostRefPressureSensor.update(now);
 
   readings.oilPressureValid = oilPressureSensor.valid();
   readings.fuelPressureValid = fuelPressureSensor.valid();
-  readings.methPressureValid = methPressureSensor.valid();
-  readings.boostRefPressureValid = boostRefPressureSensor.valid();
+  readings.methPressureValid = false;      // Not fitted.
+  readings.boostRefPressureValid = false;  // Not fitted.
 
   readings.oilPressurePsi = readings.oilPressureValid ? oilPressureSensor.valuePsi() : 0.0f;
   readings.fuelPressurePsi = readings.fuelPressureValid ? fuelPressureSensor.valuePsi() : 0.0f;
-  readings.methPressurePsi = readings.methPressureValid ? methPressureSensor.valuePsi() : 0.0f;
-  readings.boostRefPressurePsi = readings.boostRefPressureValid ? boostRefPressureSensor.valuePsi() : 0.0f;
+  readings.methPressurePsi = 0.0f;
+  readings.boostRefPressurePsi = 0.0f;
 
   if (!readings.oilPressureValid) {
     readings.analogFaultFlags |= kAnalogFaultOilPressure;
@@ -457,12 +478,8 @@ void updatePressureReadings(SensorReadings &readings, uint32_t now) {
   if (!readings.fuelPressureValid) {
     readings.analogFaultFlags |= kAnalogFaultFuelPressure;
   }
-  if (!readings.methPressureValid) {
-    readings.analogFaultFlags |= kAnalogFaultMethPressure;
-  }
-  if (!readings.boostRefPressureValid) {
-    readings.analogFaultFlags |= kAnalogFaultBoostRefPressure;
-  }
+  // Reported exactly as an unfitted sensor always was.
+  readings.analogFaultFlags |= kAnalogFaultMethPressure | kAnalogFaultBoostRefPressure;
 }
 
 #if CCM_CAN_RX_TRACE
@@ -481,6 +498,7 @@ void printCanFrame(unsigned long id, byte len, const byte *data) {
 }
 #endif
 
+#if NANO_VERBOSE_SERIAL
 void printCanTxFrame(const can_protocol::CanFrame &frame, uint8_t result) {
   if (!kSerialCanVerbose) return;
   Serial.print(F("CAN TX id=0x"));
@@ -517,14 +535,20 @@ void printCanErrorFlags(uint8_t eflg) {
   if (eflg & MCP_EFLG_RX0OVR) Serial.print(F(" RX0OVR"));
   if (eflg & MCP_EFLG_RX1OVR) Serial.print(F(" RX1OVR"));
 }
+#endif  // NANO_VERBOSE_SERIAL
 
 uint8_t sendCanFrame(const can_protocol::CanFrame &frame) {
   return canBus.sendMsgBuf(frame.id, 0, frame.dlc, const_cast<uint8_t *>(frame.data));
 }
 
+// `label` names the frame in the verbose log; the short log prints its ID instead.
 bool transmitCanFrame(const can_protocol::CanFrame &frame, const char *label) {
   const uint8_t result = sendCanFrame(frame);
+#if NANO_VERBOSE_SERIAL
   printCanTxFrame(frame, result);
+#else
+  (void)label;
+#endif
   if (result == CAN_OK) {
     consecutiveCanTxFailures = 0;
     return true;
@@ -535,6 +559,12 @@ bool transmitCanFrame(const can_protocol::CanFrame &frame, const char *label) {
   const uint32_t now = millis();
   if (consecutiveCanTxFailures == 1 || elapsed(now, lastCanTxFailureLogMs, kCanTxFailureLogMs)) {
     lastCanTxFailureLogMs = now;
+#if !NANO_VERBOSE_SERIAL
+    Serial.print(F("CAN: TX failed id=0x"));
+    Serial.print(frame.id, HEX);
+    Serial.print(F(" count="));
+    Serial.println(consecutiveCanTxFailures);
+#else
     const uint8_t eflg = canBus.getError();
     const uint8_t tec = canBus.errorCountTX();
     const uint8_t rec = canBus.errorCountRX();
@@ -553,11 +583,13 @@ bool transmitCanFrame(const can_protocol::CanFrame &frame, const char *label) {
     Serial.print(F(" flags:"));
     printCanErrorFlags(eflg);
     Serial.println();
+#endif
   }
 
   return false;
 }
 
+#if NANO_VERBOSE_SERIAL
 void logCanHealth(uint32_t now) {
   if (!kSerialCanVerbose) return;
   if (!elapsed(now, lastCanHealthLogMs, kCanHealthLogMs)) return;
@@ -592,6 +624,7 @@ void logCanHealth(uint32_t now) {
   printCanErrorFlags(eflg);
   Serial.println();
 }
+#endif  // NANO_VERBOSE_SERIAL
 
 bool serviceCanDiag(uint32_t now) {
   if (!canOnline || !elapsed(now, lastCanDiagMs, kCanDiagMs)) return canOnline;
@@ -600,6 +633,7 @@ bool serviceCanDiag(uint32_t now) {
   const uint8_t eflg = canBus.getError();
   const uint8_t rec = canBus.errorCountRX();
   const uint8_t tec = canBus.errorCountTX();
+#if NANO_VERBOSE_SERIAL
   Serial.print(F("[CAN] EFLG=0x"));
   printHexByte(eflg);
   Serial.print(F(" REC="));
@@ -611,6 +645,9 @@ bool serviceCanDiag(uint32_t now) {
   Serial.print(F(" flags:"));
   printCanErrorFlags(eflg);
   Serial.println();
+#else
+  (void)rec;
+#endif
 
   const bool busOff = (eflg & MCP_EFLG_TXBO) != 0U;
   const bool txErrorState = (eflg & (MCP_EFLG_TXEP | MCP_EFLG_TXWAR | MCP_EFLG_EWARN)) != 0U;
@@ -1211,7 +1248,9 @@ void serviceCanBus(uint32_t now,
   }
 
   if (!serviceCanDiag(now)) return;
+#if NANO_VERBOSE_SERIAL
   logCanHealth(now);
+#endif
   applyCanCommandTimeout(now);
 
   const bool interruptActive = digitalRead(pins::CAN_SPI_INT) == LOW;
@@ -1406,8 +1445,6 @@ void setup() {
   calibrateStartupBaro();
   oilPressureSensor.begin(make100PsiDividerPressureConfig(pins::OIL_PRESSURE_ADC));
   fuelPressureSensor.begin(make100PsiDividerPressureConfig(pins::FUEL_PRESSURE_ADC));
-  methPressureSensor.begin(make100PsiDividerPressureConfig(pins::METH_PRESSURE_ADC));
-  boostRefPressureSensor.begin(make100PsiDividerPressureConfig(pins::BOOST_REF_PRESSURE_ADC));
   floatSensor.begin(pins::FLOAT_SENSOR_DIGITAL,
                     config.floatActiveLow,
                     config.floatDebounceMs,
@@ -1554,6 +1591,7 @@ void loop() {
 
   if (!pulseRunning && elapsed(now, lastDebugMs, kSerialHeartbeatMs)) {
     lastDebugMs = now;
+#if NANO_VERBOSE_SERIAL
     const uint8_t commandedDuty = manualTestActive ? manualTestDuty :
         can_protocol::clampU8(static_cast<int>(result.finalDutyPercent + 0.5f));
     Serial.print(F("HB t="));
@@ -1621,5 +1659,32 @@ void loop() {
     Serial.print(')');
     Serial.print(F(" faults=0x"));
     Serial.println(readings.analogFaultFlags, HEX);
+#else
+    // map and baro in kPa, boost in tenths of a psi, pressures in psi; "!" = not valid.
+    Serial.print(F("HB map="));
+    Serial.print(static_cast<int>(readings.mapKpa + 0.5f));
+    Serial.print(readings.mapValid ? F(" boostX10=") : F("! boostX10="));
+    Serial.print(static_cast<int>(readings.boostPsi * 10.0f));
+    Serial.print(F(" baro="));
+    Serial.print(static_cast<int>(config.map.baroKpa + 0.5f));
+    Serial.print(F(" rpm="));
+    Serial.print(rpm);
+    Serial.print(engineRpmValid ? F(" pump=") : F("! pump="));
+    Serial.print(digitalRead(pins::PUMP_OUT));
+    Serial.print(F(" hold="));
+    Serial.print(governor.hold());
+    Serial.print(F(" mode="));
+    Serial.print(static_cast<uint8_t>(config.mode));
+    Serial.print(F(" tankLow="));
+    Serial.print(readings.tankLow ? 1 : 0);
+    Serial.print(F(" can="));
+    Serial.print(canOnline ? 1 : 0);
+    Serial.print(F(" oil="));
+    Serial.print(static_cast<int>(readings.oilPressurePsi + 0.5f));
+    Serial.print(readings.oilPressureValid ? F(" fuel=") : F("! fuel="));
+    Serial.print(static_cast<int>(readings.fuelPressurePsi + 0.5f));
+    Serial.print(readings.fuelPressureValid ? F(" knock=") : F("! knock="));
+    Serial.println(knockDetected ? 1 : 0);
+#endif
   }
 }
