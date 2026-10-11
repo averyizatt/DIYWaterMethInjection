@@ -158,9 +158,15 @@ running, when the pump is on or boost is within 1 psi of the start threshold. Du
 an update the pump is held off. A new firmware runs on trial: if the dash does not
 confirm it within 90 seconds, the controller goes back to the previous one.
 
-The dash does not list this controller on its firmware screen yet: that is switched on
-once this board is in the car, together with where the dash downloads the image from.
-Until then, flash it by USB.
+The first flash is by USB. After that the dash does it: every change to this
+repository is built on GitHub and published as the `watermeth-latest` release, the
+dash downloads it during **Update now**, and **Dash management > Support** offers
+"Install water/meth firmware" when the build on the Pi differs from the one the
+controller reports. A build flashed from VS Code reports build 0, so the dash will
+offer the published build over it.
+
+While the Nano board is fitted the dash shows "Water/meth firmware: no answer (normal
+with the Nano board)". The Nano cannot take firmware over CAN.
 
 ## The Nano board in the meantime
 

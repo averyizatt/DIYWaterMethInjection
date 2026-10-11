@@ -1,6 +1,8 @@
 # Builds both boards' firmware on every change, so neither is broken by work on the
-# other: the Arduino Nano (relay pump) and the ESP32-S3 (PWM pump). The ESP32 image and
-# its manifest are kept with the run as an artifact, in the form the dash installs over CAN.
+# other: the Arduino Nano (relay pump) and the ESP32-S3 (PWM pump). The ESP32 image is
+# published as the "watermeth-latest" release: the dash downloads it during Update now
+# and installs it over the CAN bus (docs/ESP32_HARDWARE.md). The Nano image is kept
+# with the run; that board is flashed by USB.
 name: Firmware
 
 on:
@@ -15,7 +17,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: firmware
@@ -53,9 +55,14 @@ jobs:
             g++ -std=c++11 -Wall -I include test/$name/test_main.cpp -o /tmp/$name && /tmp/$name
           done
 
+      # The image is copied out at once: the next build runs with other flags, and
+      # PlatformIO then clears the build folder.
       - name: Build the Nano firmware
         working-directory: DIYWaterMethInjection
-        run: pio run -e arduino_nano
+        run: |
+          pio run -e arduino_nano
+          mkdir -p out
+          cp .pio/build/arduino_nano/firmware.hex out/nano-firmware.hex
 
       # The build number the controller reports to the dash: the first eight hex digits of the commit.
       - name: Build the ESP32-S3 firmware
@@ -68,9 +75,7 @@ jobs:
       - name: Package
         working-directory: DIYWaterMethInjection
         run: |
-          mkdir out
           cp .pio/build/esp32s3_water_meth/firmware.bin out/watermeth-firmware.bin
-          cp .pio/build/arduino_nano/firmware.hex out/nano-firmware.hex
           python3 - <<'EOF'
           import hashlib, json, os, pathlib
           data = pathlib.Path('out/watermeth-firmware.bin').read_bytes()
@@ -85,3 +90,15 @@ jobs:
         with:
           name: water-meth-firmware
           path: DIYWaterMethInjection/out/
+
+      # The image goes up before its manifest: the dash only takes an image that matches the manifest it read.
+      - name: Publish
+        working-directory: DIYWaterMethInjection
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view watermeth-latest >/dev/null 2>&1 || gh release create watermeth-latest \
+            --title "Water/meth ESP32 firmware (latest build)" --latest=false \
+            --notes "Built automatically from main, for the ESP32-S3 board. The dash downloads this during Update now and installs it over the CAN bus."
+          gh release upload watermeth-latest out/watermeth-firmware.bin --clobber
+          gh release upload watermeth-latest out/watermeth-firmware.json --clobber
