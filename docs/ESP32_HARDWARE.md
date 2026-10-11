@@ -100,6 +100,15 @@ driver's input to ground. If you do not fit it, leave GPIO17 unconnected.
 The firmware also switches the pump and the relay off by itself, within a quarter of
 a second, if its main loop ever stops running, and the gate pull-down covers a reset.
 
+### Testing the driver by itself
+
+Before anything else is wired, the environment `esp32s3_pump_test` drives only the
+pump output: off for the first 10 seconds after start-up, then 10 % duty, 20 %, and so
+on to 100 %, two seconds each, then off until the board's reset button is pressed. It
+uses the same pin and PWM frequency as the real firmware, and prints each step on the
+serial monitor (115200). Have fluid in the pump: it should not run dry. Flash
+`esp32s3_water_meth` again afterwards.
+
 ## CAN module
 
 Same kind of MCP2515 module as the sensor gateway: 8 MHz crystal, 500 kbit/s. The

@@ -64,6 +64,10 @@ jobs:
           mkdir -p out
           cp .pio/build/arduino_nano/firmware.hex out/nano-firmware.hex
 
+      - name: Build the pump driver bench test
+        working-directory: DIYWaterMethInjection
+        run: pio run -e esp32s3_pump_test
+
       # The build number the controller reports to the dash: the first eight hex digits of the commit.
       - name: Build the ESP32-S3 firmware
         working-directory: DIYWaterMethInjection
