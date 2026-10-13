@@ -1,7 +1,11 @@
 #pragma once
 
-// X9C104 digital potentiometer (100 kohm, 100 wiper positions) as the gain control of
-// the knock amplifier. Three control wires: CS, INC and U/D.
+// X9C104 digital potentiometer (100 kohm) as the gain control of the knock amplifier.
+// Three control wires: CS, INC and U/D.
+//
+// The datasheet gives 100 wiper positions. Modules sold as X9C104 do not all have that
+// many (the owner's measures 30 steps from end to end), so the number of steps is a
+// setting, not an assumption: KNOCK_GAIN_TOP_STEP in pins_esp32.h.
 //
 // How the chip works, and what this driver does about it:
 //   - It is stepped, not written: each falling edge of INC while CS is low moves the
@@ -24,8 +28,8 @@
 
 namespace x9c {
 
-constexpr uint8_t kTopStep = 99;       // Positions 0..99
-constexpr uint8_t kHomePulses = 110;   // More than the whole travel: always reaches the bottom
+constexpr uint8_t kDatasheetTopStep = 99;   // Positions 0..99 on a part that matches its datasheet
+constexpr uint8_t kHomePulses = 110;        // More than any part's whole travel: always reaches the bottom
 
 // `count` steps in one direction. Leaves the chip released with nothing saved.
 template <class Io> void pulses(Io &io, bool up, uint8_t count) {
@@ -50,6 +54,10 @@ template <class Io> void pulses(Io &io, bool up, uint8_t count) {
 
 class Pot {
 public:
+  // The highest position this part has (steps from the bottom to the top).
+  void setTopStep(uint8_t topStep) { topStep_ = topStep == 0 ? 1 : topStep; }
+  uint8_t topStep() const { return topStep_; }
+
   // Walks the wiper to the bottom, wherever it was. After this the position is known.
   template <class Io> void home(Io &io) {
     pulses(io, false, kHomePulses);
@@ -57,7 +65,7 @@ public:
   }
 
   template <class Io> void moveTo(Io &io, uint8_t target) {
-    if (target > kTopStep) target = kTopStep;
+    if (target > topStep_) target = topStep_;
     if (target > step_) pulses(io, true, static_cast<uint8_t>(target - step_));
     else if (target < step_) pulses(io, false, static_cast<uint8_t>(step_ - target));
     step_ = target;
@@ -73,6 +81,7 @@ public:
 
 private:
   uint8_t step_{0};
+  uint8_t topStep_{kDatasheetTopStep};
 };
 
 } // namespace x9c

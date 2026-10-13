@@ -9,8 +9,11 @@
 
 namespace adc_sampler {
 namespace {
-constexpr uint32_t kTotalHz = knock_band::kSampleRateHz * 2UL;   // Knock is every other conversion.
-constexpr size_t kFrameBytes = 512;
+constexpr uint32_t kTotalHz = kKnockRateHz * 2UL;   // Knock is every other conversion.
+constexpr size_t kChunkBytes = 1024;                 // 256 conversions: 3.3 ms
+constexpr uint8_t kRing = 128;                       // Frames waiting for the main loop: 64 ms
+constexpr uint32_t kRateWindowMs = 2000;             // The sample rate is measured over this long
+constexpr uint32_t kMinPlausibleRateHz = 8000;
 
 adc_continuous_handle_t handle = nullptr;
 adc_cali_handle_t calibration[kSlowCount] = {};
@@ -18,68 +21,128 @@ adc_channel_t knockChannel = ADC_CHANNEL_0;
 adc_channel_t slowChannel[kSlowCount] = {};
 portMUX_TYPE lock = portMUX_INITIALIZER_UNLOCKED;
 
-uint16_t filling[knock_band::kSamples];
-uint8_t fillCount = 0;
-uint16_t newest[knock_band::kSamples];
-bool newestFresh = false;
+// Shared with the main loop, under the lock.
+knock_dsp::Frame ring[kRing];
+uint8_t ringHead = 0, ringCount = 0;
+float statLow = 1e9f, statHigh = -1e9f, statBias = 0.0f;
+uint32_t statRailed = 0, statSamples = 0;
 uint32_t slowSum[kSlowCount] = {};
 uint32_t slowCount[kSlowCount] = {};
+float wantedCentre = 6000.0f, wantedBandwidth = 1500.0f;
+bool bandChanged = true;
+bool secondActive = false;
 volatile uint32_t lastDataMs = 0;
 volatile uint32_t knockRate = 0;
+volatile uint32_t filterRate = kKnockRateHz;
+
+// The collecting task's own.
+knock_dsp::FrontEnd front;
 uint32_t knockCounted = 0;
-uint16_t rangeLow = 0xFFFF;   // Lowest and highest knock sample since knockRange() was last called
-uint16_t rangeHigh = 0;
 uint32_t rateStartMs = 0;
+uint32_t offRateSum = 0;
+uint8_t offRateWindows = 0;
 
 bool channelFor(int pin, adc_channel_t &channel) {
   adc_unit_t unit;
   return adc_continuous_io_to_channel(pin, &unit, &channel) == ESP_OK && unit == ADC_UNIT_1;
 }
 
+void designFilters(uint32_t rate) {
+  float centre, bandwidth;
+  portENTER_CRITICAL(&lock);
+  centre = wantedCentre;
+  bandwidth = wantedBandwidth;
+  bandChanged = false;
+  portEXIT_CRITICAL(&lock);
+  front.configure(static_cast<float>(rate), centre, bandwidth);
+  portENTER_CRITICAL(&lock);
+  secondActive = front.secondActive();
+  portEXIT_CRITICAL(&lock);
+  filterRate = rate;
+}
+
+// The measured rate, and the filters redesigned for it when it is steadily more than
+// 1 % from what they were designed for.
+void measureRate(uint32_t now) {
+  if (now - rateStartMs < kRateWindowMs) return;
+  const uint32_t measured = static_cast<uint32_t>(static_cast<uint64_t>(knockCounted) * 1000 / (now - rateStartMs));
+  knockCounted = 0;
+  rateStartMs = now;
+  knockRate = measured;
+  const uint32_t designed = filterRate;
+  const uint32_t off = measured > designed ? measured - designed : designed - measured;
+  if (measured < kMinPlausibleRateHz || off * 100 <= designed) {
+    offRateWindows = 0;
+    offRateSum = 0;
+    return;
+  }
+  offRateSum += measured;
+  if (++offRateWindows < 3) return;
+  designFilters(offRateSum / offRateWindows);
+  offRateWindows = 0;
+  offRateSum = 0;
+}
+
 void collect(void *) {
-  static uint8_t frame[kFrameBytes];
+  static uint8_t chunk[kChunkBytes];
+  designFilters(kKnockRateHz);
   for (;;) {
     uint32_t length = 0;
-    if (adc_continuous_read(handle, frame, sizeof(frame), &length, 100) != ESP_OK) continue;
+    if (adc_continuous_read(handle, chunk, sizeof(chunk), &length, 100) != ESP_OK) continue;
     const uint32_t now = millis();
     lastDataMs = now;
-    if (now - rateStartMs >= 1000) {
-      knockRate = static_cast<uint32_t>(static_cast<uint64_t>(knockCounted) * 1000 / (now - rateStartMs));
-      knockCounted = 0;
-      rateStartMs = now;
-    }
+    measureRate(now);
+    if (bandChanged) designFilters(filterRate);
+
+    // This chunk's results are gathered here and handed over in one go.
+    knock_dsp::Frame frames[16];
+    uint8_t frameCount = 0;
+    float low = 1e9f, high = -1e9f;
+    uint32_t railed = 0, samples = 0;
+    uint32_t sum[kSlowCount] = {};
+    uint32_t count[kSlowCount] = {};
+
     for (uint32_t i = 0; i + SOC_ADC_DIGI_RESULT_BYTES <= length; i += SOC_ADC_DIGI_RESULT_BYTES) {
-      const adc_digi_output_data_t *sample = reinterpret_cast<const adc_digi_output_data_t *>(frame + i);
+      const adc_digi_output_data_t *sample = reinterpret_cast<const adc_digi_output_data_t *>(chunk + i);
       const adc_channel_t channel = static_cast<adc_channel_t>(sample->type2.channel);
-      const uint16_t raw = sample->type2.data;   // 12 bits
+      const uint32_t raw = sample->type2.data;   // 12 bits
       if (channel == knockChannel) {
-        ++knockCounted;
-        const uint16_t ten = raw >> 2;           // 10 bits, as the knock maths expects
-        if (ten < rangeLow || ten > rangeHigh) {
-          portENTER_CRITICAL(&lock);
-          if (ten < rangeLow) rangeLow = ten;
-          if (ten > rangeHigh) rangeHigh = ten;
-          portEXIT_CRITICAL(&lock);
-        }
-        filling[fillCount++] = ten;
-        if (fillCount == knock_band::kSamples) {
-          fillCount = 0;
-          portENTER_CRITICAL(&lock);
-          memcpy(newest, filling, sizeof(newest));
-          newestFresh = true;
-          portEXIT_CRITICAL(&lock);
-        }
+        const float ten = raw * 0.25f;           // 10-bit counts, with the two extra bits kept as fractions
+        ++samples;
+        if (ten < low) low = ten;
+        if (ten > high) high = ten;
+        if (ten <= kRailLow || ten >= kRailHigh) ++railed;
+        knock_dsp::Frame frame;
+        if (front.push(ten, frame) && frameCount < sizeof(frames) / sizeof(frames[0])) frames[frameCount++] = frame;
         continue;
       }
       for (uint8_t input = 0; input < kSlowCount; ++input) {
         if (channel != slowChannel[input]) continue;
-        portENTER_CRITICAL(&lock);
-        slowSum[input] += raw;
-        ++slowCount[input];
-        portEXIT_CRITICAL(&lock);
+        sum[input] += raw;
+        ++count[input];
         break;
       }
     }
+    knockCounted += samples;
+
+    portENTER_CRITICAL(&lock);
+    for (uint8_t n = 0; n < frameCount; ++n) {
+      ring[(ringHead + ringCount) % kRing] = frames[n];
+      if (ringCount < kRing) ++ringCount;
+      else ringHead = (ringHead + 1) % kRing;   // Nobody is collecting: the oldest goes.
+    }
+    if (samples > 0) {
+      if (low < statLow) statLow = low;
+      if (high > statHigh) statHigh = high;
+      statRailed += railed;
+      statSamples += samples;
+      statBias = front.bias();
+    }
+    for (uint8_t input = 0; input < kSlowCount; ++input) {
+      slowSum[input] += sum[input];
+      slowCount[input] += count[input];
+    }
+    portEXIT_CRITICAL(&lock);
   }
 }
 } // namespace
@@ -99,8 +162,8 @@ bool begin(int knockPin, int oilPin, int fuelPin, int prePin, int postPin) {
   }
 
   adc_continuous_handle_cfg_t pool = {};
-  pool.max_store_buf_size = 4096;
-  pool.conv_frame_size = kFrameBytes;
+  pool.max_store_buf_size = 8192;
+  pool.conv_frame_size = kChunkBytes;
   if (adc_continuous_new_handle(&pool, &handle) != ESP_OK) return false;
 
   adc_digi_pattern_config_t pattern[8] = {};
@@ -119,29 +182,61 @@ bool begin(int knockPin, int oilPin, int fuelPin, int prePin, int postPin) {
   if (adc_continuous_config(handle, &config) != ESP_OK || adc_continuous_start(handle) != ESP_OK) return false;
 
   lastDataMs = rateStartMs = millis();
-  return xTaskCreatePinnedToCore(collect, "adc", 4096, nullptr, 5, nullptr, 0) == pdPASS;
+  // The filters run in floating point; a task that does is tied to one processor core.
+  return xTaskCreatePinnedToCore(collect, "adc", 8192, nullptr, 5, nullptr, 0) == pdPASS;
 }
 
-bool latestBurst(uint16_t out[knock_band::kSamples]) {
-  bool fresh;
+void setKnockBand(float centreHz, float bandwidthHz) {
   portENTER_CRITICAL(&lock);
-  fresh = newestFresh;
-  if (fresh) {
-    memcpy(out, newest, sizeof(newest));
-    newestFresh = false;
+  if (centreHz != wantedCentre || bandwidthHz != wantedBandwidth) {
+    wantedCentre = centreHz;
+    wantedBandwidth = bandwidthHz;
+    bandChanged = true;
   }
   portEXIT_CRITICAL(&lock);
-  return fresh;
 }
 
-bool knockRange(uint16_t &low, uint16_t &high) {
+size_t takeKnockFrames(knock_dsp::Frame *out, size_t capacity) {
+  size_t taken = 0;
   portENTER_CRITICAL(&lock);
-  low = rangeLow;
-  high = rangeHigh;
-  rangeLow = 0xFFFF;
-  rangeHigh = 0;
+  while (ringCount > 0 && taken < capacity) {
+    out[taken++] = ring[ringHead];
+    ringHead = (ringHead + 1) % kRing;
+    --ringCount;
+  }
   portEXIT_CRITICAL(&lock);
-  return low <= high;
+  return taken;
+}
+
+bool takeKnockStats(KnockStats &out) {
+  float low, high, bias;
+  uint32_t railed, samples;
+  portENTER_CRITICAL(&lock);
+  low = statLow;
+  high = statHigh;
+  bias = statBias;
+  railed = statRailed;
+  samples = statSamples;
+  statLow = 1e9f;
+  statHigh = -1e9f;
+  statRailed = 0;
+  statSamples = 0;
+  portEXIT_CRITICAL(&lock);
+  if (samples == 0) return false;
+  out.low = static_cast<uint16_t>(low < 0.0f ? 0.0f : low);
+  out.high = static_cast<uint16_t>(high > 1023.0f ? 1023.0f : high + 0.5f);
+  out.railed = railed;
+  out.samples = samples;
+  out.bias = bias;
+  return true;
+}
+
+bool knockSecondActive() {
+  bool active;
+  portENTER_CRITICAL(&lock);
+  active = secondActive;
+  portEXIT_CRITICAL(&lock);
+  return active;
 }
 
 bool averageMv(Slow input, float &millivolts) {
@@ -170,5 +265,6 @@ uint32_t silentForMs(uint32_t nowMs) {
 }
 
 uint32_t knockSamplesPerSecond() { return knockRate; }
+uint32_t knockFilterRateHz() { return filterRate; }
 
 } // namespace adc_sampler

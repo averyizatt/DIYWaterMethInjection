@@ -51,8 +51,8 @@ jobs:
       - name: Host tests
         working-directory: DIYWaterMethInjection
         run: |
-          for name in test_meth_tune test_meth_pwm test_esp32_inputs test_knock_band test_knock_agc; do
-            g++ -std=c++11 -Wall -I include test/$name/test_main.cpp -o /tmp/$name && /tmp/$name
+          for name in test_meth_tune test_meth_pwm test_esp32_inputs test_knock_band test_knock_agc test_knock_dsp; do
+            g++ -std=c++11 -O2 -Wall -I include test/$name/test_main.cpp -o /tmp/$name && /tmp/$name
           done
 
       # The image is copied out at once: the next build runs with other flags, and

@@ -7,6 +7,9 @@
 //     and no fresh ECU data means no injection.
 //   - Knock, oil pressure, fuel pressure and the air temperature before the nozzle are
 //     read by the ADC's own timer (adc_sampler).
+//   - Knock is listened for on every sample, 38 thousand a second, with band-pass
+//     filters on the cylinder's two resonances (knock_dsp.h); the Nano could look at one
+//     short burst in six. The amplifier's gain is set automatically (knock_agc.h).
 //   - New firmware arrives from the dash over CAN (can_contract/firmware_update.h).
 // Every CAN message, command and setting is the same as the Nano firmware's: the
 // functions that speak them are that firmware's own code. Wiring: docs/ESP32_HARDWARE.md.
@@ -30,6 +33,7 @@
 #include "injection_controller.h"
 #include "knock_agc.h"
 #include "knock_band.h"
+#include "knock_dsp.h"
 #include "meth_tune.h"
 #include "pins_esp32.h"
 #include "x9c.h"
@@ -121,10 +125,13 @@ uint32_t lastCanCommandMs = 0;
 uint32_t lastCanTxFailureLogMs = 0;
 uint32_t lastEngineRuntimeRxMs = 0;
 uint32_t manualTestStartMs = 0;
-// Knock listening (knock_band.h): the newest burst each loop pass, judged by the detector.
-knock_band::Detector knockDetector;
-knock_band::Burst knockBurst;
-uint16_t knockSamples[knock_band::kSamples];
+// Knock listening (knock_dsp.h): the ADC task filters every sample; each loop pass
+// judges the 20 ms just gone.
+knock_dsp::Detector knockDetector;
+knock_dsp::PassAnalyser knockAnalyser;
+knock_dsp::Summary knockHeard;
+knock_dsp::Frame knockFrames[knock_dsp::kMaxFrames];
+adc_sampler::KnockStats knockStats;
 bool canOnline = false;
 bool canCommandSeen = false;
 bool canCommandTimedOut = false;
@@ -193,14 +200,17 @@ uint16_t knockCenterHz() {
   return static_cast<uint16_t>(clampFloatValue(config.knock.centerFreqHz, 2000.0f, 9000.0f));
 }
 
-knock_band::Settings knockSettings() {
-  knock_band::Settings s;
-  s.offset = static_cast<uint8_t>(clampFloatValue(config.knock.thresholdOffset, 0.0f, 255.0f));
-  s.multiplierX10 = static_cast<uint8_t>(clampFloatValue(config.knock.thresholdMultiplier, 0.5f, 10.0f) * 10.0f + 0.5f);
-  s.gainX16 = static_cast<uint8_t>(clampFloatValue(config.knock.signalGain, 0.1f, 15.9f) * 16.0f + 0.5f);
+knock_dsp::Settings knockSettings() {
+  knock_dsp::Settings s;
+  s.offset = clampFloatValue(config.knock.thresholdOffset, 0.0f, 255.0f);
+  s.multiplier = clampFloatValue(config.knock.thresholdMultiplier, 0.5f, 10.0f);
+  s.gain = clampFloatValue(config.knock.signalGain, 0.1f, 15.9f);
   s.holdMs = config.knock.eventCooldownMs < 100 ? 100 : config.knock.eventCooldownMs;
   return s;
 }
+
+// Two band widths, as on the Nano: the bandwidth setting chooses the narrow one below 1 kHz.
+float knockBandwidthHz() { return config.knock.bandwidthHz < 1000.0f ? 900.0f : 1500.0f; }
 
 // ---------------------------------------------------------------------------
 // Knock amplifier gain (X9C104 potentiometer, x9c.h) under automatic control
@@ -230,7 +240,8 @@ void beginKnockGain() {
   knock_agc::Circuit circuit;
   circuit.lowGain = KNOCK_GAIN_AT_BOTTOM;
   circuit.highGain = KNOCK_GAIN_AT_TOP;
-  circuit.topStep = x9c::kTopStep;
+  circuit.topStep = KNOCK_GAIN_TOP_STEP;
+  knockPot.setTopStep(KNOCK_GAIN_TOP_STEP);
   knockGain.begin(circuit, 0);       // Lowest gain first: it cannot clip there.
   knockPot.home(knockGainPins);
   knockGainAuto = KNOCK_GAIN_POT != 0;
@@ -1112,14 +1123,14 @@ void serviceCanBus(uint32_t now,
     state.status_flags |= knockBaselineLearned ? (1U << 4) : 0U;
     state.status_flags |= knockSensorFault ? (1U << 5) : 0U;
     state.status_flags |= knockClippingDetected ? (1U << 6) : 0U;
-    state.energy = knockDetector.level();
-    state.baseline = knockDetector.baseline();
-    state.threshold = knockDetector.threshold();
+    state.energy = knock_dsp::toByte(knockDetector.level());
+    state.baseline = knock_dsp::toByte(knockDetector.baseline());
+    state.threshold = knock_dsp::toByte(knockDetector.threshold());
     state.event_count = knockEventCount;
     state.last_event_rpm_div100 = lastKnockRpmDiv100;
     state.last_event_boost_kpa = lastKnockBoostKpa;
     // Spare byte: how much of the signal sits at the knock frequency, 0..255.
-    state.reserved = knockDetector.share();
+    state.reserved = knock_dsp::toByte(knockDetector.share() * 255.0f);
 
     if (!transmitCanFrame(can_protocol::packEngineKnockState(state), "0x307")) {
       return;
@@ -1147,14 +1158,14 @@ void serviceCanBus(uint32_t now,
     hook.flags |= knockWarningActive ? (1U << 5) : 0U;
     hook.flags |= knockCriticalActive ? (1U << 6) : 0U;
     hook.flags |= knockBaselineLearned ? (1U << 7) : 0U;
-    hook.live_knock_rms = knockDetector.level();
-    hook.adaptive_threshold = knockDetector.threshold();
-    hook.adaptive_baseline = knockDetector.baseline();
+    hook.live_knock_rms = knock_dsp::toByte(knockDetector.level());
+    hook.adaptive_threshold = knock_dsp::toByte(knockDetector.threshold());
+    hook.adaptive_baseline = knock_dsp::toByte(knockDetector.baseline());
     hook.event_count = knockEventCount;
-    hook.bias_adc_div16 = can_protocol::clampU8(knockBurst.bias / 16);
+    hook.bias_adc_div16 = can_protocol::clampU8(static_cast<int>(knockStats.bias) / 16);
     hook.raw_adc_div16 = can_protocol::clampU8(knockRaw / 16);
     // Largest swing in the burst, in half counts: for setting the amplifier gain.
-    hook.envelope_level = can_protocol::clampU8(knockBurst.peak / 2);
+    hook.envelope_level = can_protocol::clampU8((knockStats.high - knockStats.low) / 4);
 
     if (!transmitCanFrame(can_protocol::packKnockLiveHook(hook), "0x30B")) {
       return;
@@ -1358,27 +1369,32 @@ void loop() {
   updateIntakeTemps(now);
   const uint16_t rpm = currentEngineRpm(now);
 
-  // ---- Knock: the newest burst from the ADC, judged as the Nano firmware judged it ----
-  if (adc_sampler::latestBurst(knockSamples)) {
-    knockBurst = knock_band::analyze(knockSamples, knock_band::centerBinFor(knockCenterHz()),
-                                     config.knock.bandwidthHz < 1000.0f ? 1 : 2);
-  }
-  uint16_t knockLow = 0, knockHigh = 0;
-  const bool knockRangeFresh = adc_sampler::knockRange(knockLow, knockHigh);
+  // ---- Knock: the ADC task has filtered every sample of the last 20 ms (knock_dsp.h) ----
+  adc_sampler::setKnockBand(knockCenterHz(), knockBandwidthHz());
+  const size_t knockFrameCount = adc_sampler::takeKnockFrames(knockFrames, knock_dsp::kMaxFrames);
+  for (size_t n = 0; n < knockFrameCount; ++n) knockAnalyser.add(knockFrames[n]);
+  // The window that fits one knock gets shorter as the engine turns faster.
+  const knock_dsp::Summary knockPass =
+      knockAnalyser.finish(adc_sampler::knockSecondActive(), knock_dsp::windowFramesFor(engineRpmValid ? rpm : 0));
+  if (knockPass.valid) knockHeard = knockPass;
+  adc_sampler::KnockStats knockFresh;
+  const bool knockRangeFresh = adc_sampler::takeKnockStats(knockFresh);
+  if (knockRangeFresh) knockStats = knockFresh;
   const bool knockInputDead = !adcReady || adc_sampler::silentForMs(now) > 500;
-  const int knockRaw = knockSamples[knock_band::kSamples - 1];
+  const int knockRaw = knockStats.high;   // The largest sample of the pass
   // With automatic gain a clipped burst is the gain control's business (it backs off at
   // once); it is a fault only when it clips with no gain left to take off, or when
   // nothing is heard at full gain with the engine at speed.
-  knockClippingDetected = knockGainAuto ? knockGain.overloaded() : knockBurst.railed >= knock_band::kSamples / 3;
-  knockSensorFault = knockInputDead || knockClippingDetected || knockBurst.bias < kKnockBiasLowAdc ||
-                     knockBurst.bias > kKnockBiasHighAdc || (knockGainAuto && knockGain.silent());
+  knockClippingDetected = knockGainAuto ? knockGain.overloaded()
+                                        : knockStats.samples > 0 && knockStats.railed * 3 >= knockStats.samples;
+  knockSensorFault = knockInputDead || knockClippingDetected || knockStats.bias < kKnockBiasLowAdc ||
+                     knockStats.bias > kKnockBiasHighAdc || (knockGainAuto && knockGain.silent());
   const bool rpmArmed = config.knock.minRpmToArm == 0 || rpm >= config.knock.minRpmToArm;
   const bool mapArmed = readings.mapKpa >= config.knock.minMapKpaToArm;
   const bool knockArmed = config.knock.enabled && rpmArmed && mapArmed && !knockSensorFault;
   // The pass after a gain change spans both gains: it is not judged and not learned from.
-  if (!(knockGainAuto && knockGain.settling())) {
-    knockDetector.update(now, knockBurst, knockSettings(), knockArmed, engineRpmValid ? rpm : 0);
+  if (knockPass.valid && !(knockGainAuto && knockGain.settling())) {
+    knockDetector.update(now, knockHeard, knockSettings(), knockArmed, engineRpmValid ? rpm : 0);
   }
   if (knockGainAuto) {
     const bool engineStopped = !engineRpmValid || rpm == 0;
@@ -1388,14 +1404,14 @@ void loop() {
       knockPot.resync(knockGainPins, knockGain.step());
     } else if (knockRangeFresh) {
       knock_agc::Sample sample;
-      sample.low = knockLow;
-      sample.high = knockHigh;
+      sample.low = knockStats.low;
+      sample.high = knockStats.high;
       sample.rpm = rpm;
       sample.rpmValid = engineRpmValid;
       sample.knocking = knockDetector.learned() && knockDetector.level() >= knockDetector.threshold();
       if (knockGain.update(sample)) {
         knockPot.moveTo(knockGainPins, knockGain.step());
-        knockDetector.rescale(knockGain.ratioX256());
+        knockDetector.rescale(knockGain.ratioX256() / 256.0f);
       }
       if (knockGain.ineffective()) {
         knockGainAuto = false;
@@ -1413,13 +1429,13 @@ void loop() {
   if (knockWarningActive && !lastKnockWarningActive) {
     queueKnockFault(can_protocol::knock_fault_code::KNOCK_WARNING,
                     static_cast<uint8_t>(can_protocol::FaultSeverity::WARNING),
-                    knockDetector.level(),
+                    knock_dsp::toByte(knockDetector.level()),
                     boostGaugeKpaForCan(readings));
   }
   if (knockCriticalActive && !lastKnockCriticalActive) {
     queueKnockFault(can_protocol::knock_fault_code::KNOCK_CRITICAL,
                     static_cast<uint8_t>(can_protocol::FaultSeverity::CRITICAL),
-                    knockDetector.level(),
+                    knock_dsp::toByte(knockDetector.level()),
                     boostGaugeKpaForCan(readings));
   }
   if (knockSensorFault && !lastKnockSensorFault) {
@@ -1511,13 +1527,14 @@ void loop() {
   if (elapsed(now, lastDebugMs, kSerialHeartbeatMs)) {
     lastDebugMs = now;
     Serial.printf("HB t=%lu map=%.1f%s boostPsi=%.2f baro=%.1f rpm=%u%s duty=%.0f%% hold=%u mode=%u tankLow=%d can=%d "
-                  "oilPsi=%.1f%s fuelPsi=%.1f%s pre=%.1f%s knock=%d bias=%u knockHz=%lu kgain=%.1f%s kpeak=%u rxOvf=%lu\n",
+                  "oilPsi=%.1f%s fuelPsi=%.1f%s pre=%.1f%s knock=%d bias=%u knockHz=%lu klvl=%.1f kbase=%.1f k2=%.1f kshare=%.2f kgain=%.1f%s kpeak=%u rxOvf=%lu\n",
                   static_cast<unsigned long>(now), readings.mapKpa, readings.mapValid ? "" : "!", readings.boostPsi,
                   config.map.baroKpa, rpm, engineRpmValid ? "" : "!", pumpDutyPercent, governor.hold(),
                   static_cast<unsigned>(config.mode), readings.tankLow ? 1 : 0, canOnline ? 1 : 0,
                   readings.oilPressurePsi, readings.oilPressureValid ? "" : "!", readings.fuelPressurePsi,
                   readings.fuelPressureValid ? "" : "!", preTempC, preTempValid ? "" : "!", knockDetected ? 1 : 0,
-                  knockBurst.bias, static_cast<unsigned long>(adc_sampler::knockSamplesPerSecond()),
+                  static_cast<unsigned>(knockStats.bias), static_cast<unsigned long>(adc_sampler::knockSamplesPerSecond()),
+                  knockDetector.level(), knockDetector.baseline(), knockDetector.second(), knockDetector.share(),
                   knockGain.gain(), knockGainAuto ? "" : "(fixed)", knockGain.typicalPeak(),
                   static_cast<unsigned long>(canRxOverflows));
   }

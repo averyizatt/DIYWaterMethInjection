@@ -37,6 +37,12 @@ constexpr int KNOCK_GAIN_INC = 18;
 constexpr int KNOCK_GAIN_UD = 21;
 } // namespace pins
 
+// Steps from the bottom of the potentiometer to its top. The X9C104's datasheet says 99;
+// the module fitted measures 30. The bench test (esp32s3_knock_gain_test) shows whether
+// this is right: at the last stop the resistance across VW and VL should be the full
+// 100 k. If it reads about a third of that, the part has the datasheet's 99.
+constexpr unsigned char KNOCK_GAIN_TOP_STEP = 30;
+
 // The knock amplifier's gain at the potentiometer's bottom and top positions. For a
 // non-inverting stage with the potentiometer (100k, terminals VW and VL) as the feedback
 // resistor and 10k from the inverting input to the 1.65 V bias point: 1 + 100k/10k.

@@ -113,8 +113,13 @@ What the board does differently, and only this:
   without fresh manifold pressure and RPM the controller does not inject. The dash's
   `0x309` RPM is the backup for RPM only.
 - Knock, pressures and temperatures are sampled by the ADC's own timer
-  ([src/adc_sampler.cpp](src/adc_sampler.cpp)): the knock input at 19.2 kHz, the same
-  rate the Nano used, so the knock settings mean the same thing.
+  ([src/adc_sampler.cpp](src/adc_sampler.cpp)), the knock input 38 thousand times a
+  second.
+- **Knock is listened for on every sample**, not one burst in six
+  ([include/knock_dsp.h](include/knock_dsp.h)): band-pass filters on the cylinder's two
+  resonances, a window the length of one knock slid over every 20 ms, and a hit that
+  has to be loud for this RPM, narrow-band and a burst. The settings (multiplier,
+  offset, frequency, band width) and what the dash is sent mean the same as on the Nano.
 - **The knock amplifier's gain is set automatically** through an X9C104 digital
   potentiometer ([include/knock_agc.h](include/knock_agc.h), [include/x9c.h](include/x9c.h)):
   normal engine noise is kept in the lower part of the ADC's range at every RPM, with
@@ -356,12 +361,18 @@ g++ -std=c++11 -I include test/test_meth_pwm/test_main.cpp -o meth_pwm_test && .
 g++ -std=c++11 -I include test/test_esp32_inputs/test_main.cpp -o esp32_inputs_test && ./esp32_inputs_test
 ```
 
-The automatic knock gain and its potentiometer driver
+The ESP32's knock listening ([test/test_knock_dsp/test_main.cpp](test/test_knock_dsp/test_main.cpp)):
+filter accuracy and selectivity at several sample rates, single knocks at random
+moments, sustained knock, false alarms over ten simulated minutes, a noise floor that
+rises without being knock, and knock caught right after a gain change. And the
+automatic knock gain with its potentiometer driver
 ([test/test_knock_agc/test_main.cpp](test/test_knock_agc/test_main.cpp)): convergence
 without hunting, clipping, knock not steering the gain, gain remembered per RPM, a dead
-sensor, a potentiometer that does nothing, and knock caught right after a gain change.
+sensor, a potentiometer that does nothing, and a part with fewer steps than its
+datasheet says.
 
 ```bash
+g++ -std=c++11 -O2 -I include test/test_knock_dsp/test_main.cpp -o knock_dsp_test && ./knock_dsp_test
 g++ -std=c++11 -I include test/test_knock_agc/test_main.cpp -o knock_agc_test && ./knock_agc_test
 ```
 

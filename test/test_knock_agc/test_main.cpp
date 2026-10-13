@@ -5,7 +5,6 @@
 #include <stdio.h>
 
 #include "knock_agc.h"
-#include "knock_band.h"
 #include "x9c.h"
 
 using namespace knock_agc;
@@ -31,6 +30,7 @@ float noise() {
 // ---------------------------------------------------------------------------
 struct Chip {
   int position = 57;        // Wherever it was left: unknown to the driver
+  int top = 99;             // The datasheet's part; some modules have fewer steps
   bool selected = false, incHigh = true, upward = false;
   int saves = 0, steps = 0;
   void select(bool on) {
@@ -42,7 +42,7 @@ struct Chip {
       ++steps;
       position += upward ? 1 : -1;
       if (position < 0) position = 0;          // It stops at the ends; it does not wrap
-      if (position > 99) position = 99;
+      if (position > top) position = top;
     }
     incHigh = high;
   }
@@ -214,6 +214,49 @@ void aDeadSensorIsNoticed() {
   check(stopped.agc.step() == 99 && !stopped.agc.silent(), "silence with the engine stopped is just silence");
 }
 
+// The owner's module: 30 steps from end to end, whatever the datasheet says.
+void aPartWithFewerStepsIsDrivenWithinItsRange() {
+  Chip chip;
+  chip.top = 30;
+  chip.position = 17;
+  x9c::Pot pot;
+  pot.setTopStep(30);
+  pot.home(chip);
+  pot.moveTo(chip, 30);
+  check(chip.position == 30 && pot.step() == 30, "the top is step 30");
+  const int before = chip.steps;
+  pot.moveTo(chip, 99);
+  check(chip.steps == before && pot.step() == 30, "it is never asked beyond its real top");
+  pot.moveTo(chip, 10);
+  check(chip.position == 10, "so the count is still right on the way back down");
+  // What would happen with the datasheet's count on this part: the count runs ahead of the wiper.
+  Chip misjudged;
+  misjudged.top = 30;
+  x9c::Pot wrong;
+  wrong.home(misjudged);
+  wrong.moveTo(misjudged, 80);
+  wrong.moveTo(misjudged, 40);
+  check(misjudged.position == 0 && wrong.step() == 40, "driven as a 99-step part it would lose its place");
+  check(chip.saves == 0 && misjudged.saves == 0, "nothing saved either way");
+
+  // The gain control with 30 coarse steps still settles and stays put.
+  for (float sensorPeak : {12.0f, 25.0f, 60.0f, 120.0f}) {
+    Bench bench;
+    bench.circuit.topStep = 30;
+    bench.agc.begin(bench.circuit, 0);
+    bench.run(750, sensorPeak, 3000);
+    const float typical = bench.typical(sensorPeak);
+    check(typical >= kLowPeak * 0.9f && typical <= kHighPeak * 1.1f, "30 steps: the signal still ends up inside the band");
+    check(bench.agc.step() <= 30, "30 steps: never beyond the top");
+    const int settled = bench.changes;
+    bench.run(3000, sensorPeak, 3000);
+    check(bench.changes - settled <= 2, "30 steps: no hunting");
+  }
+  Circuit coarse;
+  coarse.topStep = 30;
+  check(gainAt(coarse, 30) == 11.0f && fabsf(gainAt(coarse, 15) - 6.0f) < 0.01f, "30 steps span the same gain range");
+}
+
 void aPotentiometerThatDoesNothingIsNoticed() {
   // A fixed-gain amplifier: the signal is the same whatever is commanded.
   Circuit circuit;
@@ -240,67 +283,6 @@ void aPotentiometerThatDoesNothingIsNoticed() {
   check(!agc.ineffective() && agc.step() == 99, "a signal too small to judge is not taken as a broken potentiometer");
 }
 
-// ---------------------------------------------------------------------------
-// The detector across a gain change: real bursts through knock_band::analyze.
-// ---------------------------------------------------------------------------
-knock_band::Burst burst(float gain, float noiseAmp, float ringAmp) {
-  uint16_t samples[knock_band::kSamples];
-  const float phase = noise() * 3.14159f;
-  for (int i = 0; i < knock_band::kSamples; ++i) {
-    const float t = i / static_cast<float>(knock_band::kSampleRateHz);
-    float v = noiseAmp * noise();
-    const float since = t * 1000.0f - 0.3f;
-    if (ringAmp > 0.0f && since >= 0.0f) v += ringAmp * expf(-since / 1.5f) * sinf(6.2831853f * 5966.0f * t + phase);
-    v = kBias + v * gain;
-    samples[i] = static_cast<uint16_t>(v < 0.0f ? 0.0f : v > 1023.0f ? 1023.0f : v);
-  }
-  return knock_band::analyze(samples, knock_band::centerBinFor(knock_band::knockHzForBore(96)));
-}
-
-// Learns the engine's noise at one gain, changes the gain, then knocks at once.
-// Returns how many bursts it took to raise the warning (99 = never within 10).
-int burstsToCatchKnockAfterGainChange(float from, float to, bool rescale) {
-  knock_band::Detector detector;
-  knock_band::Settings settings;
-  uint32_t now = 0;
-  for (int n = 0; n < 400; ++n) detector.update(now += 20, burst(from, 12.0f, 0.0f), settings, true, 3000);
-  if (rescale) detector.rescale(static_cast<uint16_t>(to / from * 256.0f + 0.5f));
-  for (int n = 1; n <= 10; ++n) {
-    detector.update(now += 20, burst(to, 12.0f, 60.0f), settings, true, 3000);
-    if (detector.warning()) return n;
-  }
-  return 99;
-}
-
-void knockIsStillCaughtRightAfterAGainChange() {
-  seed = 777;
-  const int steady = burstsToCatchKnockAfterGainChange(4.0f, 4.0f, true);
-  check(steady <= 3, "knock is caught within three bursts at a steady gain");
-  // Gain cut to a quarter (a hard pull, clipping backed off): everything is four times smaller.
-  seed = 777;
-  const int rescaled = burstsToCatchKnockAfterGainChange(8.0f, 2.0f, true);
-  check(rescaled <= 3, "with the learned level rescaled, knock right after a gain cut is caught as fast");
-  seed = 777;
-  const int stale = burstsToCatchKnockAfterGainChange(8.0f, 2.0f, false);
-  check(stale > rescaled, "without rescaling the same knock is missed at first: the old level is four times too high");
-  // And a gain increase must not make ordinary noise look like knock.
-  seed = 778;
-  knock_band::Detector detector;
-  knock_band::Settings settings;
-  uint32_t now = 0;
-  for (int n = 0; n < 400; ++n) detector.update(now += 20, burst(2.0f, 12.0f, 0.0f), settings, true, 3000);
-  detector.rescale(static_cast<uint16_t>(4.0f * 256.0f));
-  bool alarm = false;
-  for (int n = 0; n < 1500; ++n) {
-    detector.update(now += 20, burst(8.0f, 12.0f, 0.0f), settings, true, 3000);
-    alarm = alarm || detector.warning();
-  }
-  check(!alarm, "thirty seconds of ordinary noise after a gain increase raise no alarm");
-  // Rescaling cannot overflow what the detector stores.
-  detector.rescale(65535);
-  detector.update(now += 20, burst(8.0f, 12.0f, 0.0f), settings, true, 3000);
-  check(detector.baseline() == 255, "an absurd ratio saturates instead of wrapping");
-}
 } // namespace
 
 int main() {
@@ -312,7 +294,7 @@ int main() {
   eachEngineSpeedGetsItsGainBack();
   aDeadSensorIsNoticed();
   aPotentiometerThatDoesNothingIsNoticed();
-  knockIsStillCaughtRightAfterAGainChange();
+  aPartWithFewerStepsIsDrivenWithinItsRange();
   if (failures == 0) printf("knock gain tests passed\n");
   return failures == 0 ? 0 : 1;
 }

@@ -143,6 +143,9 @@ On the Nano the 2.49 k went to 5 V; here it must go to the DevKit's `3V3` pin.
 swing, and the controller reports a sensor fault when the resting level is far off.
 The amplifier's gain is set by the firmware: see the next section.
 
+**Tank float**: between GPIO7 and ground, no resistor needed. Closed means fluid;
+an open switch or a broken wire reads as an empty tank.
+
 ## Knock amplifier with automatic gain
 
 Engine noise at the knock sensor is many times larger at high RPM than at idle. With a
@@ -162,10 +165,11 @@ engine noise in the lower part of the ADC's range with room above it for knock
   **bias point, not to ground**. Gain is then 1 at the bottom of the potentiometer and
   11 at the top, and the output rests at 1.65 V at every gain. If that 10 k goes to
   ground, the op amp amplifies the bias itself and the output sits on the rail.
-- **Output:** 1 k in series, then 22 nF to ground at GPIO1. The ADC samples at
-  19.2 kHz, so anything near 13 kHz would show up at the 6 kHz knock frequency; this
-  takes the edge off it (about half) for 2 dB at the knock frequency. It is a light
-  filter, not a complete one.
+- **Output:** 1 k in series, then 10 nF to ground at GPIO1 (a 16 kHz low-pass). The
+  ADC samples the knock input 38 thousand times a second, so it hears correctly up to
+  about 17 kHz; this takes the edge off what is above that, which would otherwise show
+  up as lower frequencies. It is a light filter, and it leaves both knock frequencies
+  (6 and 9.9 kHz) alone.
 - **Op amp:** on 3.3 V, rail-to-rail input and output. An op amp on 5 V could put more
   than 3.3 V on the ESP32's pin.
 - **X9C104 module:** VCC to **5 V** (the chip does not run on 3.3 V), GND to ground.
@@ -176,11 +180,15 @@ If you use a different resistor than 10 k, change `KNOCK_GAIN_AT_BOTTOM` and
 `KNOCK_GAIN_AT_TOP` in `include/pins_esp32.h`: gain at the top is 1 + 100 k / that
 resistor.
 
-The X9C104 has 100 positions, one about every 1 k (module listings sometimes say
-otherwise). It is stepped up and down by pulses and cannot be asked where it is, so the
-firmware walks it to the bottom at start-up and again whenever the engine is stopped.
-It also never lets the chip save its position: its memory is good for 100,000 saves,
-and the gain changes many times a minute.
+**How many steps the potentiometer has is a setting**, `KNOCK_GAIN_TOP_STEP` in
+`include/pins_esp32.h`, set to 30: the X9C104's datasheet says 100 positions, but this
+module measures 30 steps from end to end. It matters, because the chip is stepped up
+and down by pulses and cannot be asked where it is: the firmware counts. With the wrong
+number it would lose its place. The bench test below shows whether the number is right.
+
+The firmware walks the wiper to the bottom at start-up and again whenever the engine is
+stopped. It also never lets the chip save its position: its memory is good for 100,000
+saves, and the gain changes many times a minute.
 
 ### What the firmware does with it
 
@@ -212,41 +220,77 @@ is on the serial line (`kgain`), not on the dash yet.
 
 ### Testing it by itself
 
-The environment `esp32s3_knock_gain_test` steps the potentiometer through ten stops,
-three seconds each, and prints at each one the position, the gain it should give, the
-resistance to expect across VW and VL, and what the ADC hears (resting level, swing,
-knock-band level, clipping).
+The environment `esp32s3_knock_gain_test` steps the potentiometer from bottom to top in
+eleven stops, three seconds each, and prints at each one the position, the gain it
+should give, the resistance to expect across VW and VL, and what the ADC hears
+(resting level, swing, the level in each knock filter, the real sample rate, clipping).
 
 1. Module on its own, meter across VW and VL: the resistance should follow the printed
-   value, about 0, 11, 22 ... 99 k. That proves the three control wires.
+   value, 0, 10, 20 ... 100 k. That proves the three control wires. **If the last stop
+   reads about 30 k instead of 100 k**, the part has the datasheet's 99 steps after
+   all: set `KNOCK_GAIN_TOP_STEP` to 99.
 2. In the circuit, with a steady signal (tap near the sensor, or feed a tone): the
-   swing should grow with the gain.
+   swing should grow with the gain. A tone swept through 6 kHz and 9.9 kHz should peak
+   in "knock" and "second".
 3. The resting level should stay near 545 at every gain.
+4. "rate" should read about 38460.
 
 Flash `esp32s3_water_meth` again afterwards.
 
-**Tank float**: between GPIO7 and ground, no resistor needed. Closed means fluid;
-an open switch or a broken wire reads as an empty tank.
+## How knock is listened for
+
+The Nano looks at one 3.3 ms burst of the knock signal in every 20 ms, so a single
+knock is caught about one time in six. The ESP32 filters **every sample**, 38 thousand
+a second, all the time ([include/knock_dsp.h](../include/knock_dsp.h)):
+
+- Three filters run on each sample: a band-pass on the cylinder's knock frequency
+  (about 6 kHz for the 96 mm bore), a band-pass on its next resonance 1.66 times
+  higher (about 9.9 kHz), and a wide one from 1 to 17 kHz to compare against.
+- Every 20 ms a window the length of one knock is slid over the result and the loudest
+  position taken. The window is about 30 degrees of crank rotation: 2.5 ms at 2000 RPM,
+  1 ms at 5000. It reaches across the joins between passes, so no knock falls in a gap.
+- A hit is: louder than the level learned for this RPM (times the multiplier, plus the
+  offset: the same two settings as before), narrow-band, **and** standing out from the
+  rest of its own 20 ms. Knock is a burst; a noise floor that has simply come up, or a
+  steady whine at the knock frequency, is not.
+- Two hits within 0.6 s raise the warning, as before. A single strong hit raises it at
+  once when it is unmistakable: clearly narrow-band, or the second resonance is ringing
+  above its own learned level too.
+- The filters are designed for the sample rate the ADC is measured to deliver, and are
+  redesigned if that turns out to differ from what was asked. The knock frequency
+  setting means what it says either way.
+
+In the PC simulation (synthetic engine noise with valve clicks): 300 of 300 single
+knocks at random moments heard, 30 of 30 episodes of sustained knock caught in about
+40 ms, 30 of 30 single hard knocks caught at once, and no false alarm in ten minutes of
+normal running at three engine speeds. That is a simulation, not the engine: the
+multiplier and offset still have to be set on the car.
+
+What reaches the dash is unchanged in meaning: level, learned level and threshold in
+the same units, and the share of the sound that is in the knock band.
 
 ## First start-up checks
 
 Open the serial monitor (USB, 115200). Once a second the controller prints a line:
 
 ```
-HB t=12000 map=98.4 boostPsi=-0.3 baro=100.5 rpm=850 duty=0% hold=1 mode=0 tankLow=0 can=1 oilPsi=42.0 fuelPsi=39.5 pre=24.1 knock=0 bias=545 knockHz=19231 kgain=6.3 kpeak=96 rxOvf=0
+HB t=12000 map=98.4 boostPsi=-0.3 baro=100.5 rpm=850 duty=0% hold=1 mode=0 tankLow=0 can=1 oilPsi=42.0 fuelPsi=39.5 pre=24.1 knock=0 bias=545 knockHz=38460 klvl=14.2 kbase=13.1 k2=6.0 kshare=0.17 kgain=6.3 kpeak=96 rxOvf=0
 ```
 
 - `can=1`: the CAN module answered.
 - `map` and `rpm` without a `!` after them: the MicroSquirt's broadcast is arriving.
   A `!` means stale or missing, and the controller will not inject.
 - `oilPsi`, `fuelPsi`, `pre` without `!`: those sensors are reading.
-- `bias` near 512: the knock amplifier is resting at mid-scale.
+- `bias` near 545: the knock amplifier is resting at 1.65 V.
+- `klvl` is the knock-band level of the last 20 ms and `kbase` the level learned as
+  normal for this RPM; `k2` is the second resonance and `kshare` how much of the sound
+  is in the knock band (ordinary noise: under about 0.25; knock: well over 0.35).
 - `kgain` is the amplifier gain the firmware has chosen and `kpeak` the typical swing
   it sees; with the engine running `kpeak` should settle between about 70 and 180.
   `kgain=1.0(fixed)` means gain control is off.
-- `knockHz` within a few percent of 19231: the knock frequency setting means what it
-  says. If it reads something else, the knock frequency is off by the same ratio -
-  report the number before relying on knock detection.
+- `knockHz` is the knock samples a second the ADC really delivers, about 38460. The
+  filters follow it by themselves; if it reads far from that, say so, because it also
+  tells how fine the listening is.
 
 Then, engine off, run a pump test from the dash and check the pump runs and stops.
 
