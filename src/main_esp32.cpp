@@ -34,6 +34,7 @@
 #include "knock_agc.h"
 #include "knock_band.h"
 #include "knock_dsp.h"
+#include "knock_spectrum.h"
 #include "meth_tune.h"
 #include "pins_esp32.h"
 #include "x9c.h"
@@ -132,6 +133,17 @@ knock_dsp::PassAnalyser knockAnalyser;
 knock_dsp::Summary knockHeard;
 knock_dsp::Frame knockFrames[knock_dsp::kMaxFrames];
 adc_sampler::KnockStats knockStats;
+// The engine's real knock frequency, found from the spectrum (knock_spectrum.h). 0 until
+// it has been learned; then the knock filter sits there instead of on the bore's figure.
+knock_spectrum::Finder knockFinder;
+knock_spectrum::Snapshot knockSpectrum;
+float knockLearnedHz = 0.0f;
+float knockSavedHz = 0.0f;
+float knockToneHz = 0.0f;
+uint32_t knockSavedMs = 0;
+uint32_t knockSpectrumPrintMs = 0;
+constexpr uint32_t kKnockSaveEveryMs = 120000;
+constexpr uint32_t kKnockSpectrumPrintMs = 10000;
 bool canOnline = false;
 bool canCommandSeen = false;
 bool canCommandTimedOut = false;
@@ -191,11 +203,49 @@ float clampFloatValue(float value, float minValue, float maxValue) {
   return value;
 }
 
+// What the bore suggests the knock frequency is.
+uint16_t knockBoreHz() {
+  return knock_band::knockHzForBore(static_cast<uint8_t>(clampFloatValue(config.knock.boreMm, 40.0f, 200.0f) + 0.5f));
+}
+
+// Where the knock filter sits: on automatic, where the spectrum has shown this engine
+// rings, or the bore's figure until that is known; otherwise the frequency set by hand.
 uint16_t knockCenterHz() {
   if (config.knock.autoCenterFromBore) {
-    return knock_band::knockHzForBore(static_cast<uint8_t>(clampFloatValue(config.knock.boreMm, 40.0f, 200.0f) + 0.5f));
+    return knockLearnedHz > 0.0f ? static_cast<uint16_t>(knockLearnedHz + 0.5f) : knockBoreHz();
   }
   return static_cast<uint16_t>(clampFloatValue(config.knock.centerFreqHz, 2000.0f, 9000.0f));
+}
+
+// The learned frequency is kept in flash with the bore it belongs to.
+void loadKnockFrequency() {
+  Preferences store;
+  if (!store.begin("knockfreq", true)) return;
+  const uint16_t bore = store.getUShort("bore", 0), hz = store.getUShort("hz", 0);
+  store.end();
+  const float expected = knockBoreHz();
+  if (bore != knockBoreHz() || hz < expected * knock_spectrum::kSearchBelow || hz > expected * knock_spectrum::kSearchAbove) return;
+  knockLearnedHz = knockSavedHz = hz;
+}
+
+// Setting the frequency by hand discards what was learned: going back to automatic
+// then starts again from the bore's figure.
+void forgetKnockFrequency() {
+  knockLearnedHz = knockSavedHz = 0.0f;
+  knockFinder.begin(knockBoreHz());
+  Preferences store;
+  if (!store.begin("knockfreq", false)) return;
+  store.remove("hz");
+  store.end();
+}
+
+void saveKnockFrequency() {
+  Preferences store;
+  if (!store.begin("knockfreq", false)) return;
+  store.putUShort("bore", knockBoreHz());
+  store.putUShort("hz", static_cast<uint16_t>(knockLearnedHz + 0.5f));
+  store.end();
+  knockSavedHz = knockLearnedHz;
 }
 
 knock_dsp::Settings knockSettings() {
@@ -873,6 +923,7 @@ void handleCanFrame(unsigned long id, byte len, const byte *data) {
       const uint8_t value = constrainAndReport(data[1], 30, 250, ackStatus);
       config.knock.centerFreqHz = static_cast<float>(value) * 100.0f;
       config.knock.autoCenterFromBore = false;
+      forgetKnockFrequency();
       ackValue = value;
     } else {
       ackStatus = can_protocol::config_ack_status::INVALID_LENGTH;
@@ -1162,10 +1213,14 @@ void serviceCanBus(uint32_t now,
     hook.adaptive_threshold = knock_dsp::toByte(knockDetector.threshold());
     hook.adaptive_baseline = knock_dsp::toByte(knockDetector.baseline());
     hook.event_count = knockEventCount;
-    hook.bias_adc_div16 = can_protocol::clampU8(static_cast<int>(knockStats.bias) / 16);
+    // The dash turns these two into volts as the Nano's ADC counts them (5 V over 1024
+    // counts). They are sent in that scale, from the calibrated voltage at the pin, so
+    // "amplifier rests at" reads the true voltage on this board too.
+    const float nanoCountsPerMv = 1024.0f / 5000.0f;
+    hook.bias_adc_div16 = can_protocol::clampU8(static_cast<int>(knockStats.restMv * nanoCountsPerMv) / 16);
     hook.raw_adc_div16 = can_protocol::clampU8(knockRaw / 16);
     // Largest swing in the burst, in half counts: for setting the amplifier gain.
-    hook.envelope_level = can_protocol::clampU8((knockStats.high - knockStats.low) / 4);
+    hook.envelope_level = can_protocol::clampU8(static_cast<int>((knockStats.highMv - knockStats.lowMv) * nanoCountsPerMv) / 4);
 
     if (!transmitCanFrame(can_protocol::packKnockLiveHook(hook), "0x30B")) {
       return;
@@ -1305,6 +1360,12 @@ void setup() {
   // small: replaying the owner's LTspice simulation, 8 missed every knock at low
   // amplitudes that 2 catches. The dash can still set it.
   config.knock.thresholdOffset = 2.0f;
+  loadKnockFrequency();
+  knockFinder.begin(knockBoreHz());
+  adc_sampler::setKnockExpected(knockBoreHz());
+  if (knockLearnedHz > 0.0f) {
+    Serial.printf("BOOT: knock filter at %.0f Hz, learned earlier (the bore suggests %u)\n", knockLearnedHz, knockBoreHz());
+  }
   beginKnockGain();
   adc_sampler::setKnockLimitsMv(KNOCK_ADC_LOW_MV, KNOCK_ADC_HIGH_MV);
   adcReady = adc_sampler::begin(pins::KNOCK_SENSOR_ADC, pins::OIL_PRESSURE_ADC, pins::FUEL_PRESSURE_ADC,
@@ -1403,8 +1464,35 @@ void loop() {
   const bool mapArmed = readings.mapKpa >= config.knock.minMapKpaToArm;
   const bool knockArmed = config.knock.enabled && rpmArmed && mapArmed && !knockSensorFault;
   // The pass after a gain change spans both gains: it is not judged and not learned from.
-  if (knockPass.valid && !(knockGainAuto && knockGain.settling())) {
-    knockDetector.update(now, knockHeard, knockSettings(), knockArmed, engineRpmValid ? rpm : 0);
+  const bool knockJudged = knockPass.valid && !(knockGainAuto && knockGain.settling());
+  if (knockJudged) knockDetector.update(now, knockHeard, knockSettings(), knockArmed, engineRpmValid ? rpm : 0);
+
+  // ---- The knock frequency itself, from the spectrum (knock_spectrum.h) ----
+  if (knockFinder.expectedHz() != knockBoreHz()) {
+    // The bore setting changed: what was learned belonged to the other bore.
+    knockFinder.begin(knockBoreHz());
+    adc_sampler::setKnockExpected(knockBoreHz());
+    knockLearnedHz = 0.0f;
+  }
+  knock_spectrum::Snapshot knockBlock;
+  if (adc_sampler::takeKnockSpectrum(knockBlock)) {
+    knockSpectrum = knockBlock;
+    knockToneHz = knock_spectrum::steadyToneHz(knockSpectrum, knockBoreHz());
+    // Learned only from passes that are notable under load: more than normal at the
+    // knock frequency, narrow-band, a burst, with the engine in boost.
+    const bool underLoad = engineRpmValid && rpm >= 1500 && readings.mapValid && rpmArmed && mapArmed && !knockSensorFault;
+    knockFinder.add(knockSpectrum, knockJudged && underLoad && knockDetector.notable());
+    float moved = 0.0f;
+    if (config.knock.autoCenterFromBore && knockFinder.decide(knockCenterHz(), moved)) {
+      Serial.printf("KNOCK: filter moved from %u to %.0f Hz: that is where this engine rings (%u votes, %.0f %% agree)\n",
+                    knockCenterHz(), moved, knockFinder.votes(), knockFinder.agreement() * 100.0f);
+      knockLearnedHz = moved;
+      knockDetector.relearn();   // Levels learned through the old filter no longer apply.
+    }
+  }
+  if (knockLearnedHz > 0.0f && fabsf(knockLearnedHz - knockSavedHz) >= 50.0f && elapsed(now, knockSavedMs, kKnockSaveEveryMs)) {
+    knockSavedMs = now;
+    saveKnockFrequency();
   }
   if (knockGainAuto) {
     const bool engineStopped = !engineRpmValid || rpm == 0;
@@ -1535,10 +1623,22 @@ void loop() {
     ESP.restart();
   }
 
+  if (knockSpectrum.valid && elapsed(now, knockSpectrumPrintMs, kKnockSpectrumPrintMs)) {
+    knockSpectrumPrintMs = now;
+    // What each frequency normally carries, in dB (10 dB = ten times the power): the
+    // engine's own spectrum. Peaks that are always there are the block and steady tones.
+    Serial.print(F("KSPEC kHz:dB"));
+    for (uint8_t bin = 10; bin < knock_spectrum::kBins && bin * knockSpectrum.binHz <= 12000.0f; bin += 2) {
+      const float power = 0.5f * (knockSpectrum.floor[bin] + knockSpectrum.floor[bin + 1]);
+      Serial.printf(" %.1f:%.0f", (bin + 0.5f) * knockSpectrum.binHz / 1000.0f, 10.0f * log10f(power > 1e-6f ? power : 1e-6f));
+    }
+    Serial.println();
+  }
+
   if (elapsed(now, lastDebugMs, kSerialHeartbeatMs)) {
     lastDebugMs = now;
     Serial.printf("HB t=%lu map=%.1f%s boostPsi=%.2f baro=%.1f rpm=%u%s duty=%.0f%% hold=%u mode=%u tankLow=%d can=%d "
-                  "oilPsi=%.1f%s fuelPsi=%.1f%s pre=%.1f%s knock=%d krest=%umV knockHz=%lu klvl=%.1f kbase=%.1f k2=%.1f kshare=%.2f kgain=%.1f%s kpeak=%umV rxOvf=%lu\n",
+                  "oilPsi=%.1f%s fuelPsi=%.1f%s pre=%.1f%s knock=%d krest=%umV knockHz=%lu klvl=%.1f kbase=%.1f k2=%.1f kshare=%.2f kfreq=%u kfound=%.0f ktone=%.0f kgain=%.1f%s kpeak=%umV rxOvf=%lu\n",
                   static_cast<unsigned long>(now), readings.mapKpa, readings.mapValid ? "" : "!", readings.boostPsi,
                   config.map.baroKpa, rpm, engineRpmValid ? "" : "!", pumpDutyPercent, governor.hold(),
                   static_cast<unsigned>(config.mode), readings.tankLow ? 1 : 0, canOnline ? 1 : 0,
@@ -1546,6 +1646,7 @@ void loop() {
                   readings.fuelPressureValid ? "" : "!", preTempC, preTempValid ? "" : "!", knockDetected ? 1 : 0,
                   static_cast<unsigned>(knockStats.restMv), static_cast<unsigned long>(adc_sampler::knockSamplesPerSecond()),
                   knockDetector.level(), knockDetector.baseline(), knockDetector.second(), knockDetector.share(),
+                  knockCenterHz(), knockFinder.estimateHz(), knockToneHz,
                   knockGain.gain(), knockGainAuto ? "" : "(fixed)", static_cast<unsigned>(knockGain.typicalPeak()),
                   static_cast<unsigned long>(canRxOverflows));
   }

@@ -274,6 +274,44 @@ a second, all the time ([include/knock_dsp.h](../include/knock_dsp.h)):
   redesigned if that turns out to differ from what was asked. The knock frequency
   setting means what it says either way.
 
+### Finding the engine's real knock frequency
+
+The knock frequency the firmware starts with comes from the bore (5,970 Hz for 96 mm).
+That is a first guess: the real resonance depends on the chamber and the gas
+temperature and can be several hundred hertz away, and a filter beside the resonance
+hears knock weaker than it is. So the firmware looks at the spectrum and moves the
+filter to where this engine actually rings ([include/knock_spectrum.h](../include/knock_spectrum.h)).
+
+- Next to the knock filters, the signal is cut into overlapping 3.3 ms blocks and the
+  spectrum of each is taken: 600 spectra a second, 300 Hz apart. A noise floor is kept
+  for every frequency.
+- Every 20 ms the block that stood furthest above the floor is looked at, but **only
+  when the pass was notable under load**: the engine in boost above 1500 RPM, the
+  knock band clearly above its learned normal (1.5 times; the alarm needs 2.5), nearly
+  narrow-band, and a burst. That is the cylinder ringing: incipient knock and knock.
+  The frequency where that block peaks is one vote.
+- After 40 votes, if 60 % of them agree within 350 Hz and no second peak rivals the
+  winner, the filter moves toward it: by at least 150 Hz or not at all, by at most
+  300 Hz at a time, and never further than a fifth below or a quarter above the bore's
+  figure. The second-resonance filter moves with it.
+- After a move the detector learns its normal levels again through the moved filter
+  (half a second in each RPM range) before judging anything.
+- The learned frequency is saved in flash and used from the next start.
+
+What it will not follow, and why: valve clicks (broadband, not narrow), a resonance of
+the block that rings on every firing (it is the engine's normal sound, so never above
+normal), a steady line from the alternator or the pump's PWM (not a burst), ringing off
+boost, and two different ringings in equal measure (it does not choose). It needs the
+engine to ring under boost now and then; with none it stays on the bore's figure.
+
+In the PC simulation the filter went from 5,966 Hz to within 35 Hz of resonances
+placed at 5,400, 6,250 and 6,600 Hz, in 5 to 12 seconds of running with light ringing
+on some cycles.
+
+On the dash the knock page's "LISTENING AT" shows where the filter is. Setting the
+frequency by hand turns this off and discards what was learned; "from bore" turns it
+back on, starting again from the bore's figure.
+
 In the PC simulation (synthetic engine noise with valve clicks): 300 of 300 single
 knocks at random moments heard, 30 of 30 episodes of sustained knock caught in about
 40 ms, 30 of 30 single hard knocks caught at once, and no false alarm in ten minutes of
@@ -352,7 +390,8 @@ g++ -std=c++17 -O2 -I include tools/ltspice/ltreplay.cpp -o ltreplay
 Open the serial monitor (USB, 115200). Once a second the controller prints a line:
 
 ```
-HB t=12000 map=98.4 boostPsi=-0.3 baro=100.5 rpm=850 duty=0% hold=1 mode=0 tankLow=0 can=1 oilPsi=42.0 fuelPsi=39.5 pre=24.1 knock=0 krest=825mV knockHz=38460 klvl=14.2 kbase=13.1 k2=6.0 kshare=0.17 kgain=6.3 kpeak=150mV rxOvf=0
+HB t=12000 map=98.4 boostPsi=-0.3 baro=100.5 rpm=850 duty=0% hold=1 mode=0 tankLow=0 can=1 oilPsi=42.0 fuelPsi=39.5 pre=24.1 knock=0 krest=825mV knockHz=38460 klvl=14.2 kbase=13.1 k2=6.0 kshare=0.17 kfreq=6250 kfound=6262 ktone=0 kgain=6.3 kpeak=150mV rxOvf=0
+KSPEC kHz:dB 3.2:21 3.8:19 4.4:18 5.0:20 5.6:24 6.2:29 6.8:23 7.4:18 8.0:16 8.6:15 9.2:15 9.8:19 10.4:16 11.0:13 11.6:12
 ```
 
 - `can=1`: the CAN module answered.
@@ -364,6 +403,13 @@ HB t=12000 map=98.4 boostPsi=-0.3 baro=100.5 rpm=850 duty=0% hold=1 mode=0 tankL
 - `klvl` is the knock-band level of the last 20 ms and `kbase` the level learned as
   normal for this RPM; `k2` is the second resonance and `kshare` how much of the sound
   is in the knock band (ordinary noise: under about 0.25; knock: well over 0.35).
+- `kfreq` is where the knock filter sits; `kfound` where the votes last agreed the
+  engine rings (0 until they have). `ktone` is a steady tone found near the knock
+  frequency, 0 for none: if it shows a frequency while the pump runs, that is the
+  pump's PWM getting into the knock signal.
+- The `KSPEC` line, every ten seconds, is the spectrum itself: what each frequency
+  normally carries, in dB (10 dB is ten times the power). The engine's knock resonance
+  shows as a hump that grows under load.
 - `kgain` is the amplifier gain the firmware has chosen and `kpeak` the typical swing
   it sees either side of rest; with the engine running `kpeak` should settle between
   about 130 and 320 mV for the simulated circuit (16 to 40 % of the room between rest

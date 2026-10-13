@@ -17,6 +17,7 @@
 #include <stdint.h>
 
 #include "knock_dsp.h"
+#include "knock_spectrum.h"
 
 namespace adc_sampler {
 
@@ -46,6 +47,14 @@ bool begin(int knockPin, int oilPin, int fuelPin, int prePin, int postPin);
 // The knock frequency and band width to listen at. Cheap to call every pass: the
 // filters are redesigned only when a value changes.
 void setKnockBand(float centreHz, float bandwidthHz);
+
+// The frequency the knock is expected at (from the bore): the spectrum's search range
+// is set around it. Cheap to call every pass.
+void setKnockExpected(float expectedHz);
+
+// The spectrum of the block that stood furthest above the noise floor since the last
+// call (knock_spectrum.h). False when no block was completed in that time.
+bool takeKnockSpectrum(knock_spectrum::Snapshot &out);
 
 // The energy frames completed since the last call, oldest first. Returns how many.
 size_t takeKnockFrames(knock_dsp::Frame *out, size_t capacity);

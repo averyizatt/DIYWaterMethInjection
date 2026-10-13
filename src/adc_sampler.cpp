@@ -31,7 +31,8 @@ float statLow = 1e9f, statHigh = -1e9f, statBias = 0.0f;
 uint32_t statRailed = 0, statSamples = 0;
 uint32_t slowSum[kSlowCount] = {};
 uint32_t slowCount[kSlowCount] = {};
-float wantedCentre = 6000.0f, wantedBandwidth = 1500.0f;
+float wantedCentre = 6000.0f, wantedBandwidth = 1500.0f, wantedExpected = 6000.0f;
+knock_spectrum::Snapshot loudest;            // The pass's best block so far
 bool bandChanged = true;
 bool secondActive = false;
 volatile uint32_t lastDataMs = 0;
@@ -40,6 +41,7 @@ volatile uint32_t filterRate = kKnockRateHz;
 
 // The collecting task's own.
 knock_dsp::FrontEnd front;
+knock_spectrum::Blocks blocks;
 uint32_t knockCounted = 0;
 uint32_t rateStartMs = 0;
 uint32_t offRateSum = 0;
@@ -51,13 +53,15 @@ bool channelFor(int pin, adc_channel_t &channel) {
 }
 
 void designFilters(uint32_t rate) {
-  float centre, bandwidth;
+  float centre, bandwidth, expected;
   portENTER_CRITICAL(&lock);
   centre = wantedCentre;
   bandwidth = wantedBandwidth;
+  expected = wantedExpected;
   bandChanged = false;
   portEXIT_CRITICAL(&lock);
   front.configure(static_cast<float>(rate), centre, bandwidth);
+  blocks.configure(static_cast<float>(rate), expected);
   portENTER_CRITICAL(&lock);
   secondActive = front.secondActive();
   portEXIT_CRITICAL(&lock);
@@ -117,6 +121,7 @@ void collect(void *) {
         if (ten <= railLow || ten >= railHigh) ++railed;
         knock_dsp::Frame frame;
         if (front.push(ten, frame) && frameCount < sizeof(frames) / sizeof(frames[0])) frames[frameCount++] = frame;
+        blocks.push(ten - front.bias());
         continue;
       }
       for (uint8_t input = 0; input < kSlowCount; ++input) {
@@ -127,8 +132,11 @@ void collect(void *) {
       }
     }
     knockCounted += samples;
+    static knock_spectrum::Snapshot block;
+    const bool haveBlock = blocks.takeLoudest(block);
 
     portENTER_CRITICAL(&lock);
+    if (haveBlock && (!loudest.valid || block.standing > loudest.standing)) loudest = block;
     for (uint8_t n = 0; n < frameCount; ++n) {
       ring[(ringHead + ringCount) % kRing] = frames[n];
       if (ringCount < kRing) ++ringCount;
@@ -221,6 +229,28 @@ void setKnockBand(float centreHz, float bandwidthHz) {
     bandChanged = true;
   }
   portEXIT_CRITICAL(&lock);
+}
+
+void setKnockExpected(float expectedHz) {
+  portENTER_CRITICAL(&lock);
+  if (expectedHz != wantedExpected) {
+    wantedExpected = expectedHz;
+    bandChanged = true;
+  }
+  portEXIT_CRITICAL(&lock);
+}
+
+bool takeKnockSpectrum(knock_spectrum::Snapshot &out) {
+  bool valid;
+  portENTER_CRITICAL(&lock);
+  valid = loudest.valid;
+  if (valid) {
+    out = loudest;
+    loudest.valid = false;
+    loudest.standing = 0.0f;
+  }
+  portEXIT_CRITICAL(&lock);
+  return valid;
 }
 
 size_t takeKnockFrames(knock_dsp::Frame *out, size_t capacity) {

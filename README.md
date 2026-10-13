@@ -120,6 +120,10 @@ What the board does differently, and only this:
   resonances, a window the length of one knock slid over every 20 ms, and a hit that
   has to be loud for this RPM, narrow-band and a burst. The settings (multiplier,
   offset, frequency, band width) and what the dash is sent mean the same as on the Nano.
+- **The real knock frequency is found from the spectrum** ([include/knock_spectrum.h](include/knock_spectrum.h)):
+  600 spectra a second; the filter starts on the bore's figure and is moved to where
+  the engine actually rings, learned only from bursts under boost that rise above
+  normal, so not from valve noise, block resonances or steady tones. Kept in flash.
 - **The knock amplifier's gain is set automatically** through an X9C104 digital
   potentiometer ([include/knock_agc.h](include/knock_agc.h), [include/x9c.h](include/x9c.h)):
   normal engine noise is kept in the lower part of the ADC's range at every RPM, with
@@ -364,6 +368,12 @@ g++ -std=c++11 -I include test/test_meth_pwm/test_main.cpp -o meth_pwm_test && .
 g++ -std=c++11 -I include test/test_esp32_inputs/test_main.cpp -o esp32_inputs_test && ./esp32_inputs_test
 ```
 
+The knock spectrum and frequency finder ([test/test_knock_spectrum/test_main.cpp](test/test_knock_spectrum/test_main.cpp)):
+the spectrum's accuracy, resonances above and below the bore's figure found and
+followed, and the things that must not move the filter (noise, valve clicks, a block
+resonance on every firing, a steady tone, ringing off boost or out of range, two rival
+ringings).
+
 The ESP32's knock listening ([test/test_knock_dsp/test_main.cpp](test/test_knock_dsp/test_main.cpp)):
 filter accuracy and selectivity at several sample rates, single knocks at random
 moments, sustained knock, false alarms over ten simulated minutes, a noise floor that
@@ -375,6 +385,7 @@ sensor, a potentiometer that does nothing, and a part with fewer steps than its
 datasheet says.
 
 ```bash
+g++ -std=c++11 -O2 -I include test/test_knock_spectrum/test_main.cpp -o knock_spectrum_test && ./knock_spectrum_test
 g++ -std=c++11 -O2 -I include test/test_knock_dsp/test_main.cpp -o knock_dsp_test && ./knock_dsp_test
 g++ -std=c++11 -I include test/test_knock_agc/test_main.cpp -o knock_agc_test && ./knock_agc_test
 ```

@@ -54,6 +54,7 @@ constexpr uint8_t kSections = 3;             // Band-pass sections in a row: 18 
 constexpr float kUsableNyquist = 0.45f;      // Filters stay below this share of the sample rate
 constexpr float kBiasSeconds = 0.05f;        // How quickly the resting level is followed
 constexpr float kMinCrest = 1.5f;            // A hit stands this far above the rest of its pass
+constexpr float kNotableFactor = 1.5f;       // "Notable": this far above the learned level (hits need the multiplier)
 constexpr uint8_t kRpmBins = 8;              // Normal level learned per 1000 RPM
 
 // ---------------------------------------------------------------------------
@@ -310,6 +311,11 @@ public:
     // The second resonance is ringing too.
     confirmed_ = heard.secondActive && learned_ && second_ >= secondBaseline_[bin] * s.multiplier + s.offset;
     const bool hit = armed && learned_ && loud && narrow && standsOut;
+    // Not necessarily knock, but clearly more than normal at the knock frequency, nearly
+    // narrow-band and a burst: the passes the knock frequency is learned from
+    // (knock_spectrum.h). Whether the engine is under load is the caller's to add.
+    notable_ = learned_ && standsOut && heard.share >= s.minShare * 0.8f &&
+               level_ >= base * kNotableFactor + s.offset * 0.5f;
     const bool strong = hit && level_ >= threshold_ * 1.6f;
 
     if (hit) {
@@ -355,6 +361,15 @@ public:
     }
   }
 
+  // The knock filter was moved: levels learned through the old filter no longer
+  // describe what the new one hears. Each RPM range is learned again (half a second
+  // of running in it) before anything in it is judged.
+  void relearn() {
+    for (uint8_t bin = 0; bin < kRpmBins; ++bin) seen_[bin] = 0;
+    learned_ = false;
+    notable_ = false;
+  }
+
   void reset() { *this = Detector(); }
 
   float level() const { return level_; }
@@ -364,6 +379,7 @@ public:
   float threshold() const { return threshold_; }
   bool learned() const { return learned_; }
   bool confirmed() const { return confirmed_; }
+  bool notable() const { return notable_; }
   bool warning() const { return warning_; }
   bool critical() const { return critical_; }
 
@@ -387,6 +403,7 @@ private:
   float threshold_{1.0f};
   bool learned_{false};
   bool confirmed_{false};
+  bool notable_{false};
   bool haveHit_{false};
   bool warning_{false};
   bool critical_{false};
