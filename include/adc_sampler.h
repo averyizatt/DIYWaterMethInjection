@@ -23,6 +23,11 @@ bool begin(int knockPin, int oilPin, int fuelPin, int prePin, int postPin);
 // Returns false when no new burst has arrived since the last call.
 bool latestBurst(uint16_t out[knock_band::kSamples]);
 
+// The lowest and highest knock sample (10 bits) since the last call: every sample, not
+// only the burst that was analysed, so clipping anywhere in between is seen.
+// Returns false when no knock sample arrived in that time.
+bool knockRange(uint16_t &low, uint16_t &high);
+
 // Average pin voltage in millivolts since the last call for this input.
 // Returns false when no sample arrived in that time.
 bool averageMv(Slow input, float &millivolts);

@@ -31,6 +31,8 @@ works without the ECU.
 - Flyback diode across the pump, rated at least the pump's current (for example a 10 A
   Schottky)
 - Automotive 12 V to 5 V converter for the DevKit
+- X9C104 digital potentiometer module (100 k, 100 positions) for the knock amplifier's
+  gain, and a rail-to-rail op amp that runs on 3.3 V (MCP6002 or similar)
 - Resistors: two 10 k + two 20 k (pressure dividers), one or two 2.49 k (thermistor
   pull-ups), three 10 k (pull-downs), 100 ohm (gate), 1 k + 2 k (CAN module MISO)
 - Fuse for the pump, the size the pump's maker gives
@@ -52,6 +54,9 @@ works without the ECU.
 | Pump MOSFET gate | 15 | 100 ohm in series, 10 k from gate to ground |
 | Warning LED | 16 | high = warning; LED and resistor to ground |
 | Master pump relay (optional) | 17 | high = pump allowed; 10 k to ground at the driver |
+| Knock gain potentiometer CS | 14 | to the X9C104 module's CS |
+| Knock gain potentiometer INC | 18 | to its INC |
+| Knock gain potentiometer U/D | 21 | to its U/D |
 
 Not used on purpose: GPIO 0, 3, 45, 46 (start-up pins), 19 and 20 (USB), 26-37 (flash).
 
@@ -136,6 +141,89 @@ On the Nano the 2.49 k went to 5 V; here it must go to the DevKit's `3V3` pin.
 3.3 V to ground give that) and swing between 0 and 3.1 V. On the Nano it rested at
 2.5 V on a 5 V supply. The dash's knock page shows the resting level and the largest
 swing, and the controller reports a sensor fault when the resting level is far off.
+The amplifier's gain is set by the firmware: see the next section.
+
+## Knock amplifier with automatic gain
+
+Engine noise at the knock sensor is many times larger at high RPM than at idle. With a
+fixed gain the signal is either a few ADC counts at idle or clipping at speed. The
+firmware sets the gain itself through an X9C104 digital potentiometer, keeping normal
+engine noise in the lower part of the ADC's range with room above it for knock
+([include/knock_agc.h](../include/knock_agc.h)).
+
+### Circuit
+
+- **Bias point:** two 100 k resistors from 3.3 V to ground, with 10 uF across the lower
+  one. Everything rests at this 1.65 V.
+- **Input:** the sensor through 10 nF to the op amp's + input, which also goes to the
+  bias point through 100 k. That removes the engine's low rumble (below about 160 Hz).
+- **Gain:** the potentiometer's VW and VL terminals are the feedback resistor, from the
+  op amp's output to its - input (leave VH unconnected). 10 k from the - input to the
+  **bias point, not to ground**. Gain is then 1 at the bottom of the potentiometer and
+  11 at the top, and the output rests at 1.65 V at every gain. If that 10 k goes to
+  ground, the op amp amplifies the bias itself and the output sits on the rail.
+- **Output:** 1 k in series, then 22 nF to ground at GPIO1. The ADC samples at
+  19.2 kHz, so anything near 13 kHz would show up at the 6 kHz knock frequency; this
+  takes the edge off it (about half) for 2 dB at the knock frequency. It is a light
+  filter, not a complete one.
+- **Op amp:** on 3.3 V, rail-to-rail input and output. An op amp on 5 V could put more
+  than 3.3 V on the ESP32's pin.
+- **X9C104 module:** VCC to **5 V** (the chip does not run on 3.3 V), GND to ground.
+  CS, INC and U/D come straight from GPIO14, 18 and 21: it accepts 3.3 V signals and
+  sends nothing back.
+
+If you use a different resistor than 10 k, change `KNOCK_GAIN_AT_BOTTOM` and
+`KNOCK_GAIN_AT_TOP` in `include/pins_esp32.h`: gain at the top is 1 + 100 k / that
+resistor.
+
+The X9C104 has 100 positions, one about every 1 k (module listings sometimes say
+otherwise). It is stepped up and down by pulses and cannot be asked where it is, so the
+firmware walks it to the bottom at start-up and again whenever the engine is stopped.
+It also never lets the chip save its position: its memory is good for 100,000 saves,
+and the gain changes many times a minute.
+
+### What the firmware does with it
+
+- Every half second it looks at the typical size of the signal. Too small: gain up
+  1.5 dB. Too large: down 1.5 dB. In between it does nothing.
+- The moment the signal touches the ADC's limits it takes 3 dB off at once. It watches
+  every sample for that, not only the ones analysed for knock.
+- It remembers the gain that suited each 1000 RPM, and goes straight back to it when
+  the engine returns to that speed.
+- Passes the knock detector calls loud are left out, so knock does not turn the gain
+  down on itself.
+- When the gain changes, the detector's learned "normal" levels are rescaled by the
+  same amount, so knock right after a change is still caught. The one pass (20 ms)
+  that spans the change is not judged.
+
+Faults it reports through the usual knock sensor fault:
+
+- clipping at the lowest gain (the amplifier is too hot for this engine: use a larger
+  resistor than 10 k);
+- nothing heard at the highest gain above 2000 RPM (sensor or wiring).
+
+If changing the gain shows no effect on the signal (potentiometer not fitted, or a
+control wire off), it says so on the serial monitor and leaves the gain alone until the
+next start. For an amplifier with no potentiometer, build with `-DKNOCK_GAIN_POT=0`.
+
+The numbers on the dash's knock page (level, normal level, threshold) are measured
+after the amplifier, so all three move together when the gain changes. The gain itself
+is on the serial line (`kgain`), not on the dash yet.
+
+### Testing it by itself
+
+The environment `esp32s3_knock_gain_test` steps the potentiometer through ten stops,
+three seconds each, and prints at each one the position, the gain it should give, the
+resistance to expect across VW and VL, and what the ADC hears (resting level, swing,
+knock-band level, clipping).
+
+1. Module on its own, meter across VW and VL: the resistance should follow the printed
+   value, about 0, 11, 22 ... 99 k. That proves the three control wires.
+2. In the circuit, with a steady signal (tap near the sensor, or feed a tone): the
+   swing should grow with the gain.
+3. The resting level should stay near 545 at every gain.
+
+Flash `esp32s3_water_meth` again afterwards.
 
 **Tank float**: between GPIO7 and ground, no resistor needed. Closed means fluid;
 an open switch or a broken wire reads as an empty tank.
@@ -145,7 +233,7 @@ an open switch or a broken wire reads as an empty tank.
 Open the serial monitor (USB, 115200). Once a second the controller prints a line:
 
 ```
-HB t=12000 map=98.4 boostPsi=-0.3 baro=100.5 rpm=850 duty=0% hold=1 mode=0 tankLow=0 can=1 oilPsi=42.0 fuelPsi=39.5 pre=24.1 knock=0 bias=512 knockHz=19231 rxOvf=0
+HB t=12000 map=98.4 boostPsi=-0.3 baro=100.5 rpm=850 duty=0% hold=1 mode=0 tankLow=0 can=1 oilPsi=42.0 fuelPsi=39.5 pre=24.1 knock=0 bias=545 knockHz=19231 kgain=6.3 kpeak=96 rxOvf=0
 ```
 
 - `can=1`: the CAN module answered.
@@ -153,6 +241,9 @@ HB t=12000 map=98.4 boostPsi=-0.3 baro=100.5 rpm=850 duty=0% hold=1 mode=0 tankL
   A `!` means stale or missing, and the controller will not inject.
 - `oilPsi`, `fuelPsi`, `pre` without `!`: those sensors are reading.
 - `bias` near 512: the knock amplifier is resting at mid-scale.
+- `kgain` is the amplifier gain the firmware has chosen and `kpeak` the typical swing
+  it sees; with the engine running `kpeak` should settle between about 70 and 180.
+  `kgain=1.0(fixed)` means gain control is off.
 - `knockHz` within a few percent of 19231: the knock frequency setting means what it
   says. If it reads something else, the knock frequency is off by the same ratio -
   report the number before relying on knock detection.

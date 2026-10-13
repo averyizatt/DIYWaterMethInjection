@@ -28,9 +28,18 @@
 #include "can_contract/firmware_update.h"
 #include "ecu_broadcast.h"
 #include "injection_controller.h"
+#include "knock_agc.h"
 #include "knock_band.h"
 #include "meth_tune.h"
 #include "pins_esp32.h"
+#include "x9c.h"
+
+// The knock amplifier's gain is set by an X9C104 potentiometer and controlled
+// automatically (knock_agc.h). Build with -DKNOCK_GAIN_POT=0 for an amplifier with a
+// fixed gain; the firmware also stops by itself if changing the gain shows no effect.
+#ifndef KNOCK_GAIN_POT
+#define KNOCK_GAIN_POT 1
+#endif
 
 // Identifies this build to the dash. The published firmware is built with the first
 // eight hex digits of its commit; a build from the editor reports 0.
@@ -191,6 +200,40 @@ knock_band::Settings knockSettings() {
   s.gainX16 = static_cast<uint8_t>(clampFloatValue(config.knock.signalGain, 0.1f, 15.9f) * 16.0f + 0.5f);
   s.holdMs = config.knock.eventCooldownMs < 100 ? 100 : config.knock.eventCooldownMs;
   return s;
+}
+
+// ---------------------------------------------------------------------------
+// Knock amplifier gain (X9C104 potentiometer, x9c.h) under automatic control
+// (knock_agc.h). The chip cannot be asked where its wiper is, so it is walked to the
+// bottom at start-up and again whenever the engine is stopped.
+// ---------------------------------------------------------------------------
+struct KnockGainPins {
+  void select(bool on) { digitalWrite(pins::KNOCK_GAIN_CS, on ? LOW : HIGH); }
+  void inc(bool high) { digitalWrite(pins::KNOCK_GAIN_INC, high ? HIGH : LOW); }
+  void up(bool up) { digitalWrite(pins::KNOCK_GAIN_UD, up ? HIGH : LOW); }
+  void wait() { delayMicroseconds(5); }
+};
+KnockGainPins knockGainPins;
+x9c::Pot knockPot;
+knock_agc::Controller knockGain;
+bool knockGainAuto = false;         // False: fixed-gain amplifier, or the pot shows no effect
+uint32_t knockGainResyncMs = 0;
+constexpr uint32_t kKnockGainResyncMs = 60000;
+
+void beginKnockGain() {
+  pinMode(pins::KNOCK_GAIN_CS, OUTPUT);
+  pinMode(pins::KNOCK_GAIN_INC, OUTPUT);
+  pinMode(pins::KNOCK_GAIN_UD, OUTPUT);
+  digitalWrite(pins::KNOCK_GAIN_CS, HIGH);
+  digitalWrite(pins::KNOCK_GAIN_INC, HIGH);
+  digitalWrite(pins::KNOCK_GAIN_UD, LOW);
+  knock_agc::Circuit circuit;
+  circuit.lowGain = KNOCK_GAIN_AT_BOTTOM;
+  circuit.highGain = KNOCK_GAIN_AT_TOP;
+  circuit.topStep = x9c::kTopStep;
+  knockGain.begin(circuit, 0);       // Lowest gain first: it cannot clip there.
+  knockPot.home(knockGainPins);
+  knockGainAuto = KNOCK_GAIN_POT != 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -1246,6 +1289,7 @@ void setup() {
                      imageState == ESP_OTA_IMG_PENDING_VERIFY);
   if (updater.onTrial()) Serial.println(F("BOOT: new firmware, on trial until the dash confirms it"));
 
+  beginKnockGain();
   adcReady = adc_sampler::begin(pins::KNOCK_SENSOR_ADC, pins::OIL_PRESSURE_ADC, pins::FUEL_PRESSURE_ADC,
                                 pins::PRE_INJECTION_TEMP_ADC, pins::POST_INJECTION_TEMP_ADC);
   if (!adcReady) Serial.println(F("BOOT: analog inputs did not start; knock and pressures unavailable"));
@@ -1319,15 +1363,47 @@ void loop() {
     knockBurst = knock_band::analyze(knockSamples, knock_band::centerBinFor(knockCenterHz()),
                                      config.knock.bandwidthHz < 1000.0f ? 1 : 2);
   }
+  uint16_t knockLow = 0, knockHigh = 0;
+  const bool knockRangeFresh = adc_sampler::knockRange(knockLow, knockHigh);
   const bool knockInputDead = !adcReady || adc_sampler::silentForMs(now) > 500;
   const int knockRaw = knockSamples[knock_band::kSamples - 1];
-  knockClippingDetected = knockBurst.railed >= knock_band::kSamples / 3;
+  // With automatic gain a clipped burst is the gain control's business (it backs off at
+  // once); it is a fault only when it clips with no gain left to take off, or when
+  // nothing is heard at full gain with the engine at speed.
+  knockClippingDetected = knockGainAuto ? knockGain.overloaded() : knockBurst.railed >= knock_band::kSamples / 3;
   knockSensorFault = knockInputDead || knockClippingDetected || knockBurst.bias < kKnockBiasLowAdc ||
-                     knockBurst.bias > kKnockBiasHighAdc;
+                     knockBurst.bias > kKnockBiasHighAdc || (knockGainAuto && knockGain.silent());
   const bool rpmArmed = config.knock.minRpmToArm == 0 || rpm >= config.knock.minRpmToArm;
   const bool mapArmed = readings.mapKpa >= config.knock.minMapKpaToArm;
   const bool knockArmed = config.knock.enabled && rpmArmed && mapArmed && !knockSensorFault;
-  knockDetector.update(now, knockBurst, knockSettings(), knockArmed, engineRpmValid ? rpm : 0);
+  // The pass after a gain change spans both gains: it is not judged and not learned from.
+  if (!(knockGainAuto && knockGain.settling())) {
+    knockDetector.update(now, knockBurst, knockSettings(), knockArmed, engineRpmValid ? rpm : 0);
+  }
+  if (knockGainAuto) {
+    const bool engineStopped = !engineRpmValid || rpm == 0;
+    if (engineStopped && elapsed(now, knockGainResyncMs, kKnockGainResyncMs)) {
+      // Nothing to listen to: a good moment to make sure the wiper is where it is thought to be.
+      knockGainResyncMs = now;
+      knockPot.resync(knockGainPins, knockGain.step());
+    } else if (knockRangeFresh) {
+      knock_agc::Sample sample;
+      sample.low = knockLow;
+      sample.high = knockHigh;
+      sample.rpm = rpm;
+      sample.rpmValid = engineRpmValid;
+      sample.knocking = knockDetector.learned() && knockDetector.level() >= knockDetector.threshold();
+      if (knockGain.update(sample)) {
+        knockPot.moveTo(knockGainPins, knockGain.step());
+        knockDetector.rescale(knockGain.ratioX256());
+      }
+      if (knockGain.ineffective()) {
+        knockGainAuto = false;
+        Serial.println(F("KNOCK: changing the amplifier gain shows no effect (potentiometer not fitted or not "
+                         "working); gain control is off until the next start"));
+      }
+    }
+  }
   knockBaselineLearned = knockDetector.learned();
   knockSignalValid = knockArmed && knockBaselineLearned;
   knockWarningActive = knockDetector.warning();
@@ -1435,13 +1511,14 @@ void loop() {
   if (elapsed(now, lastDebugMs, kSerialHeartbeatMs)) {
     lastDebugMs = now;
     Serial.printf("HB t=%lu map=%.1f%s boostPsi=%.2f baro=%.1f rpm=%u%s duty=%.0f%% hold=%u mode=%u tankLow=%d can=%d "
-                  "oilPsi=%.1f%s fuelPsi=%.1f%s pre=%.1f%s knock=%d bias=%u knockHz=%lu rxOvf=%lu\n",
+                  "oilPsi=%.1f%s fuelPsi=%.1f%s pre=%.1f%s knock=%d bias=%u knockHz=%lu kgain=%.1f%s kpeak=%u rxOvf=%lu\n",
                   static_cast<unsigned long>(now), readings.mapKpa, readings.mapValid ? "" : "!", readings.boostPsi,
                   config.map.baroKpa, rpm, engineRpmValid ? "" : "!", pumpDutyPercent, governor.hold(),
                   static_cast<unsigned>(config.mode), readings.tankLow ? 1 : 0, canOnline ? 1 : 0,
                   readings.oilPressurePsi, readings.oilPressureValid ? "" : "!", readings.fuelPressurePsi,
                   readings.fuelPressureValid ? "" : "!", preTempC, preTempValid ? "" : "!", knockDetected ? 1 : 0,
                   knockBurst.bias, static_cast<unsigned long>(adc_sampler::knockSamplesPerSecond()),
+                  knockGain.gain(), knockGainAuto ? "" : "(fixed)", knockGain.typicalPeak(),
                   static_cast<unsigned long>(canRxOverflows));
   }
 }

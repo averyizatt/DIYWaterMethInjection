@@ -27,6 +27,8 @@ uint32_t slowCount[kSlowCount] = {};
 volatile uint32_t lastDataMs = 0;
 volatile uint32_t knockRate = 0;
 uint32_t knockCounted = 0;
+uint16_t rangeLow = 0xFFFF;   // Lowest and highest knock sample since knockRange() was last called
+uint16_t rangeHigh = 0;
 uint32_t rateStartMs = 0;
 
 bool channelFor(int pin, adc_channel_t &channel) {
@@ -52,7 +54,14 @@ void collect(void *) {
       const uint16_t raw = sample->type2.data;   // 12 bits
       if (channel == knockChannel) {
         ++knockCounted;
-        filling[fillCount++] = raw >> 2;         // 10 bits, as the knock maths expects
+        const uint16_t ten = raw >> 2;           // 10 bits, as the knock maths expects
+        if (ten < rangeLow || ten > rangeHigh) {
+          portENTER_CRITICAL(&lock);
+          if (ten < rangeLow) rangeLow = ten;
+          if (ten > rangeHigh) rangeHigh = ten;
+          portEXIT_CRITICAL(&lock);
+        }
+        filling[fillCount++] = ten;
         if (fillCount == knock_band::kSamples) {
           fillCount = 0;
           portENTER_CRITICAL(&lock);
@@ -123,6 +132,16 @@ bool latestBurst(uint16_t out[knock_band::kSamples]) {
   }
   portEXIT_CRITICAL(&lock);
   return fresh;
+}
+
+bool knockRange(uint16_t &low, uint16_t &high) {
+  portENTER_CRITICAL(&lock);
+  low = rangeLow;
+  high = rangeHigh;
+  rangeLow = 0xFFFF;
+  rangeHigh = 0;
+  portEXIT_CRITICAL(&lock);
+  return low <= high;
 }
 
 bool averageMv(Slow input, float &millivolts) {

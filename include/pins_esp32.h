@@ -29,7 +29,20 @@ constexpr int WARNING_LED = 16;            // High = warning
 // few seconds after it, so a MOSFET that has failed "on" cannot run the pump. Also
 // needs a 10k pull-down at the relay driver's input.
 constexpr int PUMP_RELAY_OUT = 17;
+
+// Knock amplifier gain: X9C104 digital potentiometer module (5 V supply; these three
+// are 3.3 V outputs to its inputs, nothing comes back). See x9c.h.
+constexpr int KNOCK_GAIN_CS = 14;
+constexpr int KNOCK_GAIN_INC = 18;
+constexpr int KNOCK_GAIN_UD = 21;
 } // namespace pins
+
+// The knock amplifier's gain at the potentiometer's bottom and top positions. For a
+// non-inverting stage with the potentiometer (100k, terminals VW and VL) as the feedback
+// resistor and 10k from the inverting input to the 1.65 V bias point: 1 + 100k/10k.
+// Change these two if your resistor is different; nothing else depends on the circuit.
+constexpr float KNOCK_GAIN_AT_BOTTOM = 1.0f;
+constexpr float KNOCK_GAIN_AT_TOP = 11.0f;
 
 // Pump PWM. Low enough for any MOSFET module to switch cleanly from a 3.3 V gate
 // signal, high enough that the pump runs smoothly.

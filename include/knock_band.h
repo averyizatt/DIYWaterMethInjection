@@ -198,6 +198,16 @@ public:
 
   void reset() { *this = Detector(); }
 
+  // The amplifier's gain changed by this ratio (x256). Everything learned is in ADC
+  // units at the old gain, so it moves with the gain: "louder than normal" then means
+  // the same before and after. Used by the ESP32 board's automatic gain (knock_agc.h).
+  void rescale(uint16_t ratioX256) {
+    for (uint8_t bin = 0; bin < kRpmBins; ++bin) {
+      const uint32_t scaled = (static_cast<uint32_t>(baseline_[bin]) * ratioX256 + 128) / 256;
+      baseline_[bin] = scaled > (255UL << 4) ? static_cast<uint16_t>(255U << 4) : static_cast<uint16_t>(scaled);
+    }
+  }
+
   uint8_t level() const { return level_; }
   uint8_t share() const { return share_; }
   uint8_t baseline() const { return baselineNow_; }

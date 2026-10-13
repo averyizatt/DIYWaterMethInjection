@@ -115,6 +115,11 @@ What the board does differently, and only this:
 - Knock, pressures and temperatures are sampled by the ADC's own timer
   ([src/adc_sampler.cpp](src/adc_sampler.cpp)): the knock input at 19.2 kHz, the same
   rate the Nano used, so the knock settings mean the same thing.
+- **The knock amplifier's gain is set automatically** through an X9C104 digital
+  potentiometer ([include/knock_agc.h](include/knock_agc.h), [include/x9c.h](include/x9c.h)):
+  normal engine noise is kept in the lower part of the ADC's range at every RPM, with
+  room above it for knock, and the detector's learned levels follow each gain change.
+  Circuit and bench test: [docs/ESP32_HARDWARE.md](docs/ESP32_HARDWARE.md).
 - Settings are saved in the ESP32's flash instead of EEPROM.
 - **Firmware updates over CAN** from the dash (`0x680`/`0x681`, module 3), refused
   while the pump runs or boost is near, with the pump held off during the transfer.
@@ -349,6 +354,15 @@ broadcast decoding and sensor scaling
 ```bash
 g++ -std=c++11 -I include test/test_meth_pwm/test_main.cpp -o meth_pwm_test && ./meth_pwm_test
 g++ -std=c++11 -I include test/test_esp32_inputs/test_main.cpp -o esp32_inputs_test && ./esp32_inputs_test
+```
+
+The automatic knock gain and its potentiometer driver
+([test/test_knock_agc/test_main.cpp](test/test_knock_agc/test_main.cpp)): convergence
+without hunting, clipping, knock not steering the gain, gain remembered per RPM, a dead
+sensor, a potentiometer that does nothing, and knock caught right after a gain change.
+
+```bash
+g++ -std=c++11 -I include test/test_knock_agc/test_main.cpp -o knock_agc_test && ./knock_agc_test
 ```
 
 The knock listening logic has a host test

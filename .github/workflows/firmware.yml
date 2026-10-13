@@ -51,7 +51,7 @@ jobs:
       - name: Host tests
         working-directory: DIYWaterMethInjection
         run: |
-          for name in test_meth_tune test_meth_pwm test_esp32_inputs test_knock_band; do
+          for name in test_meth_tune test_meth_pwm test_esp32_inputs test_knock_band test_knock_agc; do
             g++ -std=c++11 -Wall -I include test/$name/test_main.cpp -o /tmp/$name && /tmp/$name
           done
 
@@ -64,9 +64,9 @@ jobs:
           mkdir -p out
           cp .pio/build/arduino_nano/firmware.hex out/nano-firmware.hex
 
-      - name: Build the pump driver bench test
+      - name: Build the bench tests
         working-directory: DIYWaterMethInjection
-        run: pio run -e esp32s3_pump_test
+        run: pio run -e esp32s3_pump_test -e esp32s3_knock_gain_test
 
       # The build number the controller reports to the dash: the first eight hex digits of the commit.
       - name: Build the ESP32-S3 firmware
