@@ -164,8 +164,6 @@ bool engineRuntimeMapValid = false;
 
 constexpr float kPsiPerKpa = 0.1450377f;
 // The amplifier should rest near mid-scale; far from it the sensor is not being heard.
-constexpr uint16_t kKnockBiasLowAdc = 150;
-constexpr uint16_t kKnockBiasHighAdc = 870;
 constexpr uint32_t kCanRetryMs = 2000;
 constexpr uint32_t kCanCommandTimeoutMs = 3000;
 constexpr uint32_t kManualTestTimeoutMs = 5000;
@@ -241,6 +239,8 @@ void beginKnockGain() {
   circuit.lowGain = KNOCK_GAIN_AT_BOTTOM;
   circuit.highGain = KNOCK_GAIN_AT_TOP;
   circuit.topStep = KNOCK_GAIN_TOP_STEP;
+  circuit.railLow = KNOCK_ADC_LOW_MV;
+  circuit.railHigh = KNOCK_ADC_HIGH_MV;
   knockPot.setTopStep(KNOCK_GAIN_TOP_STEP);
   knockGain.begin(circuit, 0);       // Lowest gain first: it cannot clip there.
   knockPot.home(knockGainPins);
@@ -1300,7 +1300,13 @@ void setup() {
                      imageState == ESP_OTA_IMG_PENDING_VERIFY);
   if (updater.onTrial()) Serial.println(F("BOOT: new firmware, on trial until the dash confirms it"));
 
+  // On the Nano the threshold offset covers its coarse measurement (8 half counts).
+  // This board measures finely, and an offset that size hides knock when the signal is
+  // small: replaying the owner's LTspice simulation, 8 missed every knock at low
+  // amplitudes that 2 catches. The dash can still set it.
+  config.knock.thresholdOffset = 2.0f;
   beginKnockGain();
+  adc_sampler::setKnockLimitsMv(KNOCK_ADC_LOW_MV, KNOCK_ADC_HIGH_MV);
   adcReady = adc_sampler::begin(pins::KNOCK_SENSOR_ADC, pins::OIL_PRESSURE_ADC, pins::FUEL_PRESSURE_ADC,
                                 pins::PRE_INJECTION_TEMP_ADC, pins::POST_INJECTION_TEMP_ADC);
   if (!adcReady) Serial.println(F("BOOT: analog inputs did not start; knock and pressures unavailable"));
@@ -1387,8 +1393,12 @@ void loop() {
   // nothing is heard at full gain with the engine at speed.
   knockClippingDetected = knockGainAuto ? knockGain.overloaded()
                                         : knockStats.samples > 0 && knockStats.railed * 3 >= knockStats.samples;
-  knockSensorFault = knockInputDead || knockClippingDetected || knockStats.bias < kKnockBiasLowAdc ||
-                     knockStats.bias > kKnockBiasHighAdc || (knockGainAuto && knockGain.silent());
+  // The amplifier should rest well inside what it can reach; far from that, the sensor
+  // is not being heard.
+  const float knockReach = KNOCK_ADC_HIGH_MV - KNOCK_ADC_LOW_MV;
+  const bool knockRestWrong = knockStats.restMv < KNOCK_ADC_LOW_MV + 0.2f * knockReach ||
+                              knockStats.restMv > KNOCK_ADC_HIGH_MV - 0.2f * knockReach;
+  knockSensorFault = knockInputDead || knockClippingDetected || knockRestWrong || (knockGainAuto && knockGain.silent());
   const bool rpmArmed = config.knock.minRpmToArm == 0 || rpm >= config.knock.minRpmToArm;
   const bool mapArmed = readings.mapKpa >= config.knock.minMapKpaToArm;
   const bool knockArmed = config.knock.enabled && rpmArmed && mapArmed && !knockSensorFault;
@@ -1404,8 +1414,9 @@ void loop() {
       knockPot.resync(knockGainPins, knockGain.step());
     } else if (knockRangeFresh) {
       knock_agc::Sample sample;
-      sample.low = knockStats.low;
-      sample.high = knockStats.high;
+      sample.low = knockStats.lowMv;
+      sample.high = knockStats.highMv;
+      sample.rest = knockStats.restMv;
       sample.rpm = rpm;
       sample.rpmValid = engineRpmValid;
       sample.knocking = knockDetector.learned() && knockDetector.level() >= knockDetector.threshold();
@@ -1527,15 +1538,15 @@ void loop() {
   if (elapsed(now, lastDebugMs, kSerialHeartbeatMs)) {
     lastDebugMs = now;
     Serial.printf("HB t=%lu map=%.1f%s boostPsi=%.2f baro=%.1f rpm=%u%s duty=%.0f%% hold=%u mode=%u tankLow=%d can=%d "
-                  "oilPsi=%.1f%s fuelPsi=%.1f%s pre=%.1f%s knock=%d bias=%u knockHz=%lu klvl=%.1f kbase=%.1f k2=%.1f kshare=%.2f kgain=%.1f%s kpeak=%u rxOvf=%lu\n",
+                  "oilPsi=%.1f%s fuelPsi=%.1f%s pre=%.1f%s knock=%d krest=%umV knockHz=%lu klvl=%.1f kbase=%.1f k2=%.1f kshare=%.2f kgain=%.1f%s kpeak=%umV rxOvf=%lu\n",
                   static_cast<unsigned long>(now), readings.mapKpa, readings.mapValid ? "" : "!", readings.boostPsi,
                   config.map.baroKpa, rpm, engineRpmValid ? "" : "!", pumpDutyPercent, governor.hold(),
                   static_cast<unsigned>(config.mode), readings.tankLow ? 1 : 0, canOnline ? 1 : 0,
                   readings.oilPressurePsi, readings.oilPressureValid ? "" : "!", readings.fuelPressurePsi,
                   readings.fuelPressureValid ? "" : "!", preTempC, preTempValid ? "" : "!", knockDetected ? 1 : 0,
-                  static_cast<unsigned>(knockStats.bias), static_cast<unsigned long>(adc_sampler::knockSamplesPerSecond()),
+                  static_cast<unsigned>(knockStats.restMv), static_cast<unsigned long>(adc_sampler::knockSamplesPerSecond()),
                   knockDetector.level(), knockDetector.baseline(), knockDetector.second(), knockDetector.share(),
-                  knockGain.gain(), knockGainAuto ? "" : "(fixed)", knockGain.typicalPeak(),
+                  knockGain.gain(), knockGainAuto ? "" : "(fixed)", static_cast<unsigned>(knockGain.typicalPeak()),
                   static_cast<unsigned long>(canRxOverflows));
   }
 }

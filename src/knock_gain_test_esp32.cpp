@@ -5,7 +5,7 @@
 // seconds at each stop, and goes round again. At each stop it prints what the firmware
 // believes and what the ADC actually hears:
 //
-//   step 12 of 30  gain 5.0x  about 40 kohm VW-VL | rest 548  swing 131  knock 37.2  second 9.1  rate 38460
+//   step 12 of 30  gain 5.0x  about 40 kohm VW-VL | rest 826 mV  swing 131 mV  knock 37.2  second 9.1  rate 38460
 //
 //   - With a meter across VW and VL (module out of the circuit): the resistance should
 //     follow the printed value, and read the full 100 k at the last stop. If the last
@@ -13,7 +13,9 @@
 //     KNOCK_GAIN_TOP_STEP in include/pins_esp32.h. That also proves the control wires.
 //   - In the circuit with a steady signal (tap the sensor, or feed a tone): "swing"
 //     should grow in step with the gain. That proves the amplifier.
-//   - "rest" should stay near 545 (1.65 V) at every gain. If it moves with the gain,
+//   - "rest" is the voltage the amplifier sits at on the ADC pin; "swing" how far the
+//     signal goes either side. Rest should match the circuit (825 mV for 1.65 V through
+//     a 10k / 10k divider) and stay put at every gain. If it moves a lot with the gain,
 //     the amplifier is amplifying its bias: see docs/ESP32_HARDWARE.md.
 //   - "knock" and "second" are the loudest levels heard in the two knock filters (about
 //     6 and 9.9 kHz); a tone swept through those frequencies should peak there.
@@ -46,7 +48,7 @@ bool adcReady = false;
 uint8_t stop = 0;
 uint32_t stopStartedMs = 0;
 uint32_t printedMs = 0;
-uint16_t low = 0xFFFF, high = 0;
+float low = 1e9f, high = -1e9f;
 float rest = 0.0f, loudest = 0.0f, loudestSecond = 0.0f;
 bool heardAnything = false;
 
@@ -55,8 +57,8 @@ uint8_t stepAt(uint8_t index) {
 }
 
 void forget() {
-  low = 0xFFFF;
-  high = 0;
+  low = 1e9f;
+  high = -1e9f;
   loudest = loudestSecond = 0.0f;
   heardAnything = false;
 }
@@ -91,6 +93,9 @@ void setup() {
   Serial.printf("KNOCK GAIN TEST: X9C104 on CS=GPIO%d INC=GPIO%d U/D=GPIO%d, %u steps; knock input GPIO%d.\n",
                 pins::KNOCK_GAIN_CS, pins::KNOCK_GAIN_INC, pins::KNOCK_GAIN_UD, static_cast<unsigned>(KNOCK_GAIN_TOP_STEP),
                 pins::KNOCK_SENSOR_ADC);
+  circuit.railLow = KNOCK_ADC_LOW_MV;
+  circuit.railHigh = KNOCK_ADC_HIGH_MV;
+  adc_sampler::setKnockLimitsMv(KNOCK_ADC_LOW_MV, KNOCK_ADC_HIGH_MV);
   adcReady = adc_sampler::begin(pins::KNOCK_SENSOR_ADC, pins::OIL_PRESSURE_ADC, pins::FUEL_PRESSURE_ADC,
                                 pins::PRE_INJECTION_TEMP_ADC, pins::POST_INJECTION_TEMP_ADC);
   if (!adcReady) Serial.println("The ADC did not start: the potentiometer is still stepped, but nothing is measured.");
@@ -104,9 +109,9 @@ void loop() {
   const uint32_t now = millis();
   adc_sampler::KnockStats stats;
   if (adc_sampler::takeKnockStats(stats)) {
-    if (stats.low < low) low = stats.low;
-    if (stats.high > high) high = stats.high;
-    rest = stats.bias;
+    if (stats.lowMv < low) low = stats.lowMv;
+    if (stats.highMv > high) high = stats.highMv;
+    rest = stats.restMv;
     heardAnything = true;
   }
   const size_t count = adc_sampler::takeKnockFrames(frames, knock_dsp::kMaxFrames);
@@ -123,8 +128,9 @@ void loop() {
     Serial.printf("step %2u of %u  gain %4.1fx  about %3u kohm VW-VL", step, static_cast<unsigned>(KNOCK_GAIN_TOP_STEP),
                   knock_agc::gainAt(circuit, step), static_cast<unsigned>(100U * step / KNOCK_GAIN_TOP_STEP));
     if (adcReady && heardAnything) {
-      const bool clipped = low <= knock_agc::kClipLow || high >= knock_agc::kClipHigh;
-      Serial.printf(" | rest %4u  swing %3u  knock %5.1f  second %5.1f  rate %lu%s\n", static_cast<unsigned>(rest),
+      const float margin = (KNOCK_ADC_HIGH_MV - KNOCK_ADC_LOW_MV) * knock_agc::kClipMargin;
+      const bool clipped = low <= KNOCK_ADC_LOW_MV + margin || high >= KNOCK_ADC_HIGH_MV - margin;
+      Serial.printf(" | rest %4u mV  swing %4u mV  knock %5.1f  second %5.1f  rate %lu%s\n", static_cast<unsigned>(rest),
                     static_cast<unsigned>((high - low) / 2), loudest, loudestSecond,
                     static_cast<unsigned long>(adc_sampler::knockSamplesPerSecond()), clipped ? "  CLIPPED" : "");
     } else {

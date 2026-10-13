@@ -158,20 +158,30 @@ engine noise in the lower part of the ADC's range with room above it for knock
 
 - **Bias point:** two 100 k resistors from 3.3 V to ground, with 10 uF across the lower
   one. Everything rests at this 1.65 V.
-- **Input:** the sensor through 10 nF to the op amp's + input, which also goes to the
-  bias point through 100 k. That removes the engine's low rumble (below about 160 Hz).
+- **Input:** the sensor through a capacitor to the op amp's + input, which also goes to
+  the bias point through a resistor. Together with the sensor's own capacitance this
+  is a high-pass. The simulated values, 1.5 nF and 47 k with a 1.35 nF sensor and
+  cable, put its corner at 4.8 kHz: it removes rumble well, but it sits just under the
+  6 kHz knock frequency, costs about 2 dB there, and moves with the sensor's
+  capacitance, which is not known for this part. 10 nF and 100 k put the corner near
+  1.3 kHz, clear of the knock band.
 - **Gain:** the potentiometer's VW and VL terminals are the feedback resistor, from the
   op amp's output to its - input (leave VH unconnected). 10 k from the - input to the
   **bias point, not to ground**. Gain is then 1 at the bottom of the potentiometer and
   11 at the top, and the output rests at 1.65 V at every gain. If that 10 k goes to
   ground, the op amp amplifies the bias itself and the output sits on the rail.
-- **Output:** 1 k in series, then 10 nF to ground at GPIO1 (a 16 kHz low-pass). The
-  ADC samples the knock input 38 thousand times a second, so it hears correctly up to
-  about 17 kHz; this takes the edge off what is above that, which would otherwise show
-  up as lower frequencies. It is a light filter, and it leaves both knock frequencies
-  (6 and 9.9 kHz) alone.
-- **Op amp:** on 3.3 V, rail-to-rail input and output. An op amp on 5 V could put more
-  than 3.3 V on the ESP32's pin.
+- **Op amp and output, as simulated in LTspice:** an LM358 on 5 V. Its output goes from
+  about 0.05 to 3.6 V, which is more than the ESP32's pin may see, so it reaches GPIO1
+  through a divider: 10 k in series, 10 k to ground, 2.2 nF to ground (a 14 kHz
+  low-pass). The pin then rests at 825 mV and can go from 25 to 1800 mV. Those two
+  limits are `KNOCK_ADC_LOW_MV` and `KNOCK_ADC_HIGH_MV` in `include/pins_esp32.h`; the
+  gain control needs them to recognise clipping, because 1800 mV is nowhere near the
+  top of the ADC's own range.
+- **A better divider for the same op amp:** 3.3 k in series, 15 k to ground, 3.9 nF to
+  ground. The pin rests at 1.35 V and can go from 40 to 2950 mV: 64 % more signal for
+  the ADC to work with, and still safe. Set the two limits to 40 and 2950.
+- **Or a rail-to-rail op amp on 3.3 V** straight to the pin through 1 k, with 10 nF to
+  ground: limits 20 and 3100.
 - **X9C104 module:** VCC to **5 V** (the chip does not run on 3.3 V), GND to ground.
   CS, INC and U/D come straight from GPIO14, 18 and 21: it accepts 3.3 V signals and
   sends nothing back.
@@ -232,7 +242,8 @@ should give, the resistance to expect across VW and VL, and what the ADC hears
 2. In the circuit, with a steady signal (tap near the sensor, or feed a tone): the
    swing should grow with the gain. A tone swept through 6 kHz and 9.9 kHz should peak
    in "knock" and "second".
-3. The resting level should stay near 545 at every gain.
+3. "rest" should match the circuit (about 825 mV with the 10 k / 10 k divider) and stay
+   put at every gain.
 4. "rate" should read about 38460.
 
 Flash `esp32s3_water_meth` again afterwards.
@@ -269,25 +280,93 @@ multiplier and offset still have to be set on the car.
 What reaches the dash is unchanged in meaning: level, learned level and threshold in
 the same units, and the share of the sound that is in the knock band.
 
+## What the LTspice simulation shows
+
+`Knock_Bosch_0261231183_Sweep` (five feedback resistors, six source amplitudes, 3000
+RPM with three knocks) was replayed through the firmware's own code: the simulated ADC
+voltage sampled as the ESP32 samples it, through the knock filters, the detector and
+the gain control with the 30-step potentiometer (`tools/ltspice`, below).
+
+With a **fixed gain**, each resistor only works over a narrow range of sensor signal:
+too little gain and the knocks are lost in the measurement, too much and the amplifier
+clips. Knocks caught of the three (W = warning raised, k = the amplifier clips at the
+knocks, c = it clips all the time):
+
+| Sensor signal | gain 1.47 | gain 2.0 | gain 3.2 | gain 5.7 | gain 11 |
+|---|---|---|---|---|---|
+| x0.25 | 0 | 0 | 0 | 1 | 3 W |
+| x0.5 | 0 | 0 | 1 | 3 W | 3 W |
+| x1 | 1 | 3 W | 3 W | 3 W | 3 W k |
+| x2 | 3 W | 3 W | 3 W | 3 W k | 3 W k |
+| x5 | 3 W | 3 W k | 3 W k | 0 k | 0 c |
+| x10 | 3 W k | 3 W k | 0 k | 0 c | 0 c |
+
+With the **potentiometer under automatic control** all three knocks are caught at every
+amplitude, a 40 to 1 range, without clipping except slightly at the largest:
+
+| Sensor signal | Gain it settles at | Normal swing at the pin | Knocks caught |
+|---|---|---|---|
+| x0.25 | 11 (the top) | 51 mV | 3 of 3 |
+| x0.5 | 11 (the top) | 103 mV | 3 of 3 |
+| x1 | 8.0 | 150 mV | 3 of 3 |
+| x2 | 4.0 | 150 mV | 3 of 3 |
+| x5 | 1.7 | 156 mV | 3 of 3 |
+| x10 | 1.0 (the bottom) | 187 mV | 3 of 3, clipping at the knocks |
+
+What follows from it:
+
+- **Gain 1 to 11 (RG = 10 k) suits a sensor signal between about the simulation's x1 and
+  x10.** Below x1 the gain control runs out of gain; above x10 it runs out of
+  attenuation. Which of those the real engine is, only the engine can say: read
+  `kgain` and `kpeak` on the serial line at idle and at high RPM. If `kgain` sits at
+  11, use a smaller RG (4.7 k gives 1 to 22). If it sits at 1 and still clips, the
+  signal needs attenuating before the amplifier.
+- **The detector's threshold offset mattered more than the gain.** With the Nano's
+  offset of 8 no knock was caught at x0.25 and one of three at x0.5; with 2 all are.
+  The ESP32 firmware now starts at 2.
+- The weakest of the three knocks is only 1.1 to 1.2 times the threshold with the
+  default multiplier of 2.5. In the simulation the knocks are about three times the
+  normal ringing at each firing; a real engine's ratio is what the multiplier has to
+  be set for.
+
+What the simulation is not: a model of this exact sensor. Its capacitance (1.15 nF) and
+sensitivity are borrowed from a related Bosch part, as the simulation's own notes say,
+and its signal sizes and knock sizes are invented. Two measurements would make it real:
+the sensor's capacitance with a meter, and `kpeak` / `kgain` from the running engine.
+
+To replay a simulation again after changing it (the LTspice `.raw` file must have been
+saved with `V(adc)`, `V(vout)` and `V(sensor)`):
+
+```bash
+python tools/ltspice/ltraw.py path/to/Knock_Bosch_0261231183_Sweep.raw waves
+g++ -std=c++17 -O2 -I include tools/ltspice/ltreplay.cpp -o ltreplay
+./ltreplay waves            # as built: 10k/10k divider, offset 2, gain 1 to 11
+./ltreplay waves 0.82 2 22  # 3.3k/15k divider, offset 2, gain 1 to 22
+```
+
 ## First start-up checks
 
 Open the serial monitor (USB, 115200). Once a second the controller prints a line:
 
 ```
-HB t=12000 map=98.4 boostPsi=-0.3 baro=100.5 rpm=850 duty=0% hold=1 mode=0 tankLow=0 can=1 oilPsi=42.0 fuelPsi=39.5 pre=24.1 knock=0 bias=545 knockHz=38460 klvl=14.2 kbase=13.1 k2=6.0 kshare=0.17 kgain=6.3 kpeak=96 rxOvf=0
+HB t=12000 map=98.4 boostPsi=-0.3 baro=100.5 rpm=850 duty=0% hold=1 mode=0 tankLow=0 can=1 oilPsi=42.0 fuelPsi=39.5 pre=24.1 knock=0 krest=825mV knockHz=38460 klvl=14.2 kbase=13.1 k2=6.0 kshare=0.17 kgain=6.3 kpeak=150mV rxOvf=0
 ```
 
 - `can=1`: the CAN module answered.
 - `map` and `rpm` without a `!` after them: the MicroSquirt's broadcast is arriving.
   A `!` means stale or missing, and the controller will not inject.
 - `oilPsi`, `fuelPsi`, `pre` without `!`: those sensors are reading.
-- `bias` near 545: the knock amplifier is resting at 1.65 V.
+- `krest` is where the knock amplifier rests at the pin: 825 mV for the simulated
+  circuit.
 - `klvl` is the knock-band level of the last 20 ms and `kbase` the level learned as
   normal for this RPM; `k2` is the second resonance and `kshare` how much of the sound
   is in the knock band (ordinary noise: under about 0.25; knock: well over 0.35).
 - `kgain` is the amplifier gain the firmware has chosen and `kpeak` the typical swing
-  it sees; with the engine running `kpeak` should settle between about 70 and 180.
-  `kgain=1.0(fixed)` means gain control is off.
+  it sees either side of rest; with the engine running `kpeak` should settle between
+  about 130 and 320 mV for the simulated circuit (16 to 40 % of the room between rest
+  and the nearer limit). `kgain=1.0(fixed)` means gain control is off. **`kpeak`
+  divided by `kgain` is the real size of the sensor's signal**, the number the
+  simulation had to guess.
 - `knockHz` is the knock samples a second the ADC really delivers, about 38460. The
   filters follow it by themselves; if it reads far from that, say so, because it also
   tells how fine the listening is.

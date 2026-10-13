@@ -12,6 +12,7 @@ on:
       - 'src/**'
       - 'include/**'
       - 'test/**'
+      - 'tools/**'
       - 'platformio.ini'
       - '.github/workflows/firmware.yml'
   workflow_dispatch:
@@ -54,6 +55,8 @@ jobs:
           for name in test_meth_tune test_meth_pwm test_esp32_inputs test_knock_band test_knock_agc test_knock_dsp; do
             g++ -std=c++11 -O2 -Wall -I include test/$name/test_main.cpp -o /tmp/$name && /tmp/$name
           done
+          # The LTspice replay tool uses the firmware's own headers: it must keep building.
+          g++ -std=c++17 -O2 -Wall -I include tools/ltspice/ltreplay.cpp -o /tmp/ltreplay
 
       # The image is copied out at once: the next build runs with other flags, and
       # PlatformIO then clears the build folder.

@@ -77,16 +77,18 @@ void thePotentiometerIsWalkedNotWritten() {
 }
 
 // ---------------------------------------------------------------------------
-// The engine and amplifier: a signal of `sensorPeak` counts at gain 1, around the bias.
+// The engine and amplifier: a signal of `sensorPeak` at gain 1, around where the
+// amplifier rests. The default circuit reaches from 10 to 1005 and rests at 545.
 // ---------------------------------------------------------------------------
-const float kBias = 545.0f;   // 1.65 V on the ESP32's ADC
+const float kBias = 545.0f;
 
 Sample heard(float sensorPeak, float gain, uint16_t rpm, bool knocking = false, bool rpmValid = true) {
   const float swing = sensorPeak * gain * (1.0f + 0.15f * noise());
   float low = kBias - swing, high = kBias + swing;
   Sample s;
-  s.low = static_cast<uint16_t>(low < 0.0f ? 0.0f : low);
-  s.high = static_cast<uint16_t>(high > 1023.0f ? 1023.0f : high);
+  s.low = low < 0.0f ? 0.0f : low;
+  s.high = high > 1023.0f ? 1023.0f : high;
+  s.rest = kBias;
   s.rpm = rpm;
   s.rpmValid = rpmValid;
   s.knocking = knocking;
@@ -127,7 +129,7 @@ void quietSignalsAreBroughtUpAndLoudOnesDown() {
     Bench bench;
     bench.run(750, sensorPeak, 3000);   // 15 seconds from the lowest gain
     const float typical = bench.typical(sensorPeak);
-    check(typical >= kLowPeak * 0.9f && typical <= kHighPeak * 1.1f, "the normal signal ends up inside the wanted band");
+    check(typical >= bench.agc.lowPeak() * 0.9f && typical <= bench.agc.highPeak() * 1.1f, "the normal signal ends up inside the wanted band");
     const int settled = bench.changes;
     bench.run(3000, sensorPeak, 3000);  // A minute more of the same
     check(bench.changes - settled <= 2, "once there it stays put: no hunting");
@@ -153,7 +155,7 @@ void clippingIsBackedOffAtOnce() {
   check(bench.agc.settling(), "the next pass is marked as not to be judged");
   check(!bench.agc.update(heard(300.0f, bench.agc.gain(), 3000)) && !bench.agc.settling(), "and is discarded");
   bench.run(100, 300.0f, 3000);
-  check(heard(300.0f, bench.agc.gain(), 3000).high < kClipHigh, "it keeps backing off until the signal fits");
+  check(heard(300.0f, bench.agc.gain(), 3000).high < 985.0f, "it keeps backing off until the signal fits");
   check(!bench.agc.overloaded(), "clipping that gain can fix is not a fault");
   // Clipping with no gain left to take off is one.
   Bench hot;
@@ -246,7 +248,7 @@ void aPartWithFewerStepsIsDrivenWithinItsRange() {
     bench.agc.begin(bench.circuit, 0);
     bench.run(750, sensorPeak, 3000);
     const float typical = bench.typical(sensorPeak);
-    check(typical >= kLowPeak * 0.9f && typical <= kHighPeak * 1.1f, "30 steps: the signal still ends up inside the band");
+    check(typical >= bench.agc.lowPeak() * 0.9f && typical <= bench.agc.highPeak() * 1.1f, "30 steps: the signal still ends up inside the band");
     check(bench.agc.step() <= 30, "30 steps: never beyond the top");
     const int settled = bench.changes;
     bench.run(3000, sensorPeak, 3000);
@@ -255,6 +257,51 @@ void aPartWithFewerStepsIsDrivenWithinItsRange() {
   Circuit coarse;
   coarse.topStep = 30;
   check(gainAt(coarse, 30) == 11.0f && fabsf(gainAt(coarse, 15) - 6.0f) < 0.01f, "30 steps span the same gain range");
+}
+
+// The circuit as simulated in LTspice: an LM358 on 5 V through a 10k / 10k divider.
+// The pin rests at 825 mV and can go from 25 to 1800: off-centre, and nowhere near the
+// top of the ADC's range.
+void theSignalIsMeasuredAgainstTheCircuitItComesFrom() {
+  Circuit lm358;
+  lm358.topStep = 30;
+  lm358.railLow = 25.0f;
+  lm358.railHigh = 1800.0f;
+  const float rest = 825.0f;
+  auto hear = [&](float sourcePeak, float gain, float lift = 0.0f) {
+    Sample s;
+    const float swing = sourcePeak * gain;
+    s.low = rest + lift - swing < 25.0f ? 25.0f : rest + lift - swing;
+    s.high = rest + lift + swing > 1800.0f ? 1800.0f : rest + lift + swing;
+    s.rest = rest;
+    s.rpm = 3000;
+    s.rpmValid = true;
+    return s;
+  };
+  for (float source : {14.0f, 30.0f, 75.0f, 180.0f}) {
+    Controller agc;
+    agc.begin(lm358, 0);
+    for (int n = 0; n < 1500; ++n) agc.update(hear(source, agc.gain()));
+    const float typical = source * agc.gain();
+    check(fabsf(agc.room() - 800.0f) < 1.0f, "room is from the resting level to the nearer limit: 800 mV");
+    check(typical >= 128.0f * 0.9f && typical <= 320.0f * 1.1f, "the swing is steered to 16-40 % of that room");
+    check(!agc.overloaded() && !agc.ineffective(), "and nothing is reported wrong");
+  }
+  // The top limit is 1800 mV, far below the ADC's own: touching it is still clipping.
+  Controller agc;
+  agc.begin(lm358, 15);
+  const float before = agc.gain();
+  Sample top = hear(100.0f, 1.0f, 900.0f);   // Pushed up against the top only
+  check(top.high >= 1800.0f && top.low > 100.0f, "a signal clipped at the top only");
+  check(agc.update(top) && agc.gain() <= before * 0.75f, "is backed off at once, though the ADC itself has room to spare");
+  // Without the circuit's limits the same signal would look fine.
+  Circuit assumed;
+  assumed.topStep = 30;
+  assumed.railLow = 20.0f;
+  assumed.railHigh = 3100.0f;
+  Controller blind;
+  blind.begin(assumed, 15);
+  check(!blind.update(top), "with the ADC's range assumed instead, that clipping would go unnoticed");
 }
 
 void aPotentiometerThatDoesNothingIsNoticed() {
@@ -276,8 +323,9 @@ void aPotentiometerThatDoesNothingIsNoticed() {
   agc.begin(circuit, 0);
   for (int n = 0; n < 3000; ++n) {
     Sample s;
-    s.low = 544;
-    s.high = 547;
+    s.low = 544.0f;
+    s.high = 547.0f;
+    s.rest = 545.0f;
     agc.update(s);
   }
   check(!agc.ineffective() && agc.step() == 99, "a signal too small to judge is not taken as a broken potentiometer");
@@ -293,6 +341,7 @@ int main() {
   knockDoesNotSteerTheGain();
   eachEngineSpeedGetsItsGainBack();
   aDeadSensorIsNoticed();
+  theSignalIsMeasuredAgainstTheCircuitItComesFrom();
   aPotentiometerThatDoesNothingIsNoticed();
   aPartWithFewerStepsIsDrivenWithinItsRange();
   if (failures == 0) printf("knock gain tests passed\n");

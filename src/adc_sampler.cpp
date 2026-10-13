@@ -17,6 +17,9 @@ constexpr uint32_t kMinPlausibleRateHz = 8000;
 
 adc_continuous_handle_t handle = nullptr;
 adc_cali_handle_t calibration[kSlowCount] = {};
+adc_cali_handle_t knockCalibration = nullptr;
+constexpr float kFullScaleMv = 3100.0f;     // The ADC's range at this attenuation, without calibration
+float railLow = 30.0f, railHigh = 985.0f;   // A knock sample at or beyond these counts is at a limit
 adc_channel_t knockChannel = ADC_CHANNEL_0;
 adc_channel_t slowChannel[kSlowCount] = {};
 portMUX_TYPE lock = portMUX_INITIALIZER_UNLOCKED;
@@ -111,7 +114,7 @@ void collect(void *) {
         ++samples;
         if (ten < low) low = ten;
         if (ten > high) high = ten;
-        if (ten <= kRailLow || ten >= kRailHigh) ++railed;
+        if (ten <= railLow || ten >= railHigh) ++railed;
         knock_dsp::Frame frame;
         if (front.push(ten, frame) && frameCount < sizeof(frames) / sizeof(frames[0])) frames[frameCount++] = frame;
         continue;
@@ -145,11 +148,35 @@ void collect(void *) {
     portEXIT_CRITICAL(&lock);
   }
 }
+
+// Millivolts at the pin for a reading in 10-bit counts.
+float toMv(float counts) {
+  int calibrated = 0;
+  const int raw = static_cast<int>(counts * 4.0f + 0.5f);
+  if (knockCalibration && adc_cali_raw_to_voltage(knockCalibration, raw, &calibrated) == ESP_OK) return static_cast<float>(calibrated);
+  return counts * kFullScaleMv / 1023.0f;
+}
 } // namespace
+
+void setKnockLimitsMv(float lowMv, float highMv) {
+  // In counts by the nominal scale, a little inside each limit so a clipped sample
+  // counts even when this ADC reads a few percent off.
+  const float margin = (highMv - lowMv) * 0.03f;
+  railLow = (lowMv + margin) * 1023.0f / kFullScaleMv;
+  railHigh = (highMv - margin) * 1023.0f / kFullScaleMv;
+}
 
 bool begin(int knockPin, int oilPin, int fuelPin, int prePin, int postPin) {
   const int slowPins[kSlowCount] = {oilPin, fuelPin, prePin, postPin};
   if (!channelFor(knockPin, knockChannel)) return false;
+  {
+    adc_cali_curve_fitting_config_t cali = {};
+    cali.unit_id = ADC_UNIT_1;
+    cali.chan = knockChannel;
+    cali.atten = ADC_ATTEN_DB_12;
+    cali.bitwidth = ADC_BITWIDTH_12;
+    if (adc_cali_create_scheme_curve_fitting(&cali, &knockCalibration) != ESP_OK) knockCalibration = nullptr;
+  }
   for (uint8_t input = 0; input < kSlowCount; ++input) {
     if (!channelFor(slowPins[input], slowChannel[input])) return false;
     adc_cali_curve_fitting_config_t cali = {};
@@ -228,6 +255,9 @@ bool takeKnockStats(KnockStats &out) {
   out.railed = railed;
   out.samples = samples;
   out.bias = bias;
+  out.lowMv = toMv(low < 0.0f ? 0.0f : low);
+  out.highMv = toMv(high > 1023.0f ? 1023.0f : high);
+  out.restMv = toMv(bias);
   return true;
 }
 

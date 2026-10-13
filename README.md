@@ -124,7 +124,10 @@ What the board does differently, and only this:
   potentiometer ([include/knock_agc.h](include/knock_agc.h), [include/x9c.h](include/x9c.h)):
   normal engine noise is kept in the lower part of the ADC's range at every RPM, with
   room above it for knock, and the detector's learned levels follow each gain change.
-  Circuit and bench test: [docs/ESP32_HARDWARE.md](docs/ESP32_HARDWARE.md).
+  It measures against the amplifier's real limits at the ADC pin, so an amplifier that
+  rests off-centre or comes through a divider needs only those two numbers.
+  Circuit, bench test, and what the LTspice simulation of it shows when replayed
+  through this code ([tools/ltspice](tools/ltspice)): [docs/ESP32_HARDWARE.md](docs/ESP32_HARDWARE.md).
 - Settings are saved in the ESP32's flash instead of EEPROM.
 - **Firmware updates over CAN** from the dash (`0x680`/`0x681`, module 3), refused
   while the pump runs or boost is near, with the pump held off during the transfer.

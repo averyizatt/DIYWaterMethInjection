@@ -43,6 +43,15 @@ constexpr int KNOCK_GAIN_UD = 21;
 // 100 k. If it reads about a third of that, the part has the datasheet's 99.
 constexpr unsigned char KNOCK_GAIN_TOP_STEP = 30;
 
+// The lowest and highest voltage the knock amplifier can put on the ADC pin, in
+// millivolts. The gain control recognises clipping by these and sizes the signal against
+// them, wherever it rests in between. As simulated in LTspice: an LM358 on 5 V (its
+// output goes from 0.05 to 3.6 V) through a 10k / 10k divider, so 25 to 1800 mV,
+// resting at 825. Through a 3.3k / 15k divider instead: 40 to 2950. A rail-to-rail
+// op amp on 3.3 V straight to the pin: 20 to 3100.
+constexpr float KNOCK_ADC_LOW_MV = 25.0f;
+constexpr float KNOCK_ADC_HIGH_MV = 1800.0f;
+
 // The knock amplifier's gain at the potentiometer's bottom and top positions. For a
 // non-inverting stage with the potentiometer (100k, terminals VW and VL) as the feedback
 // resistor and 10k from the inverting input to the 1.65 V bias point: 1 + 100k/10k.

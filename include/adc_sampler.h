@@ -21,19 +21,24 @@
 namespace adc_sampler {
 
 constexpr uint32_t kKnockRateHz = 38462;   // Asked of the ADC (half of 76,924 conversions a second)
-constexpr float kRailLow = 30.0f;          // A knock sample at or beyond these (10-bit counts)
-constexpr float kRailHigh = 985.0f;        // is at the limit of the amplifier or the ADC
 
 enum Slow : uint8_t { kOil = 0, kFuel = 1, kPre = 2, kPost = 3, kSlowCount = 4 };
 
 // The raw knock signal since the last call: for the gain control and the sensor checks.
 struct KnockStats {
-  uint16_t low{0};       // Lowest and highest sample
+  uint16_t low{0};       // Lowest and highest sample, 10-bit counts
   uint16_t high{0};
-  uint32_t railed{0};    // Samples at a limit
+  uint32_t railed{0};    // Samples at a limit of the amplifier (setKnockLimitsMv)
   uint32_t samples{0};
-  float bias{0.0f};      // Resting level
+  float bias{0.0f};      // Resting level, counts
+  float lowMv{0.0f};     // The same three in millivolts at the pin, through the ADC's
+  float highMv{0.0f};    // factory calibration
+  float restMv{0.0f};
 };
+
+// The lowest and highest voltage the knock amplifier can put on the pin. Call before
+// begin(); without it the whole ADC range is assumed.
+void setKnockLimitsMv(float lowMv, float highMv);
 
 // Starts the ADC and the collecting task. False when the ADC could not be set up.
 bool begin(int knockPin, int oilPin, int fuelPin, int prePin, int postPin);
