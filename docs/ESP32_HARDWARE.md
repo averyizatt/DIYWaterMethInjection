@@ -158,13 +158,16 @@ engine noise in the lower part of the ADC's range with room above it for knock
 
 - **Bias point:** two 100 k resistors from 3.3 V to ground, with 10 uF across the lower
   one. Everything rests at this 1.65 V.
-- **Input:** the sensor through a capacitor to the op amp's + input, which also goes to
-  the bias point through a resistor. Together with the sensor's own capacitance this
-  is a high-pass. The simulated values, 1.5 nF and 47 k with a 1.35 nF sensor and
-  cable, put its corner at 4.8 kHz: it removes rumble well, but it sits just under the
-  6 kHz knock frequency, costs about 2 dB there, and moves with the sensor's
-  capacitance, which is not known for this part. 10 nF and 100 k put the corner near
-  1.3 kHz, clear of the knock band.
+- **Input:** the sensor through 1.5 nF to the op amp's + input, which also goes to the
+  bias point through a resistor: a high-pass, meant to sit at 1.9 kHz. The sensor is
+  itself a capacitor (about 1.35 nF with its cable) in series with that 1.5 nF, so the
+  resistor sees only 0.71 nF and the corner comes out higher than the two parts alone
+  suggest. With the simulated 47 k it is at 4.8 kHz, just under the 6 kHz knock
+  frequency: measured from the simulation's own waveforms, 78 % of the sensor's signal
+  reaches the amplifier at 6 kHz and 43 % at 2.3 kHz, where a 1.9 kHz corner would pass
+  95 % and 77 %. **120 k instead of 47 k puts the corner at 1.9 kHz** with the same
+  1.5 nF. It moves with the sensor's real capacitance, which is not known for this
+  part: worth measuring with a meter.
 - **Gain:** the potentiometer's VW and VL terminals are the feedback resistor, from the
   op amp's output to its - input (leave VH unconnected). 10 k from the - input to the
   **bias point, not to ground**. Gain is then 1 at the bottom of the potentiometer and
@@ -172,8 +175,8 @@ engine noise in the lower part of the ADC's range with room above it for knock
   ground, the op amp amplifies the bias itself and the output sits on the rail.
 - **Op amp and output, as simulated in LTspice:** an LM358 on 5 V. Its output goes from
   about 0.05 to 3.6 V, which is more than the ESP32's pin may see, so it reaches GPIO1
-  through a divider: 10 k in series, 10 k to ground, 2.2 nF to ground (a 14 kHz
-  low-pass). The pin then rests at 825 mV and can go from 25 to 1800 mV. Those two
+  through a divider: 10 k in series, 10 k to ground, 2.2 nF to ground. That is also
+  the low-pass, at 14.5 kHz, which suits the 38 kHz sampling as it is. The pin then rests at 825 mV and can go from 25 to 1800 mV. Those two
   limits are `KNOCK_ADC_LOW_MV` and `KNOCK_ADC_HIGH_MV` in `include/pins_esp32.h`; the
   gain control needs them to recognise clipping, because 1800 mV is nowhere near the
   top of the ADC's own range.
