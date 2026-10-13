@@ -59,6 +59,9 @@ extern "C" bool verifyRollbackLater() { return true; }
 static_assert(CCM_CAN_PROTOCOL_VERSION == can_protocol::CAN_PROTOCOL_SCHEMA_VERSION,
               "platformio.ini CCM_CAN_PROTOCOL_VERSION does not match the shared CAN contract");
 #endif
+#ifndef CAN_PROTOCOL_HAS_KNOCK_DETAIL
+#error "Update DIYComfortControlModule: the shared CAN contract needs the knock detail messages (extension 6)."
+#endif
 #ifndef CAN_PROTOCOL_HAS_METH_PWM
 #error "Update DIYComfortControlModule: the shared CAN contract needs the PWM duty settings (extension 5)."
 #endif
@@ -144,6 +147,24 @@ uint32_t knockSavedMs = 0;
 uint32_t knockSpectrumPrintMs = 0;
 constexpr uint32_t kKnockSaveEveryMs = 120000;
 constexpr uint32_t kKnockSpectrumPrintMs = 10000;
+// What the dash is told about all this (0x30E, can_protocol.h extension 6).
+namespace kd = can_protocol::knock_detail;
+uint32_t lastKnockDetailTxMs = 0;
+uint32_t lastKnockListeningTxMs = 0;
+uint32_t lastKnockSpectrumTxMs = 0;
+uint8_t knockSpectrumNext = 0;                      // Next chunk to send: the normal spectrum, then the burst
+uint8_t knockSpectrumNormal[kd::SPECTRUM_POINTS];   // As sent: (dB + 10) * 3
+uint8_t knockSpectrumBurst[kd::SPECTRUM_POINTS];
+float knockBurstHoldDb[kd::SPECTRUM_POINTS];        // Loudest block since the burst spectrum was last sent
+bool knockBurstHeld = false;
+constexpr uint32_t kKnockDetailTxMs = 500;
+constexpr uint32_t kKnockListeningTxMs = 200;
+constexpr uint32_t kKnockSpectrumTxMs = 80;         // One of twelve chunks: both spectra once a second
+// Knock settings changed from the dash are written to flash a few seconds after the last change.
+bool knockSettingsDirty = false;
+uint32_t knockSettingsChangedMs = 0;
+constexpr uint32_t kKnockSettingsSaveMs = 3000;
+int16_t knockGainFixedStep = -1;                    // -1: the controller sets the gain; else held here
 bool canOnline = false;
 bool canCommandSeen = false;
 bool canCommandTimedOut = false;
@@ -274,7 +295,9 @@ struct KnockGainPins {
 KnockGainPins knockGainPins;
 x9c::Pot knockPot;
 knock_agc::Controller knockGain;
-bool knockGainAuto = false;         // False: fixed-gain amplifier, or the pot shows no effect
+knock_agc::Circuit knockCircuit;
+bool knockGainAuto = false;         // False: fixed-gain amplifier, held from the dash, or the pot shows no effect
+bool knockGainGaveUp = false;       // Gain changes showed no effect
 uint32_t knockGainResyncMs = 0;
 constexpr uint32_t kKnockGainResyncMs = 60000;
 
@@ -285,16 +308,70 @@ void beginKnockGain() {
   digitalWrite(pins::KNOCK_GAIN_CS, HIGH);
   digitalWrite(pins::KNOCK_GAIN_INC, HIGH);
   digitalWrite(pins::KNOCK_GAIN_UD, LOW);
-  knock_agc::Circuit circuit;
-  circuit.lowGain = KNOCK_GAIN_AT_BOTTOM;
-  circuit.highGain = KNOCK_GAIN_AT_TOP;
-  circuit.topStep = KNOCK_GAIN_TOP_STEP;
-  circuit.railLow = KNOCK_ADC_LOW_MV;
-  circuit.railHigh = KNOCK_ADC_HIGH_MV;
+  knockCircuit.lowGain = KNOCK_GAIN_AT_BOTTOM;
+  knockCircuit.highGain = KNOCK_GAIN_AT_TOP;
+  knockCircuit.topStep = KNOCK_GAIN_TOP_STEP;
+  knockCircuit.railLow = KNOCK_ADC_LOW_MV;
+  knockCircuit.railHigh = KNOCK_ADC_HIGH_MV;
   knockPot.setTopStep(KNOCK_GAIN_TOP_STEP);
-  knockGain.begin(circuit, 0);       // Lowest gain first: it cannot clip there.
+  knockGain.begin(knockCircuit, 0);  // Lowest gain first: it cannot clip there.
   knockPot.home(knockGainPins);
-  knockGainAuto = KNOCK_GAIN_POT != 0;
+  knockGainAuto = KNOCK_GAIN_POT != 0 && knockGainFixedStep < 0;
+}
+
+// Knock settings changed from the dash, kept in flash so they are still there after
+// the ignition has been off. Version 1.
+struct KnockSaved {
+  uint8_t version;
+  uint8_t enabled;
+  uint8_t autoCentre;
+  int8_t fixedStep;        // -1 = automatic gain
+  uint16_t minRpm;
+  uint16_t holdMs;
+  float offset, multiplier, minMapKpa, levelGain, bandwidthHz, centreHz, boreMm;
+};
+
+void loadKnockSettings() {
+  Preferences store;
+  if (!store.begin("knockcfg", true)) return;
+  KnockSaved saved;
+  const bool read = store.getBytes("settings", &saved, sizeof(saved)) == sizeof(saved) && saved.version == 1;
+  store.end();
+  if (!read) return;
+  config.knock.enabled = saved.enabled != 0;
+  config.knock.autoCenterFromBore = saved.autoCentre != 0;
+  config.knock.minRpmToArm = saved.minRpm > 8000 ? 8000 : saved.minRpm;
+  config.knock.eventCooldownMs = saved.holdMs;
+  config.knock.thresholdOffset = clampFloatValue(saved.offset, 0.0f, 200.0f);
+  config.knock.thresholdMultiplier = clampFloatValue(saved.multiplier, 1.2f, 3.8f);
+  config.knock.minMapKpaToArm = clampFloatValue(saved.minMapKpa, 0.0f, 250.0f);
+  config.knock.boostEnableKpa = config.knock.minMapKpaToArm;
+  config.knock.signalGain = clampFloatValue(saved.levelGain, 0.1f, 20.0f);
+  config.knock.bandwidthHz = clampFloatValue(saved.bandwidthHz, 300.0f, 20000.0f);
+  config.knock.centerFreqHz = clampFloatValue(saved.centreHz, 3000.0f, 25000.0f);
+  config.knock.boreMm = clampFloatValue(saved.boreMm, 40.0f, 200.0f);
+  knockGainFixedStep = saved.fixedStep < 0 ? -1 : saved.fixedStep > KNOCK_GAIN_TOP_STEP ? KNOCK_GAIN_TOP_STEP : saved.fixedStep;
+}
+
+void saveKnockSettings() {
+  KnockSaved saved = {};
+  saved.version = 1;
+  saved.enabled = config.knock.enabled ? 1 : 0;
+  saved.autoCentre = config.knock.autoCenterFromBore ? 1 : 0;
+  saved.fixedStep = static_cast<int8_t>(knockGainFixedStep);
+  saved.minRpm = config.knock.minRpmToArm;
+  saved.holdMs = config.knock.eventCooldownMs;
+  saved.offset = config.knock.thresholdOffset;
+  saved.multiplier = config.knock.thresholdMultiplier;
+  saved.minMapKpa = config.knock.minMapKpaToArm;
+  saved.levelGain = config.knock.signalGain;
+  saved.bandwidthHz = config.knock.bandwidthHz;
+  saved.centreHz = config.knock.centerFreqHz;
+  saved.boreMm = config.knock.boreMm;
+  Preferences store;
+  if (!store.begin("knockcfg", false)) return;
+  store.putBytes("settings", &saved, sizeof(saved));
+  store.end();
 }
 
 // ---------------------------------------------------------------------------
@@ -957,6 +1034,29 @@ void handleCanFrame(unsigned long id, byte len, const byte *data) {
     lastKnockClippingDetected = false;
     knockFaultPending = false;
     break;
+  case can_protocol::knock_detail_command::SET_AMPLIFIER_GAIN:
+    if (len >= 2) {
+      // 0 hands the gain back to the controller; n holds the potentiometer at position n - 1.
+      const uint8_t value = constrainAndReport(data[1], 0, KNOCK_GAIN_TOP_STEP + 1, ackStatus);
+      knockGainFixedStep = value == 0 ? -1 : value - 1;
+      if (value == 0) knockGainGaveUp = false;   // Asked for again: it gets another try.
+      ackValue = value;
+    } else {
+      ackStatus = can_protocol::config_ack_status::INVALID_LENGTH;
+    }
+    break;
+  case can_protocol::knock_detail_command::SET_BORE_MM:
+    if (len >= 2) {
+      const uint8_t value = constrainAndReport(data[1], 40, 200, ackStatus);
+      config.knock.boreMm = static_cast<float>(value);   // The loop restarts the frequency search for it.
+      ackValue = value;
+    } else {
+      ackStatus = can_protocol::config_ack_status::INVALID_LENGTH;
+    }
+    break;
+  case can_protocol::knock_detail_command::RELEARN_FREQUENCY:
+    forgetKnockFrequency();
+    break;
   default:
     if (kSerialCanVerbose) {
       Serial.print(F("CAN CMD: unsupported 0x"));
@@ -965,6 +1065,14 @@ void handleCanFrame(unsigned long id, byte len, const byte *data) {
     ackStatus = can_protocol::config_ack_status::UNSUPPORTED_COMMAND;
     commandAccepted = false;
     break;
+  }
+
+  // Any knock setting that was taken is written to flash shortly afterwards.
+  if (commandAccepted && data[0] >= can_protocol::meth_command::KNOCK_SET_ENABLE &&
+      data[0] <= can_protocol::knock_detail_command::RELEARN_FREQUENCY && data[0] != can_protocol::meth_command::KNOCK_CLEAR_EVENTS &&
+      (ackStatus == can_protocol::config_ack_status::OK || ackStatus == can_protocol::config_ack_status::VALUE_CLAMPED)) {
+    knockSettingsDirty = true;
+    knockSettingsChangedMs = now;
   }
 
   if (!sendConfigAck(data[0], ackStatus, ackValue)) {
@@ -1274,6 +1382,77 @@ void serviceCanBus(uint32_t now,
       tuneReportNext = key < meth_tune::kCount ? key + 1 : 0;
     }
   }
+
+  // ---- Knock detail for the dash's knock page (0x30E) ----
+  if (elapsed(now, lastKnockDetailTxMs, kKnockDetailTxMs)) {
+    lastKnockDetailTxMs = now;
+    namespace amp = can_protocol::knock_amplifier_flag;
+    uint8_t ampFlags = 0;
+    if (knockGainAuto) ampFlags |= amp::AUTOMATIC;
+    if (knockGainGaveUp) ampFlags |= amp::INEFFECTIVE;
+    if (knockGainAuto && knockGain.overloaded()) ampFlags |= amp::OVERLOADED;
+    if (knockGainAuto && knockGain.silent()) ampFlags |= amp::SILENT;
+    if (knockGainFixedStep >= 0) ampFlags |= amp::FIXED;
+    const float swingMv = knockGainAuto ? knockGain.typicalPeak() : (knockStats.highMv - knockStats.lowMv) * 0.5f;
+    if (!transmitCanFrame(can_protocol::packKnockAmplifier(
+            ampFlags, can_protocol::clampU8(static_cast<int>(knockGain.gain() * 10.0f + 0.5f)), knockPot.step(), KNOCK_GAIN_TOP_STEP,
+            static_cast<uint16_t>(knockStats.restMv > 0.0f ? knockStats.restMv : 0.0f), static_cast<uint16_t>(swingMv > 0.0f ? swingMv : 0.0f),
+            static_cast<uint16_t>(knockGain.room())), "0x30E-amp")) {
+      return;
+    }
+    namespace freq = can_protocol::knock_frequency_flag;
+    uint8_t freqFlags = 0;
+    if (config.knock.autoCenterFromBore) freqFlags |= freq::LEARNING;
+    if (config.knock.autoCenterFromBore && knockLearnedHz > 0.0f) freqFlags |= freq::LEARNED;
+    if (knockHeard.secondActive) freqFlags |= freq::SECOND_ACTIVE;
+    const uint16_t votes = knockFinder.votes();
+    if (!transmitCanFrame(can_protocol::packKnockFrequency(
+            freqFlags, knockCenterHz(), static_cast<uint16_t>(knockFinder.estimateHz() + 0.5f),
+            can_protocol::clampU8(static_cast<int>(knockFinder.agreement() * 100.0f + 0.5f)), can_protocol::clampU8(votes)), "0x30E-freq")) {
+      return;
+    }
+    const uint32_t rate = adc_sampler::knockSamplesPerSecond();
+    if (!transmitCanFrame(can_protocol::packKnockEngine(knockBoreHz(), static_cast<uint16_t>(knockToneHz + 0.5f),
+                                                        static_cast<uint16_t>(rate > 65535 ? 65535 : rate)), "0x30E-engine")) {
+      return;
+    }
+  }
+  if (elapsed(now, lastKnockListeningTxMs, kKnockListeningTxMs)) {
+    lastKnockListeningTxMs = now;
+    namespace listening = can_protocol::knock_listening_flag;
+    uint8_t flags = 0;
+    if (knockDetector.notable()) flags |= listening::NOTABLE;
+    if (knockDetector.confirmed()) flags |= listening::CONFIRMED;
+    const float levelGain = clampFloatValue(config.knock.signalGain, 0.1f, 15.9f);
+    const float crest = knockHeard.background > 0.0f ? knockHeard.level / knockHeard.background : 0.0f;
+    if (!transmitCanFrame(can_protocol::packKnockListening(
+            flags, knock_dsp::toByte(knockDetector.second()), knock_dsp::toByte(knockDetector.secondBaseline()),
+            knock_dsp::toByte(knockHeard.background * 0.5f * levelGain), knock_dsp::toByte(crest * 10.0f)), "0x30E-listen")) {
+      return;
+    }
+  }
+  if (knockSpectrum.valid && elapsed(now, lastKnockSpectrumTxMs, kKnockSpectrumTxMs)) {
+    lastKnockSpectrumTxMs = now;
+    const uint8_t chunks = kd::SPECTRUM_POINTS / kd::SPECTRUM_PER_FRAME;
+    if (knockSpectrumNext == 0) {
+      // A new round: fix what both spectra are, so the chunks of one round belong together.
+      for (uint8_t point = 0; point < kd::SPECTRUM_POINTS; ++point) {
+        const float hz = kd::SPECTRUM_START_HZ + static_cast<float>(point) * kd::SPECTRUM_STEP_HZ;
+        const float normal = knock_spectrum::valueAtHz(knockSpectrum.floor, knockSpectrum.binHz, hz);
+        const float normalDb = 10.0f * log10f(normal > 1e-3f ? normal : 1e-3f);
+        knockSpectrumNormal[point] = knock_dsp::toByte((normalDb + 10.0f) * 3.0f);
+        knockSpectrumBurst[point] = knock_dsp::toByte(((knockBurstHeld ? knockBurstHoldDb[point] : normalDb) + 10.0f) * 3.0f);
+      }
+      knockBurstHeld = false;
+    }
+    const bool burst = knockSpectrumNext >= chunks;
+    const uint8_t first = static_cast<uint8_t>((knockSpectrumNext % chunks) * kd::SPECTRUM_PER_FRAME);
+    if (!transmitCanFrame(can_protocol::packKnockSpectrum(burst ? kd::SPECTRUM_BURST : kd::SPECTRUM_NORMAL, first,
+                                                          (burst ? knockSpectrumBurst : knockSpectrumNormal) + first), "0x30E-spectrum")) {
+      return;
+    }
+    knockSpectrumNext = static_cast<uint8_t>((knockSpectrumNext + 1) % (2 * chunks));
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1360,6 +1539,7 @@ void setup() {
   // small: replaying the owner's LTspice simulation, 8 missed every knock at low
   // amplitudes that 2 catches. The dash can still set it.
   config.knock.thresholdOffset = 2.0f;
+  loadKnockSettings();   // What was set from the dash, if anything.
   loadKnockFrequency();
   knockFinder.begin(knockBoreHz());
   adc_sampler::setKnockExpected(knockBoreHz());
@@ -1478,6 +1658,15 @@ void loop() {
   if (adc_sampler::takeKnockSpectrum(knockBlock)) {
     knockSpectrum = knockBlock;
     knockToneHz = knock_spectrum::steadyToneHz(knockSpectrum, knockBoreHz());
+    // For the dash: the loudest any frequency has been in a block since the burst
+    // spectrum was last sent.
+    for (uint8_t point = 0; point < kd::SPECTRUM_POINTS; ++point) {
+      const float hz = kd::SPECTRUM_START_HZ + static_cast<float>(point) * kd::SPECTRUM_STEP_HZ;
+      const float power = knock_spectrum::valueAtHz(knockSpectrum.power, knockSpectrum.binHz, hz);
+      const float db = 10.0f * log10f(power > 1e-3f ? power : 1e-3f);
+      if (!knockBurstHeld || db > knockBurstHoldDb[point]) knockBurstHoldDb[point] = db;
+    }
+    knockBurstHeld = true;
     // Learned only from passes that are notable under load: more than normal at the
     // knock frequency, narrow-band, a burst, with the engine in boost.
     const bool underLoad = engineRpmValid && rpm >= 1500 && readings.mapValid && rpmArmed && mapArmed && !knockSensorFault;
@@ -1493,6 +1682,25 @@ void loop() {
   if (knockLearnedHz > 0.0f && fabsf(knockLearnedHz - knockSavedHz) >= 50.0f && elapsed(now, knockSavedMs, kKnockSaveEveryMs)) {
     knockSavedMs = now;
     saveKnockFrequency();
+  }
+  // Who sets the gain: the controller, or a position held from the dash.
+  if (KNOCK_GAIN_POT != 0) {
+    if (knockGainFixedStep >= 0) {
+      if (knockGainAuto || knockPot.step() != knockGainFixedStep) {
+        const float before = knockGain.gain();
+        knockPot.moveTo(knockGainPins, static_cast<uint8_t>(knockGainFixedStep));
+        knockGain.begin(knockCircuit, knockPot.step());
+        knockDetector.rescale(knockGain.gain() / before);
+        knockGainAuto = false;
+      }
+    } else if (!knockGainAuto && !knockGainGaveUp) {
+      knockGain.begin(knockCircuit, knockPot.step());
+      knockGainAuto = true;
+    }
+  }
+  if (knockSettingsDirty && elapsed(now, knockSettingsChangedMs, kKnockSettingsSaveMs)) {
+    knockSettingsDirty = false;
+    saveKnockSettings();
   }
   if (knockGainAuto) {
     const bool engineStopped = !engineRpmValid || rpm == 0;
@@ -1514,8 +1722,9 @@ void loop() {
       }
       if (knockGain.ineffective()) {
         knockGainAuto = false;
+        knockGainGaveUp = true;
         Serial.println(F("KNOCK: changing the amplifier gain shows no effect (potentiometer not fitted or not "
-                         "working); gain control is off until the next start"));
+                         "working); gain control is off until the next start or until it is asked for again"));
       }
     }
   }

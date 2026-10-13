@@ -14,9 +14,12 @@ environment `esp32s3_water_meth`.
 | Knock, oil pressure, fuel pressure, tank float | here | here, unchanged |
 | New firmware | USB cable | from the dash over CAN, or USB |
 
-Every CAN message, command and setting is the same as before. The dash does not need
-to know which board is fitted; it reads the two new settings (lowest and highest pump
-duty) if the controller reports them.
+Every CAN message, command and setting the Nano has is the same as before. The dash
+does not need to be told which board is fitted: it reads the two new settings (lowest
+and highest pump duty) if the controller reports them, and its knock page shows the
+spectrum, the knock frequency and the amplifier gain when the controller sends them
+(one new message, `0x30E`, and three new commands: see
+[On the dash](#on-the-dash)).
 
 **No fresh data from the MicroSquirt means no injection.** The controller needs the
 ECU's manifold pressure and RPM, each less than half a second old. A pump test still
@@ -228,8 +231,9 @@ control wire off), it says so on the serial monitor and leaves the gain alone un
 next start. For an amplifier with no potentiometer, build with `-DKNOCK_GAIN_POT=0`.
 
 The numbers on the dash's knock page (level, normal level, threshold) are measured
-after the amplifier, so all three move together when the gain changes. The gain itself
-is on the serial line (`kgain`), not on the dash yet.
+after the amplifier, so all three move together when the gain changes. The gain, the
+potentiometer position and the size of the signal are on the knock page too, and the
+gain can be held at a position from there (see [On the dash](#on-the-dash)).
 
 ### Testing it by itself
 
@@ -308,9 +312,10 @@ In the PC simulation the filter went from 5,966 Hz to within 35 Hz of resonances
 placed at 5,400, 6,250 and 6,600 Hz, in 5 to 12 seconds of running with light ringing
 on some cycles.
 
-On the dash the knock page's "LISTENING AT" shows where the filter is. Setting the
-frequency by hand turns this off and discards what was learned; "from bore" turns it
-back on, starting again from the bore's figure.
+On the dash the knock page shows where the filter is, where the votes say the engine
+rings, and the spectrum itself. Setting the frequency by hand turns the search off and
+discards what was learned; "Found from the engine" turns it back on, starting again
+from the bore's figure, and so does "LEARN IT AGAIN".
 
 In the PC simulation (synthetic engine noise with valve clicks): 300 of 300 single
 knocks at random moments heard, 30 of 30 episodes of sustained knock caught in about
@@ -318,8 +323,76 @@ knocks at random moments heard, 30 of 30 episodes of sustained knock caught in a
 normal running at three engine speeds. That is a simulation, not the engine: the
 multiplier and offset still have to be set on the car.
 
-What reaches the dash is unchanged in meaning: level, learned level and threshold in
-the same units, and the share of the sound that is in the knock band.
+What the Nano sent reaches the dash unchanged in meaning: level, learned level and
+threshold in the same units, and the share of the sound that is in the knock band.
+
+## On the dash
+
+The dash's **Knock** page has two views.
+
+**Live** shows the knock-band level against normal and the threshold, as before, and
+beside it the **spectrum** from 2 to 12.5 kHz: what each frequency normally carries
+(blue), the loudest burst of the last second (yellow), the band being listened in and
+the second-resonance band (shaded), the bore's frequency (dashed) and the frequency the
+engine itself rings at (green). Under them: where the filter is and why, the amplifier
+gain and potentiometer position, the second resonance against its normal, how far the
+loudest moment stood out, the size of the sensor signal and how much of the room to the
+ADC's limit it uses, where the amplifier rests, any steady tone near the knock
+frequency, and the real sample rate. It is the serial monitor's `HB` and `KSPEC` lines
+without a cable.
+
+**Settings** changes everything the controller lets the dash set, and the controller
+keeps it:
+
+| Setting | What it does |
+|---|---|
+| Listening on / off | The knock monitor as a whole |
+| Multiplier, margin | Knock is louder than normal times the multiplier, plus the margin |
+| Warning stays up for | How long a warning is held |
+| Level gain | A software gain on the level; leave it at 1 with the automatic amplifier |
+| Only above RPM / manifold pressure | When hits are judged |
+| Where it listens | Found from the engine, or a frequency set by hand |
+| Band width | Wide (1500 Hz) or narrow (900 Hz) |
+| Cylinder bore | Where the search starts and how far it may go; changing it starts the search again |
+| Learn it again | Forgets the learned frequency |
+| Amplifier gain | Automatic, or held at a potentiometer position you choose |
+
+A held gain stays held across restarts until it is set back to automatic. While it is
+held the controller leaves the gain alone and does not judge "too loud at the lowest
+gain" or "nothing heard at the highest". The sensor signal shown on the page is then
+the swing as measured, not the typical one, so a position that is too high shows as a
+swing that uses all of the room.
+
+**Knock settings are saved.** Three seconds after the last change the controller writes
+the knock settings to flash (the enable switch, thresholds, arming limits, frequency
+mode, band width, bore and held gain), and loads them at start-up. The Nano board saves
+them in its EEPROM as before.
+
+### CAN: the knock detail message
+
+One new message, `0x30E`, eight bytes, the first naming what the rest is
+(`can_protocol.h`, extension 6, `knock_detail`). Nothing existing changed. The Nano
+does not send it, and the dash then shows those parts as not available.
+
+| Byte 0 | Sent | Contents |
+|---|---|---|
+| 1 amplifier | every 0.5 s | flags (automatic, no effect, overloaded, silent, held), gain x10, position, top position, rest /16 mV, typical swing /8 mV, room to the nearer limit /16 mV |
+| 2 frequency | every 0.5 s | flags (searching, learned, second resonance in use), filter Hz, found Hz (0: not yet), agreement %, votes |
+| 3 engine | every 0.5 s | bore's frequency Hz, steady tone Hz (0: none), knock samples a second |
+| 4 listening | every 0.2 s | flags (notable, second resonance confirmed), second resonance level, its normal, background level, how far the peak stood out x10 |
+| 5 spectrum, normal | one piece every 80 ms | first point, then six points |
+| 6 spectrum, loudest burst | in turn with 5 | the same; the loudest of each frequency over about the last second |
+
+A spectrum is 36 points from 2,000 Hz every 300 Hz, six to a frame; a point is
+(dB + 10) x 3. Both spectra are complete about once a second.
+
+Three new commands on `0x301`, acknowledged on `0x30A` like the others:
+
+| Command | Value | |
+|---|---|---|
+| `0x4B` amplifier gain | 0, or 1 to 31 | 0: automatic. n: hold potentiometer position n - 1 |
+| `0x4C` bore | 40 to 200 mm | |
+| `0x4D` learn the frequency again | none | |
 
 ## What the LTspice simulation shows
 
@@ -387,7 +460,8 @@ g++ -std=c++17 -O2 -I include tools/ltspice/ltreplay.cpp -o ltreplay
 
 ## First start-up checks
 
-Open the serial monitor (USB, 115200). Once a second the controller prints a line:
+The dash's knock page shows most of this without a cable. For the first start, open
+the serial monitor (USB, 115200). Once a second the controller prints a line:
 
 ```
 HB t=12000 map=98.4 boostPsi=-0.3 baro=100.5 rpm=850 duty=0% hold=1 mode=0 tankLow=0 can=1 oilPsi=42.0 fuelPsi=39.5 pre=24.1 knock=0 krest=825mV knockHz=38460 klvl=14.2 kbase=13.1 k2=6.0 kshare=0.17 kfreq=6250 kfound=6262 ktone=0 kgain=6.3 kpeak=150mV rxOvf=0

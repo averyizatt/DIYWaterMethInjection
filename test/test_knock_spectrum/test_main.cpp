@@ -261,10 +261,23 @@ void itFollowsTheSampleRate() {
   }
   check(fabsf(rig.centre - 6500.0f) < 200.0f, "at 30 kHz sampling the knock frequency is still found");
 }
+
+// What the dash is sent: the spectrum read off at its own frequencies, between the lines.
+void aSpectrumIsReadAtAnyFrequency() {
+  float values[knock_spectrum::kBins];
+  for (int bin = 0; bin < knock_spectrum::kBins; ++bin) values[bin] = 10.0f * bin;
+  const float binHz = 300.0f;
+  check(fabsf(knock_spectrum::valueAtHz(values, binHz, 6000.0f) - 200.0f) < 0.01f, "on a line it is that line's value");
+  check(fabsf(knock_spectrum::valueAtHz(values, binHz, 6150.0f) - 205.0f) < 0.01f, "between two lines it is in between");
+  check(knock_spectrum::valueAtHz(values, binHz, -50.0f) == values[0], "below the spectrum it is the first line");
+  check(knock_spectrum::valueAtHz(values, binHz, 1e6f) == values[knock_spectrum::kBins - 1], "above the spectrum it is the last line");
+  check(knock_spectrum::valueAtHz(values, 0.0f, 6000.0f) == 0.0f, "with no spectrum yet it is nothing, not a division by zero");
+}
 } // namespace
 
 int main() {
   theSpectrumIsRight();
+  aSpectrumIsReadAtAnyFrequency();
   theFloorShowsTonesNotBursts();
   theFilterIsPulledToWhereTheCylinderRings();
   itStaysPutWithoutGoodReason();

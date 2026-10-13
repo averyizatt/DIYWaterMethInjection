@@ -259,6 +259,11 @@ void knockIsCaughtAndNormalRunningIsNot() {
   rig.engine.rpm = 4000.0f;
   rig.engine.noiseAmp = 70.0f;
   rig.run(5.0f);
+  // What the dash shows beside the second resonance: its own normal level, learned like the main one.
+  const float secondNormal = rig.detector.secondBaseline();
+  printf("second resonance in normal running: %.1f, learned normal %.1f\n", rig.detector.second(), secondNormal);
+  check(secondNormal > 0.0f && secondNormal <= 255.0f, "the second resonance has a learned normal level");
+  check(rig.detector.second() < secondNormal * 2.5f + 2.0f, "and in normal running it sits near it");
   int caught = 0, latencyMs = 0;
   for (int episode = 0; episode < 30; ++episode) {
     const int before = rig.warnings;

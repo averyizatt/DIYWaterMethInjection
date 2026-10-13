@@ -297,6 +297,7 @@ public:
     second_ = limit(heard.second * 0.5f * s.gain);
 
     const float base = baseline_[bin];
+    secondBaselineNow_ = secondBaseline_[bin] > 255.0f ? 255.0f : secondBaseline_[bin];
     float threshold = base * s.multiplier + s.offset;
     if (threshold > 255.0f) threshold = 255.0f;
     if (threshold < 1.0f) threshold = 1.0f;
@@ -375,6 +376,7 @@ public:
   float level() const { return level_; }
   float share() const { return share_; }
   float second() const { return second_; }
+  float secondBaseline() const { return secondBaselineNow_; }
   float baseline() const { return baselineNow_; }
   float threshold() const { return threshold_; }
   bool learned() const { return learned_; }
@@ -400,6 +402,7 @@ private:
   float share_{0.0f};
   float second_{0.0f};
   float baselineNow_{0.0f};
+  float secondBaselineNow_{0.0f};
   float threshold_{1.0f};
   bool learned_{false};
   bool confirmed_{false};

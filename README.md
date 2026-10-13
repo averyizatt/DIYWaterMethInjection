@@ -124,6 +124,9 @@ What the board does differently, and only this:
   600 spectra a second; the filter starts on the bore's figure and is moved to where
   the engine actually rings, learned only from bursts under boost that rise above
   normal, so not from valve noise, block resonances or steady tones. Kept in flash.
+- **The dash's knock page shows what the controller hears** (`0x30E`): the spectrum,
+  where the filter is and where the engine rings, the amplifier gain and the size of
+  the signal. Every knock setting can be changed from there and is saved in flash.
 - **The knock amplifier's gain is set automatically** through an X9C104 digital
   potentiometer ([include/knock_agc.h](include/knock_agc.h), [include/x9c.h](include/x9c.h)):
   normal engine noise is kept in the lower part of the ADC's range at every RPM, with

@@ -192,6 +192,17 @@ inline float peakHz(const float *values, uint8_t bin, float binHz) {
   return (bin + shift) * binHz;
 }
 
+// The value at a frequency, between the two nearest lines of a spectrum.
+inline float valueAtHz(const float *values, float binHz, float hz) {
+  if (!(binHz > 0.0f)) return 0.0f;
+  const float position = hz / binHz;
+  if (position <= 0.0f) return values[0];
+  if (position >= kBins - 1) return values[kBins - 1];
+  const uint8_t bin = static_cast<uint8_t>(position);
+  const float part = position - bin;
+  return values[bin] + (values[bin + 1] - values[bin]) * part;
+}
+
 // A steady tone inside the search range, read off the noise floor: 0 when there is none.
 inline float steadyToneHz(const Snapshot &s, uint8_t searchLow, uint8_t searchHigh) {
   if (!s.valid || searchHigh < searchLow + 4) return 0.0f;
