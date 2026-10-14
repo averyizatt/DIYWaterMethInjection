@@ -64,7 +64,7 @@ struct KnockConfig {
   // Detection is only active when both arming conditions are met.
   // RPM can remain unused if no reliable crank signal is available.
   uint16_t minRpmToArm{0};
-  float minMapKpaToArm{120.0f};
+  float minMapKpaToArm{100.0f};
   float minLoadPercentToArm{30.0f};
 
   // Front-end ADC sampling and analysis block sizing.
@@ -133,7 +133,7 @@ struct KnockConfig {
 
   // Adjustable thresholding.
   float thresholdOffset{8.0f};
-  float boostEnableKpa{120.0f};
+  float boostEnableKpa{100.0f};
   float thresholdMultiplier{2.5f};
   bool baselineLearningEnabled{true};
   float baselineLearnAlpha{0.02f};

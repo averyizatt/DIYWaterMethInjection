@@ -365,8 +365,13 @@ swing that uses all of the room.
 
 **Knock settings are saved.** Three seconds after the last change the controller writes
 the knock settings to flash (the enable switch, thresholds, arming limits, frequency
-mode, band width, bore and held gain), and loads them at start-up. The Nano board saves
-them in its EEPROM as before.
+mode, band width, bore and held gain), and loads them at start-up. The Nano board does
+not: its EEPROM holds the pump tuning only, so it starts with its built-in knock
+defaults at every power-up, and a change from the dash lasts until the ignition is off.
+
+The built-in arming level is **100 kPa absolute**. It was 120: at about 5,000 ft the
+barometer reads 85 to 87 kPa, so 120 was 5 psi of boost, and the car's logs spend only
+seconds a drive above it. 100 is about 2 psi there.
 
 ### CAN: the knock detail message
 

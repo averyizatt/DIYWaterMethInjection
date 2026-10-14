@@ -63,7 +63,10 @@ AppConfig defaultConfig() {
 
   config.knock.enabled = true;
   config.knock.minRpmToArm = 0;
-  config.knock.minMapKpaToArm = 120.0f;
+  // Absolute. The car lives at about 5,000 ft (barometer 85-87 kPa), where 120 kPa is
+  // 5 psi of boost and the logs spend only seconds a drive above it; 100 kPa is about
+  // 2 psi there. A stock 9.5:1 engine on 91 can knock from light boost on.
+  config.knock.minMapKpaToArm = 100.0f;
   config.knock.minLoadPercentToArm = 35.0f;
   config.knock.sampleRateHz = 19231;  // What the Nano's ADC actually delivers (knock_band.h).
   config.knock.samplesPerUpdate = 64;
@@ -114,7 +117,7 @@ AppConfig defaultConfig() {
   config.knock.biasAlpha = 0.002f;
   config.knock.envelopeAlpha = 0.20f;
   config.knock.rmsAlpha = 0.12f;
-  config.knock.boostEnableKpa = 120.0f;
+  config.knock.boostEnableKpa = 100.0f;
   config.knock.thresholdMultiplier = 2.5f;
   config.knock.thresholdOffset = 8.0f;
   config.knock.baselineLearnAlpha = 0.02f;
