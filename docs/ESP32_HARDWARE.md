@@ -255,6 +255,29 @@ should give, the resistance to expect across VW and VL, and what the ADC hears
 
 Flash `esp32s3_water_meth` again afterwards.
 
+### Testing the knock circuit with fixed resistors
+
+Before the potentiometer is fitted, with the gain set by a jumper (J1-J5: 1.47, 2, 3.2,
+5.7 or 11 times), flash **`esp32s3_knock_test`** (`src/knock_test_esp32.cpp`). It runs
+the real firmware's knock listening and nothing else, and prints in plain words every
+2 s: whether the ADC runs at its rate, where the amplifier rests (about 825 mV on
+GPIO1), how far the signal swings and whether it clips, the size of the signal at the
+sensor itself, the level against normal and the threshold, the bursts heard and the
+verdict. Every burst louder than the threshold gets a line at once saying whether it
+looked like knock (narrow-band at the knock frequency, short) or not (a tap or a
+click). Every 10 s it draws the spectrum from 2 to 12 kHz.
+
+Type into the serial monitor: `g 3.2` for the jumper fitted, `r 4000` for the engine
+speed to pretend, `f 6500` to listen at a frequency by hand (`f 0` back to the bore),
+`m` and `o` for the threshold multiplier and offset, `s` for the spectrum, `c` to learn
+"normal" again.
+
+1. Nothing touching the sensor: rest about 825 mV, swing a few mV.
+2. Tap the block or the sensor's bolt: loud bursts, usually "not knock-like" (broadband).
+3. A 6 kHz tone from a phone against the sensor: the level and the spectrum rise at 6 kHz;
+   short beeps are "knock-like".
+4. "CLIPPING": fit a lower gain jumper.
+
 ## How knock is listened for
 
 The Nano looks at one 3.3 ms burst of the knock signal in every 20 ms, so a single

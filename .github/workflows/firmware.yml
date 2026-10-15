@@ -69,7 +69,7 @@ jobs:
 
       - name: Build the bench tests
         working-directory: DIYWaterMethInjection
-        run: pio run -e esp32s3_pump_test -e esp32s3_knock_gain_test
+        run: pio run -e esp32s3_pump_test -e esp32s3_knock_gain_test -e esp32s3_knock_test
 
       # The build number the controller reports to the dash: the first eight hex digits of the commit.
       - name: Build the ESP32-S3 firmware
