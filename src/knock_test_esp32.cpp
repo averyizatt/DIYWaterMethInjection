@@ -6,7 +6,14 @@
 // (adc_sampler.cpp, knock_dsp.h), the detector that decides what is knock, and the
 // spectrum and frequency finder (knock_spectrum.h).
 //
-// Wiring: the amplifier's output through 10k / 10k (2.2 nF to ground) to GPIO1.
+// Wiring: the amplifier's output through 10k / 10k (2.2 nF to ground) to GPIO2.
+//
+// Knock maker (optional): a speaker or tweeter clamped against the block next to the
+// sensor, switched by a transistor on GPIO9: GPIO9 - 1k - base of an NPN (2N2222,
+// PN2222, BC337), emitter to GND, collector to the speaker's -, the speaker's + through
+// 33 ohm to 5 V, a diode (1N4148) across the speaker with its band to the 5 V side.
+// "k 4" then rings it at the knock frequency for 1.5 ms on one firing in four, timed
+// from the pretended RPM.
 //
 // Every 2 s it prints a block like this:
 //
@@ -30,6 +37,7 @@
 //   f 6500  listen at this frequency; f 0 goes back to the bore's figure
 //   m 2.5   threshold multiplier     o 8   threshold offset (as on the dash)
 //   s       the spectrum now         c     start learning "normal" again
+//   k 4     knock maker: a burst on one firing in 4 (k 1 every firing); k 0 stops it
 //
 // Bench checks, in order:
 //   1. Power on, nothing touching the sensor: "Amp out rests at" about 825 mV and the
@@ -39,7 +47,11 @@
 //   3. A 6 kHz tone (phone tone generator, speaker against the sensor): the level rises
 //      and the spectrum shows a peak at 6 kHz; short beeps of it are "knock-like".
 //   4. Too loud: "CLIPPING" means the amplifier hits its limits: fit a lower gain jumper.
+//   5. Knock maker: "k 4". Every burst should be a "LOUD BURST ... KNOCK-LIKE" line. Then
+//      unclamp the speaker and hold it just off the block: if it is still heard, that is
+//      the 5 V supply carrying the bursts into the amplifier, not vibration.
 #include <Arduino.h>
+#include <esp_timer.h>
 #include <math.h>
 
 #include "adc_sampler.h"
@@ -54,6 +66,15 @@
 #ifndef KNOCK_TEST_BORE_MM
 #define KNOCK_TEST_BORE_MM 96
 #endif
+// The knock input for this test. The real firmware uses GPIO1 (pins::KNOCK_SENSOR_ADC);
+// the bench rig is wired to GPIO2.
+#ifndef KNOCK_TEST_PIN
+#define KNOCK_TEST_PIN 2
+#endif
+// The knock maker's transistor.
+#ifndef KNOCK_TEST_DRIVE_PIN
+#define KNOCK_TEST_DRIVE_PIN 9
+#endif
 
 namespace {
 constexpr uint32_t kPassMs = 20;           // One pass, as in the real firmware
@@ -63,6 +84,11 @@ constexpr float kDivider = 0.5f;           // 10k / 10k between the LM358 and th
 constexpr float kExpectedRestMv = 825.0f;  // 1.65 V through that divider
 constexpr float kBandwidthHz = 1500.0f;
 constexpr uint8_t kMaxEventsPerReport = 12;
+constexpr int kKnockPin = KNOCK_TEST_PIN;
+constexpr int kDrivePin = KNOCK_TEST_DRIVE_PIN;
+constexpr uint8_t kCylinders = 4;          // For the knock maker's timing
+constexpr uint32_t kBurstUs = 1500;        // Knock rings for a millisecond or two
+constexpr uint8_t kDriveBits = 8;
 
 knock_dsp::Frame frames[knock_dsp::kMaxFrames];
 knock_dsp::PassAnalyser analyser;
@@ -83,6 +109,12 @@ bool adcReady = false;
 bool wasWarning = false, wasCritical = false;
 float toneHz = 0.0f;
 
+bool makerReady = false;
+uint8_t knockEvery = 0;                    // Set with "k": a burst on one firing in this many; 0: off
+uint32_t makerFirings = 0;
+uint32_t driveHz = 0;
+esp_timer_handle_t firingTimer = nullptr, burstTimer = nullptr;
+
 struct Period {
   float lowMv{1e9f}, highMv{-1e9f}, restMv{0.0f};
   uint32_t railed{0}, samples{0};
@@ -99,6 +131,44 @@ size_t typedLength = 0;
 float boreHz() { return knock_band::knockHzForBore(KNOCK_TEST_BORE_MM); }
 float centreHz() { return handHz > 0.0f ? handHz : foundHz > 0.0f ? foundHz : boreHz(); }
 const char *centreWhy() { return handHz > 0.0f ? "set by hand" : foundHz > 0.0f ? "found from the bursts heard" : "from the bore"; }
+
+// ---------------------------------------------------------------------------- knock maker
+
+// It rings at the frequency set with "f", or the bore's; not at what was found, so the
+// finder has something real to find.
+float makerHz() { return handHz > 0.0f ? handHz : boreHz(); }
+uint32_t firingUs() { return 120000000UL / (static_cast<uint32_t>(rpm) * kCylinders); }   // Four-stroke
+
+void burstEnd(void *) { ledcWrite(kDrivePin, 0); }
+
+void firing(void *) {
+  if (knockEvery == 0 || ++makerFirings % knockEvery != 0) return;
+  ledcWrite(kDrivePin, 1U << (kDriveBits - 1));   // Half on: a square wave at makerHz()
+  esp_timer_start_once(burstTimer, kBurstUs);
+}
+
+// Starts it again for the RPM and frequency now set, or stops it.
+void restartMaker() {
+  if (!makerReady) return;
+  esp_timer_stop(firingTimer);   // An error when it was not running: fine.
+  ledcWrite(kDrivePin, 0);
+  const uint32_t hz = static_cast<uint32_t>(makerHz() + 0.5f);
+  if (hz != driveHz && ledcChangeFrequency(kDrivePin, hz, kDriveBits)) driveHz = hz;
+  if (knockEvery > 0 && rpm > 0) esp_timer_start_periodic(firingTimer, firingUs());
+}
+
+bool beginMaker() {
+  driveHz = static_cast<uint32_t>(makerHz() + 0.5f);
+  if (!ledcAttach(kDrivePin, driveHz, kDriveBits)) return false;
+  ledcWrite(kDrivePin, 0);
+  esp_timer_create_args_t args = {};
+  args.callback = firing;
+  args.name = "firing";
+  if (esp_timer_create(&args, &firingTimer) != ESP_OK) return false;
+  args.callback = burstEnd;
+  args.name = "burst";
+  return esp_timer_create(&args, &burstTimer) == ESP_OK;
+}
 
 knock_dsp::Settings settings() {
   knock_dsp::Settings s;
@@ -163,24 +233,40 @@ void printReport(uint32_t now) {
   }
   const uint32_t rate = adc_sampler::knockSamplesPerSecond();
   const bool rateOk = rate > 36000 && rate < 41000;
-  Serial.printf(" ADC       %lu samples/s%*s%s\n", static_cast<unsigned long>(rate), 38, "", rateOk ? "OK" : "CHECK: expected about 38460");
+  // The rate is measured over 2 s, so the first report after start-up has none yet.
+  Serial.printf(" ADC       %lu samples/s%*s%s\n", static_cast<unsigned long>(rate), 38, "",
+                rateOk ? "OK" : rate == 0 && now < 5000 ? "measuring" : "CHECK: expected about 38460");
   if (!period.any || adc_sampler::silentForMs(now) > 500) {
-    Serial.println(F(" Amp out   no samples from GPIO1"));
+    Serial.printf(" Amp out   no samples from GPIO%d\n", kKnockPin);
     return;
   }
   const float rest = period.restMv;
   const bool restOk = fabsf(rest - kExpectedRestMv) < 150.0f;
+  // Resting at or beyond a limit (within 5 % of the range), the amplifier is not what
+  // sets the pin, or it is pinned against its own supply: a wiring fault, and nothing it
+  // hears gets through. Above the top one is more than the LM358 can reach through the
+  // divider at all.
+  const float edge = (KNOCK_ADC_HIGH_MV - KNOCK_ADC_LOW_MV) * 0.05f;
+  const bool stuckHigh = rest > KNOCK_ADC_HIGH_MV - edge, stuckLow = rest < KNOCK_ADC_LOW_MV + edge;
   Serial.printf(" Amp out   rests at %.0f mV (expect about %.0f)%*s%s\n", rest, kExpectedRestMv, 18, "",
-                restOk ? "OK" : "CHECK the 1.65 V reference and the 10k/10k divider");
+                restOk     ? "OK" :
+                stuckHigh  ? "CHECK: more than the amp can give: the divider's 10k to ground, the grounds, the pin's wire" :
+                stuckLow   ? "CHECK: about 0 V: the amp's 5 V and output, the 10k in series, the pin's wire" :
+                             "CHECK the 1.65 V reference and the 10k/10k divider");
   const float swing = (period.highMv - period.lowMv) / 2.0f;
   const bool clipping = period.samples > 0 && period.railed * 1000U >= period.samples;   // 0.1 % of samples at a limit
-  const char *swingNote = clipping ? "CLIPPING: fit a lower gain jumper" : swing < 3.0f ? "quiet: tap the sensor" :
+  const char *swingNote = stuckHigh || stuckLow ? "STUCK at a limit: the wiring, not the gain" :
+                          clipping ? "CLIPPING: fit a lower gain jumper" : swing < 3.0f ? "quiet: tap the sensor" :
                           period.highMv > KNOCK_ADC_HIGH_MV * 0.85f || period.lowMv < 120.0f ? "loud: near the limits" : "OK";
   Serial.printf("           swing +/- %.0f mV, range %.0f-%.0f mV (limits %.0f-%.0f)   %s\n", swing, period.lowMv, period.highMv,
                 KNOCK_ADC_LOW_MV, KNOCK_ADC_HIGH_MV, swingNote);
   Serial.printf(" Sensor    +/- %.1f mV at the sensor itself (gain %.2fx fitted)\n", swing / (kDivider * fittedGain), fittedGain);
   Serial.printf(" Listening %.2f kHz (%s), second resonance %.2f kHz %s\n", centreHz() / 1000.0f, centreWhy(),
                 centreHz() * knock_dsp::kSecondModeRatio / 1000.0f, adc_sampler::knockSecondActive() ? "" : "(off: sample rate too low)");
+  if (knockEvery > 0) {
+    Serial.printf(" Maker     ringing %.2f kHz for %.1f ms, one firing in %u (every %.0f ms)\n", makerHz() / 1000.0f,
+                  kBurstUs / 1000.0f, knockEvery, firingUs() * knockEvery / 1000.0f);
+  }
   Serial.printf(" Level     now %.0f  normal %.0f  threshold %.0f  loudest %.0f   (the dash's 0-255 scale; at %u RPM)\n",
                 detector.level(), detector.baseline(), detector.threshold(), period.loudest, rpm);
   Serial.printf(" Bursts    last 2 s: %u loud (%u knock-like)   since start: %lu (%lu)\n", period.bursts, period.knockLike,
@@ -192,7 +278,8 @@ void printReport(uint32_t now) {
     Serial.println();
   }
   if (toneHz > 0.0f) Serial.printf(" Tone      a steady tone at %.2f kHz (pump PWM, alternator, a power supply?)\n", toneHz / 1000.0f);
-  const char *verdict = !detector.learned() ? "LEARNING what normal sounds like" : detector.critical() ? "KNOCK (critical)" :
+  const char *verdict = stuckHigh || stuckLow ? "CANNOT HEAR: the input is stuck (see Amp out)" :
+                        !detector.learned() ? "LEARNING what normal sounds like" : detector.critical() ? "KNOCK (critical)" :
                         detector.warning() ? "KNOCK (warning)" : "OK";
   Serial.printf(" Verdict   %s\n", verdict);
 }
@@ -211,12 +298,28 @@ void command(char *text) {
     break;
   case 'r': case 'R':
     if (value >= 0.0f && value <= 9000.0f) rpm = static_cast<uint16_t>(value);
+    restartMaker();
     Serial.printf(">> Pretending %u RPM: listening window %.1f ms\n", rpm, knock_dsp::windowFramesFor(rpm) * 0.5f);
     break;
   case 'f': case 'F':
     handHz = value >= 2000.0f && value <= 9000.0f ? value : 0.0f;
     detector.relearn();
+    restartMaker();
     Serial.printf(">> Listening at %.2f kHz (%s)\n", centreHz() / 1000.0f, centreWhy());
+    break;
+  case 'k': case 'K':
+    if (!makerReady) {
+      Serial.printf(">> Knock maker: GPIO%d could not be set up\n", kDrivePin);
+      break;
+    }
+    knockEvery = value >= 1.0f && value <= 50.0f ? static_cast<uint8_t>(value) : 0;
+    restartMaker();
+    if (knockEvery == 0) {
+      Serial.println(F(">> Knock maker off"));
+    } else {
+      Serial.printf(">> Knock maker on GPIO%d: %.2f kHz for %.1f ms on one firing in %u (every %.0f ms at %u RPM)\n", kDrivePin,
+                    makerHz() / 1000.0f, kBurstUs / 1000.0f, knockEvery, firingUs() * knockEvery / 1000.0f, rpm);
+    }
     break;
   case 'm': case 'M':
     if (value >= 1.0f && value <= 10.0f) multiplier = value;
@@ -233,7 +336,7 @@ void command(char *text) {
     relearn();
     break;
   default:
-    Serial.println(F(">> g <gain>  r <rpm>  f <Hz>  m <multiplier>  o <offset>  s (spectrum)  c (learn again)"));
+    Serial.println(F(">> g <gain>  r <rpm>  f <Hz>  m <multiplier>  o <offset>  s (spectrum)  c (learn again)  k <1 in n> (knock maker)"));
   }
 }
 
@@ -321,18 +424,22 @@ void setup() {
   delay(2000);   // Time to open the serial monitor.
   Serial.println();
   Serial.println(F("=== KNOCK TEST: fixed-gain amplifier, no CAN, no pump ==="));
-  Serial.printf("Knock input GPIO%d (ADC1 channel 0). Amplifier limits at the pin %.0f-%.0f mV, rest expected %.0f mV.\n",
-                pins::KNOCK_SENSOR_ADC, KNOCK_ADC_LOW_MV, KNOCK_ADC_HIGH_MV, kExpectedRestMv);
+  Serial.printf("Knock input GPIO%d. Amplifier limits at the pin %.0f-%.0f mV, rest expected %.0f mV.\n",
+                kKnockPin, KNOCK_ADC_LOW_MV, KNOCK_ADC_HIGH_MV, kExpectedRestMv);
   Serial.printf("Bore %d mm: knock expected near %.2f kHz. Gain jumper assumed %.2fx (type g <gain> to change).\n",
                 KNOCK_TEST_BORE_MM, boreHz() / 1000.0f, fittedGain);
   Serial.println(F("Type ? and Enter for the commands."));
   adc_sampler::setKnockLimitsMv(KNOCK_ADC_LOW_MV, KNOCK_ADC_HIGH_MV);
-  adcReady = adc_sampler::begin(pins::KNOCK_SENSOR_ADC, pins::OIL_PRESSURE_ADC, pins::FUEL_PRESSURE_ADC,
+  // The second pin is an unused slot (oil pressure is not read here): GPIO1, so GPIO2 is
+  // not sampled twice per round, which would space the knock samples unevenly.
+  adcReady = adc_sampler::begin(kKnockPin, 1, pins::FUEL_PRESSURE_ADC,
                                 pins::PRE_INJECTION_TEMP_ADC, pins::POST_INJECTION_TEMP_ADC);
   if (!adcReady) Serial.println(F("The ADC did not start."));
   adc_sampler::setKnockExpected(boreHz());
   adc_sampler::setKnockBand(centreHz(), kBandwidthHz);
   finder.begin(boreHz());
+  makerReady = beginMaker();
+  Serial.printf("Knock maker on GPIO%d: %s\n", kDrivePin, makerReady ? "ready, k 4 to start it" : "could not be set up");
   lastPassMs = lastReportMs = lastSpectrumMs = millis();
 }
 

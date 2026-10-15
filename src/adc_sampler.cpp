@@ -280,13 +280,17 @@ bool takeKnockStats(KnockStats &out) {
   statSamples = 0;
   portEXIT_CRITICAL(&lock);
   if (samples == 0) return false;
-  out.low = static_cast<uint16_t>(low < 0.0f ? 0.0f : low);
-  out.high = static_cast<uint16_t>(high > 1023.0f ? 1023.0f : high + 0.5f);
+  // Both ends clamped the same way: a full-scale sample is 1023.75 counts, and clamping
+  // only the high end put it below the low end when every sample was at the top.
+  low = low < 0.0f ? 0.0f : low > 1023.0f ? 1023.0f : low;
+  high = high < 0.0f ? 0.0f : high > 1023.0f ? 1023.0f : high;
+  out.low = static_cast<uint16_t>(low);
+  out.high = static_cast<uint16_t>(high + 0.5f > 1023.0f ? 1023.0f : high + 0.5f);
   out.railed = railed;
   out.samples = samples;
   out.bias = bias;
-  out.lowMv = toMv(low < 0.0f ? 0.0f : low);
-  out.highMv = toMv(high > 1023.0f ? 1023.0f : high);
+  out.lowMv = toMv(low);
+  out.highMv = toMv(high);
   out.restMv = toMv(bias);
   return true;
 }
