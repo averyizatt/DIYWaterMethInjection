@@ -73,21 +73,22 @@ void ecuFramesThatAreNotBelieved() {
 
 void pressureTransducer() {
   analog_inputs::Pressure oil;
-  // 0.5 V at the sensor is 333 mV at the pin: 0 psi. 4.5 V is 3000 mV: 100 psi.
-  oil.update(333.3f);
+  // Through 6.8k / 10k the pin sees 10/16.8 of the sensor: 0.5 V is 297.6 mV at the pin
+  // (0 psi), 2.5 V is 1488.1 mV, 4.5 V is 2678.6 mV (100 psi), 5 V is 2976.2 mV.
+  oil.update(297.6f);
   check(oil.valid && near(oil.psi, 0.0f, 0.1f), "0.5 V: 0 psi");
-  for (int i = 0; i < 60; ++i) oil.update(1666.7f);
+  for (int i = 0; i < 60; ++i) oil.update(1488.1f);
   check(near(oil.psi, 50.0f, 0.2f) && near(oil.sensorV, 2.5f, 0.01f), "2.5 V: 50 psi, after the filter settles");
-  for (int i = 0; i < 60; ++i) oil.update(3000.0f);
+  for (int i = 0; i < 60; ++i) oil.update(2678.6f);
   check(near(oil.psi, 100.0f, 0.2f), "4.5 V: 100 psi");
   oil.update(20.0f);
   check(!oil.valid, "unplugged: not valid");
-  oil.update(1666.7f);
+  oil.update(1488.1f);
   check(oil.valid && near(oil.psi, 50.0f, 0.1f), "plugged back in: the first reading is taken as it is");
-  oil.update(3290.0f);
-  check(!oil.valid, "shorted to 5 V: not valid");
+  oil.update(2976.2f);
+  check(!oil.valid, "shorted to 5 V: not valid, and still inside the ADC's range");
   analog_inputs::Pressure low;
-  low.update(300.0f);
+  low.update(267.9f);
   check(low.valid && low.psi == 0.0f, "slightly under 0.5 V reads 0, not negative");
 }
 

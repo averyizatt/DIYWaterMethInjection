@@ -132,10 +132,13 @@ dash already needs one of them. The controller understands both.
 
 ## Sensors
 
-**Oil and fuel pressure** (0.5-4.5 V, 0-100 psi, 5 V supply): sensor signal - 10 k -
-pin, and 20 k from the pin to ground. The pin sees two thirds of the sensor voltage,
-3.0 V at 100 psi. These are the dividers the Nano board used; they move over as they
-are. A sensor that is unplugged or shorted reads as a fault, not as zero pressure.
+**Oil and fuel pressure** (0.5-4.5 V, 0-100 psi, 5 V supply): sensor signal - 6.8 k -
+pin, 10 k from the pin to ground, and 100 nF from the pin to ground. The pin sees 0.595
+of the sensor voltage: 0.30 V at 0 psi, 2.68 V at 100 psi, and 2.98 V for a sensor stuck
+at 5 V, so even that fault reads inside the ADC's range (about 3.1 V). The Nano board's
+10 k / 20 k would put full scale at 3.0 V with no room above it; do not move those over.
+A sensor that is unplugged or shorted reads as a fault, not as zero pressure. Other
+dividers: change `kTopOhms` and `kBottomOhms` in `include/analog_inputs.h`.
 
 **Air temperature** (GM-style thermistor): 3.3 V - 2.49 k - pin - sensor - ground.
 On the Nano the 2.49 k went to 5 V; here it must go to the DevKit's `3V3` pin.

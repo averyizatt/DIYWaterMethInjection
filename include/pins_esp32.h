@@ -13,8 +13,8 @@ constexpr int CAN_SPI_MISO = 13;
 
 // Analog inputs, all on ADC1 (0-3.1 V at the pin). Sampled together by adc_sampler.
 constexpr int KNOCK_SENSOR_ADC = 1;        // ADC1 channel 0: knock amplifier, resting near 1.65 V
-constexpr int OIL_PRESSURE_ADC = 2;        // ADC1 channel 1: 0.5-4.5 V sensor through 10k/20k
-constexpr int FUEL_PRESSURE_ADC = 4;       // ADC1 channel 3: 0.5-4.5 V sensor through 10k/20k
+constexpr int OIL_PRESSURE_ADC = 2;        // ADC1 channel 1: 0.5-4.5 V sensor through 6.8k/10k
+constexpr int FUEL_PRESSURE_ADC = 4;       // ADC1 channel 3: 0.5-4.5 V sensor through 6.8k/10k
 constexpr int PRE_INJECTION_TEMP_ADC = 5;  // ADC1 channel 4: intake air before the nozzle
 constexpr int POST_INJECTION_TEMP_ADC = 6; // ADC1 channel 5: spare; intake air after the nozzle if fitted
 constexpr float INTAKE_TEMP_PULLUP_OHMS = 2490.0f;  // Each thermistor: 3.3 V -> 2.49k -> pin -> sensor -> GND

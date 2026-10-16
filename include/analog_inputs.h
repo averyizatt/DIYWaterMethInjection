@@ -9,8 +9,10 @@
 
 namespace analog_inputs {
 
-// 0.5-4.5 V, 0-100 psi pressure transducer (5 V supply) read through a 10k/20k divider:
-// the pin sees two thirds of the sensor voltage, 3.0 V at full scale.
+// 0.5-4.5 V, 0-100 psi pressure transducer (5 V supply) read through a 6.8k / 10k divider
+// (sensor - 6.8k - pin - 10k - ground, 100 nF from the pin to ground): the pin sees 0.595
+// of the sensor voltage, 2.68 V at full scale and 2.98 V for a sensor stuck at 5 V, so a
+// fault still reads inside the ADC's range. The Nano board keeps its own 10k / 20k.
 struct Pressure {
   float psi{0.0f};
   float sensorV{0.0f};
@@ -19,7 +21,7 @@ struct Pressure {
 
   // Returns the filtered pressure state after one reading of the pin voltage.
   void update(float pinMv) {
-    constexpr float kTopOhms = 10000.0f, kBottomOhms = 20000.0f;
+    constexpr float kTopOhms = 6800.0f, kBottomOhms = 10000.0f;
     sensorV = pinMv / 1000.0f * (kTopOhms + kBottomOhms) / kBottomOhms;
     // Below 0.1 V: unplugged or shorted to ground. Above 4.85 V: open ground or shorted to 5 V.
     if (sensorV < 0.10f || sensorV > 4.85f) { valid = false; seen = false; return; }
