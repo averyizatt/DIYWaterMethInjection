@@ -821,9 +821,10 @@ void handleTuneCommand(byte len, const byte *data) {
   } else {
     status = ack::UNSUPPORTED_COMMAND;
   }
-  if (!transmitCanFrame(can_protocol::packMethTuneAck(data[0], status, subject, value, tuneRevision), "0x30F-ack")) {
-    canOnline = false;
-  }
+  // A reply that did not go out is counted by transmitCanFrame, which resets the
+  // controller only when sending keeps failing; one lost reply must not take the
+  // Nano off the bus (the dash simply asks again).
+  transmitCanFrame(can_protocol::packMethTuneAck(data[0], status, subject, value, tuneRevision), "0x30F-ack");
 }
 
 void updateIntakeTemps(uint32_t now) {
@@ -960,10 +961,7 @@ void handleCanFrame(unsigned long id, byte len, const byte *data) {
     if (kSerialCanVerbose) {
       Serial.println(F("CAN RX: config request 0x305, sending 0x30C/0x30D"));
     }
-    if (!sendKnockConfigPages()) {
-      Serial.println(F("CAN: config request TX failed, will retry init"));
-      canOnline = false;
-    }
+    sendKnockConfigPages();   // A failure is counted; the dash asks again.
     return;
   }
 
@@ -1176,15 +1174,12 @@ void handleCanFrame(unsigned long id, byte len, const byte *data) {
     break;
   }
 
-  if (!sendConfigAck(data[0], ackStatus, ackValue)) {
-    Serial.println(F("CAN: config ACK TX failed, will retry init"));
-    canOnline = false;
-  } else if (commandAccepted &&
-             (ackStatus == can_protocol::config_ack_status::OK ||
-              ackStatus == can_protocol::config_ack_status::VALUE_CLAMPED) &&
-             !sendKnockConfigPages()) {
-    Serial.println(F("CAN: config page TX failed, will retry init"));
-    canOnline = false;
+  // Failures are counted by transmitCanFrame, which resets the controller only when
+  // sending keeps failing. Before, one lost reply took the Nano off the bus for 2 s.
+  if (sendConfigAck(data[0], ackStatus, ackValue) && commandAccepted &&
+      (ackStatus == can_protocol::config_ack_status::OK ||
+       ackStatus == can_protocol::config_ack_status::VALUE_CLAMPED)) {
+    sendKnockConfigPages();
   }
 }
 
