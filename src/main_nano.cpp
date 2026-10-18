@@ -167,6 +167,14 @@ constexpr uint32_t kCanConfigTxMs = 1000;
 constexpr uint32_t kSerialHeartbeatMs = 1000;
 constexpr bool kSerialCanVerbose = false;
 constexpr uint8_t kBaroSampleCount = 16;
+// The barometer measured at the last start with the engine stopped, kept for a restart
+// with it running: magic, kPa, check byte. After the tune block (addresses 0..40).
+constexpr int kBaroEepromAddress = 64;
+constexpr uint8_t kBaroEepromMagic = 0x42;
+// The dash sends the engine RPM (0x309) every 50 ms; this long without it means the dash
+// is not up yet, which at key-on is normal.
+constexpr uint16_t kStartRpmListenMs = 300;
+constexpr uint16_t kEngineRunningRpm = 300;
 constexpr float kMinStartupBaroKpa = 60.0f;
 constexpr float kMaxStartupBaroKpa = 110.0f;
 constexpr uint16_t kAnalogFaultOilPressure = 1U << 0;
@@ -409,7 +417,41 @@ bool initCanBus() {
   return true;
 }
 
-void calibrateStartupBaro() {
+// A restart with the engine already running (a reset while driving) must not take the
+// manifold pressure for the barometer: at part throttle that reads 60-85 kPa, inside the
+// plausible range, and every boost reading for the rest of the drive would be several psi
+// high. So listen briefly for the dash's engine RPM first.
+void handleEngineRuntimeFrame(byte len, const byte *data);
+
+bool engineRunningAtStart() {
+  if (!canOnline) return false;
+  const uint32_t start = millis();
+  while (!elapsed(millis(), start, kStartRpmListenMs)) {
+    unsigned long rxId = 0;
+    byte len = 0;
+    byte data[8] = {};
+    if (canBus.checkReceive() == CAN_MSGAVAIL && canBus.readMsgBuf(&rxId, &len, data) == CAN_OK &&
+        rxId == can_protocol::ID_ENGINE_RUNTIME) {
+      handleEngineRuntimeFrame(len, data);
+      if (engineRpmValid && engineRpm >= kEngineRunningRpm) return true;
+    }
+  }
+  return false;
+}
+
+void calibrateStartupBaro(bool engineRunning) {
+  if (engineRunning) {
+    const uint8_t saved = EEPROM.read(kBaroEepromAddress + 1);
+    if (EEPROM.read(kBaroEepromAddress) == kBaroEepromMagic &&
+        EEPROM.read(kBaroEepromAddress + 2) == static_cast<uint8_t>(saved ^ kBaroEepromMagic) &&
+        saved >= kMinStartupBaroKpa && saved <= kMaxStartupBaroKpa) {
+      config.map.baroKpa = saved;
+      mapSensor.begin(pins::MAP_SENSOR_ADC, config.map);
+    }
+    Serial.print(F("MAP baro: engine running, kept "));
+    Serial.println(static_cast<int>(config.map.baroKpa + 0.5f));
+    return;
+  }
   float mapTotalKpa = 0.0f;
   uint8_t validSamples = 0;
 
@@ -431,6 +473,10 @@ void calibrateStartupBaro() {
 
   config.map.baroKpa = mapTotalKpa / static_cast<float>(validSamples);
   mapSensor.begin(pins::MAP_SENSOR_ADC, config.map);
+  const uint8_t kpa = static_cast<uint8_t>(config.map.baroKpa + 0.5f);
+  EEPROM.update(kBaroEepromAddress, kBaroEepromMagic);   // Writes only a changed byte
+  EEPROM.update(kBaroEepromAddress + 1, kpa);
+  EEPROM.update(kBaroEepromAddress + 2, static_cast<uint8_t>(kpa ^ kBaroEepromMagic));
   Serial.print(F("MAP baro calibrated to "));
   Serial.print(static_cast<int>(config.map.baroKpa + 0.5f));
   Serial.println(F(" kPa"));
@@ -1437,7 +1483,6 @@ void setup() {
   Serial.println(config.serialBaud);
 
   mapSensor.begin(pins::MAP_SENSOR_ADC, config.map);
-  calibrateStartupBaro();
   oilPressureSensor.begin(make100PsiDividerPressureConfig(pins::OIL_PRESSURE_ADC));
   fuelPressureSensor.begin(make100PsiDividerPressureConfig(pins::FUEL_PRESSURE_ADC));
   floatSensor.begin(pins::FLOAT_SENSOR_DIGITAL,
@@ -1458,6 +1503,7 @@ void setup() {
   Serial.println(pins::KNOCK_SENSOR_ADC);
   canOnline = initCanBus();
   lastCanRetryMs = millis();
+  calibrateStartupBaro(engineRunningAtStart());
 }
 
 void loop() {
