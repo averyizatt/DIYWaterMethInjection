@@ -70,6 +70,9 @@ Run simulate(Governor &g, const Settings &s, uint32_t fromMs, uint32_t toMs, Inp
 Settings defaults() {
   Settings s;
   loadDefaults(s);
+  // These tests were written around a 5 psi start; the shipped start is 0.5 psi
+  // (checked in the meth tune tests).
+  s.value[kStartPsiX10] = 50;
   return s;
 }
 
@@ -483,6 +486,11 @@ void hotIntakeAirAddsRunTime() {
 } // namespace
 
 int main() {
+  {
+    Settings shipped;
+    loadDefaults(shipped);
+    check(shipped.value[kStartPsiX10] == 5 && rangeOf(kStartPsiX10).min == 5, "injection starts at 0.5 psi, the lowest setting");
+  }
   defaultsAreConservativeAndValid();
   settingsClampAndNeverRaiseOtherValues();
   onTimeRisesWithBoost();

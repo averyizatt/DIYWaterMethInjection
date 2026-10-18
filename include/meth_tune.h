@@ -89,7 +89,7 @@ inline Range rangeOf(uint8_t key) {
   case kPeriodMs: return {1000, 10000, 4000};
   case kMinOnMs: return {kShortestPulseMs, 10000, 1000};
   case kMaxOnMs: return {kShortestPulseMs, 10000, 2000};
-  case kStartPsiX10: return {10, 300, 50};
+  case kStartPsiX10: return {5, 300, 5};   // From 0.5 psi (owner, October 2026)
   case kFullPsiX10: return {20, 350, 100};
   case kMinRpm: return {0, 8000, 2500};
   case kMaxSprayS: return {1, 120, 12};

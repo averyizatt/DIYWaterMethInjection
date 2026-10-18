@@ -7,6 +7,7 @@
 #include "actuators.h"
 #include "app_config.h"
 #include "can_contract/can_protocol.h"
+#include "ecu_broadcast.h"
 #include "injection_controller.h"
 #include "knock_band.h"
 #include "meth_tune.h"
@@ -55,7 +56,10 @@ namespace {
 AppConfig config = defaultConfig();
 TankBlend blend = computeTankBlend(1.5f, 0.5f);
 
-MapSensor mapSensor;
+// Manifold pressure, barometer, RPM and intake temperature from the MicroSquirt's CAN
+// broadcast (ecu_broadcast.h, as on the ESP32 board): this controller reads no MAP sensor.
+ecu::Data ecuData;
+uint8_t savedBaroKpa = 0;
 FloatSensor floatSensor;
 PressureSensor oilPressureSensor;
 PressureSensor fuelPressureSensor;
@@ -107,7 +111,6 @@ uint32_t lastKnockHookTxMs = 0;
 uint32_t lastCanConfigTxMs = 0;
 uint32_t lastCanRetryMs = 0;
 uint32_t lastCanDiagMs = 0;
-uint32_t lastCanRxPollMs = 0;
 uint32_t lastCanCommandMs = 0;
 uint32_t lastCanTxFailureLogMs = 0;
 uint32_t lastEngineRuntimeRxMs = 0;
@@ -153,7 +156,6 @@ constexpr uint16_t kKnockBiasLowAdc = 150;
 constexpr uint16_t kKnockBiasHighAdc = 870;
 constexpr uint32_t kCanRetryMs = 2000;
 constexpr uint32_t kCanDiagMs = 3000;
-constexpr uint32_t kCanRxFallbackPollMs = 50;
 constexpr uint32_t kCanCommandTimeoutMs = 3000;
 constexpr uint32_t kManualTestTimeoutMs = 5000;
 constexpr uint32_t kCanTxFailureLogMs = 1000;
@@ -166,17 +168,10 @@ constexpr uint32_t kKnockHookTxMs = 50;
 constexpr uint32_t kCanConfigTxMs = 1000;
 constexpr uint32_t kSerialHeartbeatMs = 1000;
 constexpr bool kSerialCanVerbose = false;
-constexpr uint8_t kBaroSampleCount = 16;
-// The barometer measured at the last start with the engine stopped, kept for a restart
-// with it running: magic, kPa, check byte. After the tune block (addresses 0..40).
+// The last barometer, for a start with the engine already running: magic, kPa, check
+// byte. After the tune block (addresses 0..40).
 constexpr int kBaroEepromAddress = 64;
 constexpr uint8_t kBaroEepromMagic = 0x42;
-// The dash sends the engine RPM (0x309) every 50 ms; this long without it means the dash
-// is not up yet, which at key-on is normal.
-constexpr uint16_t kStartRpmListenMs = 300;
-constexpr uint16_t kEngineRunningRpm = 300;
-constexpr float kMinStartupBaroKpa = 60.0f;
-constexpr float kMaxStartupBaroKpa = 110.0f;
 constexpr uint16_t kAnalogFaultOilPressure = 1U << 0;
 constexpr uint16_t kAnalogFaultFuelPressure = 1U << 1;
 constexpr uint16_t kAnalogFaultMethPressure = 1U << 2;
@@ -417,69 +412,36 @@ bool initCanBus() {
   return true;
 }
 
-// A restart with the engine already running (a reset while driving) must not take the
-// manifold pressure for the barometer: at part throttle that reads 60-85 kPa, inside the
-// plausible range, and every boost reading for the rest of the drive would be several psi
-// high. So listen briefly for the dash's engine RPM first.
-void handleEngineRuntimeFrame(byte len, const byte *data);
-
-bool engineRunningAtStart() {
-  if (!canOnline) return false;
-  const uint32_t start = millis();
-  while (!elapsed(millis(), start, kStartRpmListenMs)) {
-    unsigned long rxId = 0;
-    byte len = 0;
-    byte data[8] = {};
-    if (canBus.checkReceive() == CAN_MSGAVAIL && canBus.readMsgBuf(&rxId, &len, data) == CAN_OK &&
-        rxId == can_protocol::ID_ENGINE_RUNTIME) {
-      handleEngineRuntimeFrame(len, data);
-      if (engineRpmValid && engineRpm >= kEngineRunningRpm) return true;
-    }
+// Atmospheric pressure, for boost = MAP - barometer: the ECU's own barometer when it
+// broadcasts one; otherwise its MAP with the engine stopped (key on, the manifold is at
+// atmospheric pressure). Kept in EEPROM for a start with the engine already running.
+void updateBaro(uint32_t now, bool mapFresh) {
+  float baro = NAN;
+  if (ecuData.baroKnown()) {
+    baro = ecuData.baroKpa;
+  } else if (mapFresh && ecuData.rpmFresh(now) && ecuData.rpm == 0 &&
+             ecuData.mapKpa >= ecu::kMinBaroKpa && ecuData.mapKpa <= ecu::kMaxBaroKpa) {
+    baro = ecuData.mapKpa;
   }
-  return false;
-}
-
-void calibrateStartupBaro(bool engineRunning) {
-  if (engineRunning) {
-    const uint8_t saved = EEPROM.read(kBaroEepromAddress + 1);
-    if (EEPROM.read(kBaroEepromAddress) == kBaroEepromMagic &&
-        EEPROM.read(kBaroEepromAddress + 2) == static_cast<uint8_t>(saved ^ kBaroEepromMagic) &&
-        saved >= kMinStartupBaroKpa && saved <= kMaxStartupBaroKpa) {
-      config.map.baroKpa = saved;
-      mapSensor.begin(pins::MAP_SENSOR_ADC, config.map);
-    }
-    Serial.print(F("MAP baro: engine running, kept "));
-    Serial.println(static_cast<int>(config.map.baroKpa + 0.5f));
-    return;
-  }
-  float mapTotalKpa = 0.0f;
-  uint8_t validSamples = 0;
-
-  for (uint8_t i = 0; i < kBaroSampleCount; ++i) {
-    const SensorReadings sample = mapSensor.read();
-    if (sample.mapValid && sample.mapKpa >= kMinStartupBaroKpa && sample.mapKpa <= kMaxStartupBaroKpa) {
-      mapTotalKpa += sample.mapKpa;
-      ++validSamples;
-    }
-    delay(5);
-  }
-
-  if (validSamples == 0) {
-    Serial.print(F("MAP baro kept at "));
-    Serial.print(static_cast<int>(config.map.baroKpa + 0.5f));
-    Serial.println(F(" kPa"));
-    return;
-  }
-
-  config.map.baroKpa = mapTotalKpa / static_cast<float>(validSamples);
-  mapSensor.begin(pins::MAP_SENSOR_ADC, config.map);
-  const uint8_t kpa = static_cast<uint8_t>(config.map.baroKpa + 0.5f);
-  EEPROM.update(kBaroEepromAddress, kBaroEepromMagic);   // Writes only a changed byte
+  if (isnan(baro)) return;
+  config.map.baroKpa = baro;
+  // Saved only on a change of 2 kPa or more: an EEPROM write stalls the loop for a few ms.
+  const uint8_t kpa = static_cast<uint8_t>(baro + 0.5f);
+  if (kpa + 1 >= savedBaroKpa && kpa <= savedBaroKpa + 1) return;
+  savedBaroKpa = kpa;
+  EEPROM.update(kBaroEepromAddress, kBaroEepromMagic);
   EEPROM.update(kBaroEepromAddress + 1, kpa);
   EEPROM.update(kBaroEepromAddress + 2, static_cast<uint8_t>(kpa ^ kBaroEepromMagic));
-  Serial.print(F("MAP baro calibrated to "));
-  Serial.print(static_cast<int>(config.map.baroKpa + 0.5f));
-  Serial.println(F(" kPa"));
+}
+
+void loadSavedBaro() {
+  const uint8_t saved = EEPROM.read(kBaroEepromAddress + 1);
+  if (EEPROM.read(kBaroEepromAddress) == kBaroEepromMagic &&
+      EEPROM.read(kBaroEepromAddress + 2) == static_cast<uint8_t>(saved ^ kBaroEepromMagic) &&
+      saved >= ecu::kMinBaroKpa && saved <= ecu::kMaxBaroKpa) {
+    config.map.baroKpa = saved;
+    savedBaroKpa = saved;
+  }
 }
 
 PressureConfig make100PsiDividerPressureConfig(int pin) {
@@ -974,6 +936,12 @@ void handleEngineRuntimeFrame(byte len, const byte *data) {
 }
 
 uint16_t currentEngineRpm(uint32_t now) {
+  if (ecuData.rpmFresh(now)) {   // The ECU's own broadcast first; the dash's 0x309 otherwise.
+    engineRpm = ecuData.rpm;
+    engineRpmValid = true;
+    lastEngineRuntimeRxMs = now;
+    return engineRpm;
+  }
   if (!engineRpmValid || elapsed(now, lastEngineRuntimeRxMs, kEngineRuntimeTimeoutMs)) {
     engineRpmValid = false;
     return 0;
@@ -1274,6 +1242,24 @@ void queueKnockFault(uint8_t code, uint8_t severity, uint8_t data0, uint8_t data
   knockFaultPending = true;
 }
 
+// Every frame waiting in the CAN controller. It holds only two, and the ECU's broadcast
+// alone fills them within milliseconds, so this runs on every pass of loop(); before,
+// frames were read once per 20 ms pass and the rest (commands included) were lost.
+void receiveCan(uint32_t now) {
+  if (!canOnline) return;
+  for (byte n = 0; n < 16 && canBus.checkReceive() == CAN_MSGAVAIL; ++n) {
+    unsigned long rxId = 0;
+    byte len = 0;
+    byte data[8] = {};
+    if (canBus.readMsgBuf(&rxId, &len, data) != CAN_OK) break;
+#if CCM_CAN_RX_TRACE
+    printCanFrame(rxId, len, data);
+#endif
+    if (ecu::accept(static_cast<uint16_t>(rxId), data, len, now, ecuData)) continue;
+    handleCanFrame(rxId, len, data);
+  }
+}
+
 void serviceCanBus(uint32_t now,
                    const SensorReadings &readings,
                    const ControlResult &result,
@@ -1294,30 +1280,7 @@ void serviceCanBus(uint32_t now,
 #endif
   applyCanCommandTimeout(now);
 
-  const bool interruptActive = digitalRead(pins::CAN_SPI_INT) == LOW;
-  const bool fallbackPollDue = elapsed(now, lastCanRxPollMs, kCanRxFallbackPollMs);
-  byte framesRead = 0;
-  if (interruptActive || fallbackPollDue) lastCanRxPollMs = now;
-  // Poll the controller periodically even when INT is stuck high or its wire
-  // is open. checkReceive() also avoids treating an error-only interrupt as a
-  // failed frame read.
-  while ((interruptActive || fallbackPollDue) && framesRead < 8 &&
-         canBus.checkReceive() == CAN_MSGAVAIL) {
-    unsigned long rxId = 0;
-    byte len = 0;
-    byte data[8] = {};
-
-    if (canBus.readMsgBuf(&rxId, &len, data) == CAN_OK) {
-#if CCM_CAN_RX_TRACE
-      printCanFrame(rxId, len, data);
-#endif
-      handleCanFrame(rxId, len, data);
-    } else {
-      Serial.println(F("CAN: read failed"));
-      break;
-    }
-    ++framesRead;
-  }
+  receiveCan(now);
 
   const uint8_t commandedDuty = manualTestActive ? manualTestDuty :
       can_protocol::clampU8(static_cast<int>(result.finalDutyPercent + 0.5f));
@@ -1482,7 +1445,7 @@ void setup() {
   Serial.print(F("BOOT: serial baud="));
   Serial.println(config.serialBaud);
 
-  mapSensor.begin(pins::MAP_SENSOR_ADC, config.map);
+  loadSavedBaro();
   oilPressureSensor.begin(make100PsiDividerPressureConfig(pins::OIL_PRESSURE_ADC));
   fuelPressureSensor.begin(make100PsiDividerPressureConfig(pins::FUEL_PRESSURE_ADC));
   floatSensor.begin(pins::FLOAT_SENSOR_DIGITAL,
@@ -1503,15 +1466,26 @@ void setup() {
   Serial.println(pins::KNOCK_SENSOR_ADC);
   canOnline = initCanBus();
   lastCanRetryMs = millis();
-  calibrateStartupBaro(engineRunningAtStart());
 }
 
 void loop() {
   const uint32_t now = millis();
+  receiveCan(now);   // Every pass, not every 20 ms: the controller holds only two frames.
   if (!elapsed(now, lastLoopMs, config.loopPeriodMs)) return;
   lastLoopMs = now;
 
-  SensorReadings readings = mapSensor.read();
+  // Boost from the ECU's broadcast. No fresh MAP means no injection (MapInvalid, fault bit 1).
+  SensorReadings readings{};
+  const bool mapFresh = ecuData.mapFresh(now);
+  updateBaro(now, mapFresh);
+  readings.mapValid = mapFresh;
+  readings.mapKpa = mapFresh ? ecuData.mapKpa : config.map.baroKpa;
+  readings.boostPsi = (readings.mapKpa - config.map.baroKpa) * kPsiPerKpa;
+  if (ecuData.intakeFresh(now)) {
+    ecuIntakeC = ecuData.intakeC;
+    ecuIntakeSeenMs = now;
+    ecuIntakeSeen = true;
+  }
   readings.tankLow = floatSensor.update();
   updatePressureReadings(readings, now);
   updateIntakeTemps(now);

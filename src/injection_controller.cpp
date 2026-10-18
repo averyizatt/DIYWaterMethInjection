@@ -79,7 +79,9 @@ ControlResult InjectionController::update(const SensorReadings &readings, const 
     return result;
   }
 
-  const float onThreshold = config.boost.startPsi + kBoostHysteresisPsi;
+  // Injection starts at the start boost itself and stops a little below it, so a start
+  // as low as 0.5 psi means 0.5 psi (it used to need start + 0.6 psi to begin).
+  const float onThreshold = config.boost.startPsi;
   const float offThreshold = config.boost.startPsi - kBoostHysteresisPsi;
   const bool emergencyNow = readings.boostPsi >= config.boost.overboostEmergencyPsi;
   const bool warnNow = readings.boostPsi >= config.boost.overboostWarnPsi;

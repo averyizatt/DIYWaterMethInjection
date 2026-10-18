@@ -38,6 +38,9 @@ Inputs idle(uint8_t reason = kHoldBelowBoost) {
 Settings defaults() {
   Settings s;
   loadDefaults(s);
+  // These tests were written around a 5 psi start; the shipped start is 0.5 psi
+  // (checked in the meth tune tests).
+  s.value[kStartPsiX10] = 50;
   return s;
 }
 

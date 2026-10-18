@@ -2,7 +2,9 @@
 
 Two boards run this controller, with the same CAN messages:
 
-- **Arduino Nano** (`src/main_nano.cpp`): pump on a mechanical relay, its own MAP sensor.
+- **Arduino Nano** (`src/main_nano.cpp`): pump on a mechanical relay; manifold pressure,
+  barometer and RPM from the MicroSquirt's CAN broadcast, as on the ESP32 board (its own
+  MAP sensor is no longer read: October 2026, the owner's choice).
 - **ESP32-S3** (`src/main_esp32.cpp`, the replacement): pump on a MOSFET with PWM,
   manifold pressure and RPM from the MicroSquirt over CAN, firmware updates from the
   dash over CAN. See [ESP32-S3 board](#esp32-s3-board-pump-on-a-mosfet-with-pwm) and
@@ -11,7 +13,7 @@ Two boards run this controller, with the same CAN messages:
 Standalone Arduino Nano firmware for a water/meth controller with:
 
 - MCP2515 (SPI) CAN bus only
-- MAP/float/temperature/pressure analog sensing
+- Float/temperature/pressure analog sensing; boost from the ECU over CAN (`include/ecu_broadcast.h`)
 - Pump control and failsafe handling
 - Knock DSP detection with CAN telemetry hooks for a remote UI/main controller
 
@@ -56,7 +58,7 @@ ECU's intake air temperature, which the dash forwards about four times a second
 | Cycle length | 1000-10000 ms | 4000 |
 | Pump on-time at start boost | 500-10000 ms | 1000 |
 | Pump on-time at full boost | 500-10000 ms (= cycle: continuous) | 2000 |
-| Start boost | 1.0-30.0 psi | 5.0 |
+| Start boost | 0.5-30.0 psi | 0.5 |
 | Full boost | 2.0-35.0 psi | 10.0 |
 | Minimum engine RPM | 0-8000 | 2500 |
 | Longest continuous spray | 1-120 s | 12 |
@@ -72,6 +74,14 @@ ECU's intake air temperature, which the dash forwards about four times a second
 | Hot air reaches full on-time at | 20-150 C | 70 |
 
 Settings apply at once and are kept in RAM until a SAVE action writes them to EEPROM.
+Injection starts at the start boost and stops 0.6 psi below it.
+
+Boost is the ECU's manifold pressure minus its barometer, both from its CAN broadcast
+(0x5E8, or the real-time groups at 0x5F0/0x700). Without a barometer frame the
+manifold pressure with the engine stopped stands in, and the last value is kept in
+EEPROM (addresses 64-66) for a start with the engine already running. No fresh
+manifold pressure (500 ms) means no injection: fault bit 1, 'no manifold pressure'.
+
 A blank or corrupt EEPROM loads the defaults above. The older boost-start command
 (`0x301/0x04`) and the `0x304` configuration frame set the same start-boost value.
 
