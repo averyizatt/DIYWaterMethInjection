@@ -1698,6 +1698,13 @@ void loop() {
     Serial.print(static_cast<int>(readings.oilPressurePsi + 0.5f));
     Serial.print(readings.oilPressureValid ? F(" fuel=") : F("! fuel="));
     Serial.print(static_cast<int>(readings.fuelPressurePsi + 0.5f));
+    // The sensor's own output (before the divider), so a fault says which kind: about 0 mV
+    // is a wire off, an unpowered sensor or a resistive sender with no pull-up; 4850 mV or
+    // more is the signal tied to 5 V. A working 0.5-4.5 V sensor reads 500-4500.
+    Serial.print(F(" fuelmV="));
+    Serial.print(static_cast<int>(fuelPressureSensor.sensorVoltage() * 1000.0f));
+    Serial.print(F(" oilmV="));
+    Serial.print(static_cast<int>(oilPressureSensor.sensorVoltage() * 1000.0f));
     Serial.print(readings.fuelPressureValid ? F(" knock=") : F("! knock="));
     Serial.println(knockDetected ? 1 : 0);
 #endif
