@@ -1018,8 +1018,19 @@ void handleCanFrame(unsigned long id, byte len, const byte *data) {
   uint8_t ackStatus = can_protocol::config_ack_status::OK;
   uint8_t ackValue = len >= 2 ? data[1] : 0;
   bool commandAccepted = true;
+  bool restartAfterAck = false;
 
   switch (data[0]) {
+  case can_protocol::meth_command::RESTART:
+    // Asked for by the dash (Software & power). Not while the pump is running: that
+    // injection is finished first, and the dash says the controller is busy.
+    if (lastPumpOn || manualTestActive) {
+      ackStatus = can_protocol::config_ack_status::BUSY;
+      commandAccepted = false;
+    } else {
+      restartAfterAck = true;
+    }
+    break;
   case can_protocol::meth_command::ARM:
     if (len >= 2) {
       config.mode = data[1] ? InjectionMode::BoostOnly : InjectionMode::Off;
@@ -1191,7 +1202,17 @@ void handleCanFrame(unsigned long id, byte len, const byte *data) {
 
   // Failures are counted by transmitCanFrame, which resets the controller only when
   // sending keeps failing. Before, one lost reply took the Nano off the bus for 2 s.
-  if (sendConfigAck(data[0], ackStatus, ackValue) && commandAccepted &&
+  const bool acknowledged = sendConfigAck(data[0], ackStatus, ackValue);
+  if (restartAfterAck) {
+    pumpDriver.setRelay(false);
+    Serial.println(F("CAN: restart asked for by the dash"));
+    Serial.flush();
+    delay(20);                 // The acknowledgement leaves the CAN controller
+    wdt_enable(WDTO_15MS);     // The watchdog resets the board; setup starts it safe
+    for (;;) {
+    }
+  }
+  if (acknowledged && commandAccepted &&
       (ackStatus == can_protocol::config_ack_status::OK ||
        ackStatus == can_protocol::config_ack_status::VALUE_CLAMPED)) {
     sendKnockConfigPages();

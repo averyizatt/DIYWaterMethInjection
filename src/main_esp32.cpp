@@ -1137,6 +1137,10 @@ void handleUpdateFrame(const RxFrame &rx, uint32_t now) {
     transmitCanFrame(fw::packAck(fw::TARGET_WATER_METH, fw::BEGIN, fw::STATUS_BUSY), "0x681");
     return;
   }
+  if (in.data[0] == fw::RESTART && in.data[1] == fw::TARGET_WATER_METH && injectionNeeded(now)) {
+    transmitCanFrame(fw::packAck(fw::TARGET_WATER_METH, fw::RESTART, fw::STATUS_BUSY), "0x681");
+    return;   // Not while injecting: asked again once the car is parked
+  }
   fw::Action action = fw::Action::NONE;
   if (!updater.handle(in, reply, now, action)) return;
   transmitCanFrame(reply, "0x681");
