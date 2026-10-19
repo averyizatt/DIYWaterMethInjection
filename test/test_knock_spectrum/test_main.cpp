@@ -275,7 +275,20 @@ void aSpectrumIsReadAtAnyFrequency() {
 }
 } // namespace
 
+// The start-up check that decides whether the board uses ESP-DSP: on a PC both sides are
+// the portable code, so it must find them the same (its own arithmetic and limits).
+void theStartUpCheckAcceptsCodeThatAgrees() {
+  Blocks blocks;
+  blocks.configure(38462.0f, 5966.0f);
+  knock_dsp::espDspOn() = true;
+  check(checkEspDsp(blocks, 38462.0f), "the start-up check passes code that agrees with the reference");
+  check(knock_dsp::espDspOn(), "and leaves it on");
+  knock_dsp::espDspOn() = false;
+  check(!checkEspDsp(blocks, 38462.0f), "nothing to check when it is off");
+}
+
 int main() {
+  theStartUpCheckAcceptsCodeThatAgrees();
   theSpectrumIsRight();
   aSpectrumIsReadAtAnyFrequency();
   theFloorShowsTonesNotBursts();

@@ -37,10 +37,37 @@
 // in 10-bit ADC counts (fractions kept); the detector's level, learned level and
 // threshold are in half counts, 255 = full scale, as the Nano's are and as the CAN
 // messages carry them.
+//
+// On the ESP32-S3 the filters and the frame energies run a whole ADC chunk at a time
+// through Espressif's ESP-DSP library (part of the Arduino core), which uses the S3's
+// vector instructions. The portable code below is the reference: the board compares
+// the two on a test signal at start-up (selfCheck) and keeps the portable code if they
+// ever disagree. On a PC only the portable code exists.
 #include <math.h>
 #include <stdint.h>
 
+#ifndef KNOCK_USE_ESP_DSP
+#if defined(ESP_PLATFORM) && defined(__has_include)
+#if __has_include(<esp_dsp.h>)
+#define KNOCK_USE_ESP_DSP 1
+#endif
+#endif
+#endif
+#ifndef KNOCK_USE_ESP_DSP
+#define KNOCK_USE_ESP_DSP 0
+#endif
+#if KNOCK_USE_ESP_DSP
+#include <esp_dsp.h>
+#endif
+
 namespace knock_dsp {
+
+// Whether ESP-DSP is in use: built in, and not turned off by the start-up check.
+inline bool &espDspOn() {
+  static bool on = KNOCK_USE_ESP_DSP != 0;
+  return on;
+}
+constexpr uint16_t kMaxBlock = 256;          // Samples handed to FrontEnd::pushBlock at once
 
 constexpr float kTwoPi = 6.2831853f;
 constexpr float kFrameSeconds = 0.0005f;     // Energy is added up in frames this long
@@ -60,55 +87,70 @@ constexpr uint8_t kRpmBins = 8;              // Normal level learned per 1000 RP
 // ---------------------------------------------------------------------------
 // Filters
 // ---------------------------------------------------------------------------
+// Direct form II, laid out as ESP-DSP's dsps_biquad_f32 wants it: coefficients
+// b0 b1 b2 a1 a2, and two state values.
 struct Biquad {
-  float b0{0.0f}, b1{0.0f}, b2{0.0f}, a1{0.0f}, a2{0.0f};
-  float z1{0.0f}, z2{0.0f};
+  float c[5]{0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+  float w[2]{0.0f, 0.0f};
   inline float step(float x) {
-    const float y = b0 * x + z1;
-    z1 = b1 * x - a1 * y + z2;
-    z2 = b2 * x - a2 * y;
+    const float d = x - c[3] * w[0] - c[4] * w[1];
+    const float y = c[0] * d + c[1] * w[0] + c[2] * w[1];
+    w[1] = w[0];
+    w[0] = d;
     return y;
   }
+  // A block of samples; `in` and `out` are different buffers.
+  inline void run(const float *in, float *out, uint16_t n) {
+#if KNOCK_USE_ESP_DSP
+    if (espDspOn()) {
+      dsps_biquad_f32(in, out, n, c, w);
+      return;
+    }
+#endif
+    for (uint16_t i = 0; i < n; ++i) out[i] = step(in[i]);
+  }
 };
+
+// Sum of squares of n values.
+inline float energy(const float *x, uint16_t n) {
+#if KNOCK_USE_ESP_DSP
+  if (espDspOn() && n > 0) {
+    float sum = 0.0f;
+    dsps_dotprod_f32(x, x, &sum, n);
+    return sum;
+  }
+#endif
+  float sum = 0.0f;
+  for (uint16_t i = 0; i < n; ++i) sum += x[i] * x[i];
+  return sum;
+}
+
+inline Biquad coefficients(float b0, float b1, float b2, float a1, float a2) {
+  Biquad f;
+  f.c[0] = b0; f.c[1] = b1; f.c[2] = b2; f.c[3] = a1; f.c[4] = a2;
+  return f;
+}
 
 // Band-pass with a gain of exactly 1 at its centre.
 inline Biquad bandPass(float sampleRate, float centre, float q) {
   const float w = kTwoPi * centre / sampleRate;
   const float alpha = sinf(w) / (2.0f * q);
   const float a0 = 1.0f + alpha;
-  Biquad f;
-  f.b0 = alpha / a0;
-  f.b1 = 0.0f;
-  f.b2 = -alpha / a0;
-  f.a1 = -2.0f * cosf(w) / a0;
-  f.a2 = (1.0f - alpha) / a0;
-  return f;
+  return coefficients(alpha / a0, 0.0f, -alpha / a0, -2.0f * cosf(w) / a0, (1.0f - alpha) / a0);
 }
 
 inline Biquad highPass(float sampleRate, float corner) {
   const float w = kTwoPi * corner / sampleRate;
   const float alpha = sinf(w) / 1.4142136f;   // Q = 0.707
   const float c = cosf(w), a0 = 1.0f + alpha;
-  Biquad f;
-  f.b0 = (1.0f + c) / 2.0f / a0;
-  f.b1 = -(1.0f + c) / a0;
-  f.b2 = f.b0;
-  f.a1 = -2.0f * c / a0;
-  f.a2 = (1.0f - alpha) / a0;
-  return f;
+  return coefficients((1.0f + c) / 2.0f / a0, -(1.0f + c) / a0, (1.0f + c) / 2.0f / a0, -2.0f * c / a0, (1.0f - alpha) / a0);
 }
 
 inline Biquad lowPass(float sampleRate, float corner) {
   const float w = kTwoPi * corner / sampleRate;
   const float alpha = sinf(w) / 1.4142136f;
   const float c = cosf(w), a0 = 1.0f + alpha;
-  Biquad f;
-  f.b0 = (1.0f - c) / 2.0f / a0;
-  f.b1 = (1.0f - c) / a0;
-  f.b2 = f.b0;
-  f.a1 = -2.0f * c / a0;
-  f.a2 = (1.0f - alpha) / a0;
-  return f;
+  return coefficients((1.0f - c) / 2.0f / a0, (1.0f - c) / a0, (1.0f - c) / 2.0f / a0, -2.0f * c / a0, (1.0f - alpha) / a0);
 }
 
 // Mean square of each filter's output over one frame, in counts squared.
@@ -173,6 +215,52 @@ public:
     return true;
   }
 
+  // A block of samples, in 10-bit counts: the same as push() on each in turn, but the
+  // filters and energies run over the whole block (ESP-DSP on the board). The samples
+  // are replaced by the signal with the resting level taken off, for the spectrum.
+  // Writes the frames completed (at most maxOut) and returns how many.
+  uint8_t pushBlock(float *samples, uint16_t n, Frame *out, uint8_t maxOut) {
+    if (n > kMaxBlock) n = kMaxBlock;
+    for (uint16_t i = 0; i < n; ++i) {
+      if (!biasKnown_) {
+        bias_ = samples[i];
+        biasKnown_ = true;
+      }
+      bias_ += (samples[i] - bias_) * biasAlpha_;
+      samples[i] -= bias_;
+    }
+    knock_[0].run(samples, a_, n);
+    knock_[1].run(a_, b_, n);
+    knock_[2].run(b_, a_, n);       // The knock band, in a_
+    wideHigh_.run(samples, b_, n);
+    wideLow_.run(b_, c_, n);        // The wide band, in c_
+    if (secondActive_) {
+      second_[0].run(samples, b_, n);
+      second_[1].run(b_, d_, n);
+      second_[2].run(d_, b_, n);    // The second resonance, in b_
+    }
+    uint8_t made = 0;
+    for (uint16_t at = 0; at < n;) {
+      uint16_t take = frameLength_ - count_;
+      if (take > n - at) take = n - at;
+      sumKnock_ += energy(a_ + at, take);
+      sumWide_ += energy(c_ + at, take);
+      if (secondActive_) sumSecond_ += energy(b_ + at, take);
+      count_ += take;
+      at += take;
+      if (count_ < frameLength_) break;
+      if (made < maxOut) {
+        out[made].knock = sumKnock_ / count_;
+        out[made].second = sumSecond_ / count_;
+        out[made].wide = sumWide_ / count_;
+        ++made;
+      }
+      sumKnock_ = sumSecond_ = sumWide_ = 0.0f;
+      count_ = 0;
+    }
+    return made;
+  }
+
   float bias() const { return bias_; }
   float sampleRate() const { return sampleRate_; }
   float centreHz() const { return centre_; }
@@ -182,6 +270,11 @@ public:
 
 private:
   Biquad knock_[kSections], second_[kSections], wideHigh_, wideLow_;
+  // pushBlock's working space, aligned as ESP-DSP's vector code prefers.
+  alignas(16) float a_[kMaxBlock];
+  alignas(16) float b_[kMaxBlock];
+  alignas(16) float c_[kMaxBlock];
+  alignas(16) float d_[kMaxBlock];
   float sampleRate_{38462.0f}, centre_{6000.0f}, bandwidth_{1500.0f};
   float bias_{512.0f}, biasAlpha_{0.0005f};
   float sumKnock_{0.0f}, sumSecond_{0.0f}, sumWide_{0.0f};

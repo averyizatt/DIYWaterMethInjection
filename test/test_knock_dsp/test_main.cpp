@@ -375,7 +375,42 @@ void valuesFitTheirCanBytes() {
 }
 } // namespace
 
+// The board feeds whole ADC chunks (pushBlock, ESP-DSP there); it must hear exactly what
+// sample-by-sample feeding hears, whatever the chunk sizes and wherever frames end.
+void aChunkAtATimeHearsTheSameAsSampleBySample() {
+  FrontEnd one, many;
+  one.configure(kRate, kKnockHz, 1500.0f);
+  many.configure(kRate, kKnockHz, 1500.0f);
+  Frame single[64], chunked[64];
+  uint8_t singles = 0, chunks = 0;
+  float centred[kMaxBlock], expected[kMaxBlock];
+  uint32_t n = 0;
+  bool sameSignal = true;
+  for (const uint16_t size : {240, 37, 256, 1, 19, 200, 255, 64}) {
+    for (uint16_t i = 0; i < size; ++i, ++n) {
+      const float t = n / kRate;
+      const float x = kBias + 60.0f * sinf(kTwoPi * kKnockHz * t) + 25.0f * sinf(kTwoPi * kKnockHz * kSecondModeRatio * t) + 8.0f * noise();
+      centred[i] = x;
+      Frame f;
+      if (one.push(x, f) && singles < 64) single[singles++] = f;
+      expected[i] = x - one.bias();
+    }
+    chunks += many.pushBlock(centred, size, chunked + chunks, static_cast<uint8_t>(64 - chunks));
+    for (uint16_t i = 0; i < size; ++i) sameSignal = sameSignal && fabsf(centred[i] - expected[i]) < 1e-3f;
+  }
+  check(singles == chunks && singles > 50, "the same number of frames either way");
+  bool same = true;
+  for (uint8_t i = 0; i < singles && i < chunks; ++i) {
+    same = same && fabsf(single[i].knock - chunked[i].knock) <= 1e-3f * (1.0f + single[i].knock)
+                && fabsf(single[i].second - chunked[i].second) <= 1e-3f * (1.0f + single[i].second)
+                && fabsf(single[i].wide - chunked[i].wide) <= 1e-3f * (1.0f + single[i].wide);
+  }
+  check(same, "and the same energies in every frame");
+  check(sameSignal, "the samples come back with the resting level taken off, for the spectrum");
+}
+
 int main() {
+  aChunkAtATimeHearsTheSameAsSampleBySample();
   aToneIsMeasuredAtItsTrueSize();
   theFiltersFollowTheRealSampleRate();
   ordinaryNoiseIsNotNarrow();

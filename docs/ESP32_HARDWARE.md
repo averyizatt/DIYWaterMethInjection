@@ -303,6 +303,12 @@ a second, all the time ([include/knock_dsp.h](../include/knock_dsp.h)):
 - The filters are designed for the sample rate the ADC is measured to deliver, and are
   redesigned if that turns out to differ from what was asked. The knock frequency
   setting means what it says either way.
+- The filters, the frame energies and the spectra run through Espressif's **ESP-DSP**
+  library, which comes with the Arduino core and uses the S3's vector instructions,
+  a whole ADC chunk (3.3 ms) at a time. The portable code is kept as the reference. At
+  start-up the board runs both on a test signal and uses ESP-DSP only if they agree.
+  The serial monitor says which it chose: `[knock] DSP: ESP-DSP (S3 vector
+  instructions)`, or `portable code` and why.
 
 ### Finding the engine's real knock frequency
 

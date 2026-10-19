@@ -92,7 +92,15 @@ void measureRate(uint32_t now) {
 
 void collect(void *) {
   static uint8_t chunk[kChunkBytes];
+  alignas(16) static float knockSamples[knock_dsp::kMaxBlock];
   designFilters(kKnockRateHz);
+  // ESP-DSP (the S3's vector instructions) against the portable code, once: it is used
+  // only if the two agree on a test signal (knock_spectrum.h checkEspDsp).
+  const bool built = KNOCK_USE_ESP_DSP != 0;
+  const bool fast = knock_spectrum::checkEspDsp(blocks, kKnockRateHz);
+  Serial.printf("[knock] DSP: %s\n", fast ? "ESP-DSP (S3 vector instructions)"
+                                         : built ? "portable code: ESP-DSP disagreed with it at start-up"
+                                                 : "portable code");
   for (;;) {
     uint32_t length = 0;
     if (adc_continuous_read(handle, chunk, sizeof(chunk), &length, 100) != ESP_OK) continue;
@@ -119,9 +127,7 @@ void collect(void *) {
         if (ten < low) low = ten;
         if (ten > high) high = ten;
         if (ten <= railLow || ten >= railHigh) ++railed;
-        knock_dsp::Frame frame;
-        if (front.push(ten, frame) && frameCount < sizeof(frames) / sizeof(frames[0])) frames[frameCount++] = frame;
-        blocks.push(ten - front.bias());
+        if (samples <= knock_dsp::kMaxBlock) knockSamples[samples - 1] = ten;
         continue;
       }
       for (uint8_t input = 0; input < kSlowCount; ++input) {
@@ -131,6 +137,11 @@ void collect(void *) {
         break;
       }
     }
+    // The chunk's knock samples through the filters at once, then into the spectrum
+    // (with the resting level taken off by the front end).
+    const uint16_t knockCount = samples < knock_dsp::kMaxBlock ? samples : knock_dsp::kMaxBlock;
+    frameCount = front.pushBlock(knockSamples, knockCount, frames, sizeof(frames) / sizeof(frames[0]));
+    for (uint16_t n = 0; n < knockCount; ++n) blocks.push(knockSamples[n]);
     knockCounted += samples;
     static knock_spectrum::Snapshot block;
     const bool haveBlock = blocks.takeLoudest(block);

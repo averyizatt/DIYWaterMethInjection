@@ -31,9 +31,12 @@
 // It also reports a steady tone inside the search range (a pump or alternator line),
 // read off the noise floor, where bursts do not show and steady tones do.
 //
-// Pure logic, no Arduino calls; tested on a PC (test/test_knock_spectrum).
+// Pure logic, no Arduino calls; tested on a PC (test/test_knock_spectrum). On the board
+// the transform is ESP-DSP's FFT (knock_dsp.h says when ESP-DSP is used).
 #include <math.h>
 #include <stdint.h>
+
+#include "knock_dsp.h"
 
 namespace knock_spectrum {
 
@@ -78,6 +81,11 @@ public:
   }
 
   void configure(float sampleRate, float expectedHz) {
+#if KNOCK_USE_ESP_DSP
+    // ESP-DSP's twiddle table, once. Without it the portable transform is used.
+    static bool ready = dsps_fft2r_init_fc32(nullptr, kBlock) == ESP_OK;
+    if (!ready) knock_dsp::espDspOn() = false;
+#endif
     binHz_ = sampleRate / kBlock;
     const float low = expectedHz * kSearchBelow / binHz_, high = expectedHz * kSearchAbove / binHz_;
     searchLow_ = low < 2.0f ? 2 : static_cast<uint8_t>(low);
@@ -110,17 +118,29 @@ public:
     return true;
   }
 
-  const float *power() const { return power_; }
-  const float *floor() const { return floor_; }
-  float binHz() const { return binHz_; }
-  uint8_t searchLow() const { return searchLow_; }
-  uint8_t searchHigh() const { return searchHigh_; }
-
-private:
-  void transform() {
-    float re[kBlock], im[kBlock];
+  // The transform of one block (already windowed): re and im, kBlock values each, in
+  // frequency order. Public so the start-up check can compare the two ways.
+  void transformOf(const float *windowed, float *re, float *im, bool useEspDsp) const {
+#if KNOCK_USE_ESP_DSP
+    if (useEspDsp) {
+      static float data[2 * kBlock] __attribute__((aligned(16)));
+      for (uint16_t n = 0; n < kBlock; ++n) {
+        data[2 * n] = windowed[n];
+        data[2 * n + 1] = 0.0f;
+      }
+      dsps_fft2r_fc32(data, kBlock);
+      dsps_bit_rev_fc32(data, kBlock);
+      for (uint16_t n = 0; n < kBlock; ++n) {
+        re[n] = data[2 * n];
+        im[n] = data[2 * n + 1];
+      }
+      return;
+    }
+#else
+    (void)useEspDsp;
+#endif
     for (uint16_t n = 0; n < kBlock; ++n) {
-      re[reversed_[n]] = samples_[n] * window_[n];
+      re[reversed_[n]] = windowed[n];
       im[n] = 0.0f;
     }
     for (uint16_t size = 2; size <= kBlock; size <<= 1) {
@@ -137,6 +157,20 @@ private:
         }
       }
     }
+  }
+  float windowAt(uint16_t n) const { return window_[n]; }
+
+  const float *power() const { return power_; }
+  const float *floor() const { return floor_; }
+  float binHz() const { return binHz_; }
+  uint8_t searchLow() const { return searchLow_; }
+  uint8_t searchHigh() const { return searchHigh_; }
+
+private:
+  void transform() {
+    float windowed[kBlock], re[kBlock], im[kBlock];
+    for (uint16_t n = 0; n < kBlock; ++n) windowed[n] = samples_[n] * window_[n];
+    transformOf(windowed, re, im, knock_dsp::espDspOn());
     // Power, scaled so a steady sine of amplitude A reads A*A/2 at its frequency.
     const float scale = 8.0f / (static_cast<float>(kBlock) * kBlock);
     float above = 0.0f, floorSum = 0.0f;
@@ -181,6 +215,60 @@ private:
   uint8_t searchLow_{14}, searchHigh_{26};
   bool floorKnown_{false};
 };
+
+// Start-up check on the board: ESP-DSP against the portable code, on a made-up knock
+// signal (two resonances and noise) through a knock filter, the energy sum and the
+// transform. When they differ by more than rounding, ESP-DSP is turned off and the
+// portable code is used from then on. `blocks` must be configured (the FFT table).
+// Returns whether ESP-DSP is in use afterwards.
+inline bool checkEspDsp(const Blocks &blocks, float sampleRate) {
+  if (!knock_dsp::espDspOn()) return false;
+  alignas(16) float signal[kBlock];
+  alignas(16) float fast[kBlock];
+  alignas(16) float slow[kBlock];
+  uint32_t seed = 12345U;
+  for (uint16_t n = 0; n < kBlock; ++n) {
+    seed = seed * 1664525U + 1013904223U;
+    const float noise = static_cast<float>((seed >> 9) & 1023U) / 1023.0f - 0.5f;
+    signal[n] = 40.0f * sinf(kTwoPi * 6000.0f * n / sampleRate) + 15.0f * sinf(kTwoPi * 9900.0f * n / sampleRate) + 5.0f * noise;
+  }
+  bool same = true;
+  // The filter, a block at once against sample by sample.
+  knock_dsp::Biquad quick = knock_dsp::bandPass(sampleRate, 6000.0f, 4.0f), reference = quick;
+  quick.run(signal, fast, kBlock);
+  float worst = 0.0f, peak = 1e-6f;
+  for (uint16_t n = 0; n < kBlock; ++n) {
+    slow[n] = reference.step(signal[n]);
+    const float gap = fabsf(fast[n] - slow[n]), size = fabsf(slow[n]);
+    if (gap > worst) worst = gap;
+    if (size > peak) peak = size;
+  }
+  same = same && worst <= peak * 1e-3f;
+  // The energy of a frame, from wherever frames start in a chunk (not only aligned places).
+  const uint16_t starts[] = {0, 1, 3, 19, 57}, lengths[] = {kBlock, 19, 37, 19, 5};
+  for (uint8_t i = 0; i < 5; ++i) {
+    float sum = 0.0f;
+    for (uint16_t n = 0; n < lengths[i] && starts[i] + n < kBlock; ++n) sum += signal[starts[i] + n] * signal[starts[i] + n];
+    const uint16_t length = starts[i] + lengths[i] <= kBlock ? lengths[i] : kBlock - starts[i];
+    same = same && fabsf(knock_dsp::energy(signal + starts[i], length) - sum) <= sum * 1e-4f + 1e-3f;
+  }
+  // The transform.
+  float re1[kBlock], im1[kBlock], re2[kBlock], im2[kBlock];
+  for (uint16_t n = 0; n < kBlock; ++n) slow[n] = signal[n] * blocks.windowAt(n);
+  blocks.transformOf(slow, re1, im1, true);
+  blocks.transformOf(slow, re2, im2, false);
+  worst = 0.0f;
+  peak = 1e-6f;
+  for (uint16_t b = 0; b < kBins; ++b) {
+    const float gap = fabsf(re1[b] - re2[b]) + fabsf(im1[b] - im2[b]);
+    const float size = fabsf(re2[b]) + fabsf(im2[b]);
+    if (gap > worst) worst = gap;
+    if (size > peak) peak = size;
+  }
+  same = same && worst <= peak * 1e-3f;
+  if (!same) knock_dsp::espDspOn() = false;
+  return same;
+}
 
 // The frequency of the highest point between two bins, from the bin and its neighbours.
 inline float peakHz(const float *values, uint8_t bin, float binHz) {

@@ -130,6 +130,8 @@ What the board does differently, and only this:
   resonances, a window the length of one knock slid over every 20 ms, and a hit that
   has to be loud for this RPM, narrow-band and a burst. The settings (multiplier,
   offset, frequency, band width) and what the dash is sent mean the same as on the Nano.
+  The filters and spectra run through ESP-DSP (the S3's vector instructions), checked
+  against the portable code at every start.
 - **The real knock frequency is found from the spectrum** ([include/knock_spectrum.h](include/knock_spectrum.h)):
   600 spectra a second; the filter starts on the bore's figure and is moved to where
   the engine actually rings, learned only from bursts under boost that rise above
