@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <EEPROM.h>
+#include <avr/wdt.h>
 #include <SPI.h>
 #include <math.h>
 #include <mcp_can.h>
@@ -1436,6 +1437,14 @@ void serviceCanBus(uint32_t now,
 } // namespace
 
 void setup() {
+  // The pump relay off before anything else: until now the pin floats.
+  digitalWrite(pins::PUMP_OUT, LOW);
+  pinMode(pins::PUMP_OUT, OUTPUT);
+  // After a watchdog reset the watchdog is still running: off until setup is done.
+  // (Optiboot, which this board has, as upload_speed 115200 says, does the same; the old
+  // Nano bootloader does not, and with it a watchdog reset would loop.)
+  MCUSR = 0;
+  wdt_disable();
   Serial.begin(config.serialBaud);
   delay(250);
   // Fail safe until the comfort module explicitly arms this controller.
@@ -1466,9 +1475,14 @@ void setup() {
   Serial.println(pins::KNOCK_SENSOR_ADC);
   canOnline = initCanBus();
   lastCanRetryMs = millis();
+  // From here a loop that stops for 2 s (a hang anywhere: SPI, the CAN controller, a
+  // bad value) resets the board, and the relay starts off again above. Before, a hang
+  // with the relay on would have run the pump until the key went off.
+  wdt_enable(WDTO_2S);
 }
 
 void loop() {
+  wdt_reset();
   const uint32_t now = millis();
   receiveCan(now);   // Every pass, not every 20 ms: the controller holds only two frames.
   if (!elapsed(now, lastLoopMs, config.loopPeriodMs)) return;
