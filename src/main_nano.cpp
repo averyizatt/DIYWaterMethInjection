@@ -836,25 +836,30 @@ void handleTuneCommand(byte len, const byte *data) {
   transmitCanFrame(can_protocol::packMethTuneAck(data[0], status, subject, value, tuneRevision), "0x30F-ack");
 }
 
+// One intake thermistor. A pin with nothing wired to it floats, and the Nano's ADC then
+// reads back about what it last measured on another pin, which passes for a temperature.
+// So each reading first checks with the pin's own pull-up on: an empty pin goes to full
+// scale, while a fitted sensor holds it near its usual level through the 2.49k resistor.
+// The pull-up is off again for the reading itself.
+void readIntakeTemp(uint8_t pin, float &tempC, bool &valid) {
+  pinMode(pin, INPUT_PULLUP);
+  const bool fitted = analogRead(pin) < 1010;
+  pinMode(pin, INPUT);
+  float sample = 0.0f;
+  // Light smoothing only: these sensors are there to show each pulse cooling the air.
+  if (fitted && meth_tune::thermistorC(static_cast<uint16_t>(analogRead(pin)), pins::INTAKE_TEMP_PULLUP_OHMS, sample)) {
+    tempC = valid ? tempC + (sample - tempC) * 0.3f : sample;
+    valid = true;
+  } else {
+    valid = false;
+  }
+}
+
 void updateIntakeTemps(uint32_t now) {
   if (!elapsed(now, lastIntakeTempMs, kIntakeTempSampleMs)) return;
   lastIntakeTempMs = now;
-  float sample = 0.0f;
-  // Light smoothing only: these sensors are there to show each pulse cooling the air.
-  if (meth_tune::thermistorC(static_cast<uint16_t>(analogRead(pins::PRE_INJECTION_TEMP_ADC)),
-                             pins::INTAKE_TEMP_PULLUP_OHMS, sample)) {
-    preTempC = preTempValid ? preTempC + (sample - preTempC) * 0.3f : sample;
-    preTempValid = true;
-  } else {
-    preTempValid = false;
-  }
-  if (meth_tune::thermistorC(static_cast<uint16_t>(analogRead(pins::POST_INJECTION_TEMP_ADC)),
-                             pins::INTAKE_TEMP_PULLUP_OHMS, sample)) {
-    postTempC = postTempValid ? postTempC + (sample - postTempC) * 0.3f : sample;
-    postTempValid = true;
-  } else {
-    postTempValid = false;
-  }
+  readIntakeTemp(pins::PRE_INJECTION_TEMP_ADC, preTempC, preTempValid);
+  readIntakeTemp(pins::POST_INJECTION_TEMP_ADC, postTempC, postTempValid);
 }
 
 // Why the controller is not asking for injection, for the dash's status line.
