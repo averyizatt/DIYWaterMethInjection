@@ -14,15 +14,17 @@ struct MapCalibration {
 
   // Optional divider between a 5 V sensor and the ADC input.
   // sensorV = adcV * (top + bottom) / bottom. Set top=0, bottom=1 for no divider.
-  float dividerTopOhms{0.0f};
-  float dividerBottomOhms{1.0f};
+  // The car: a GM MAP sensor through a 15k/20k divider, so a 5 V sensor output is
+  // about 2.86 V at the Nano ADC.
+  float dividerTopOhms{15000.0f};
+  float dividerBottomOhms{20000.0f};
 
-  // Select based on sensor type (examples provided in defaultConfig()).
-  float kpaMin{10.0f};
-  float kpaMax{200.0f};
+  // By sensor type: GM 3-bar 20-312 kPa (the car's); GM 2-bar 10-200 kPa.
+  float kpaMin{20.0f};
+  float kpaMax{312.0f};
 
-  // Local atmospheric pressure estimate used for boost conversion.
-  float baroKpa{101.325f};
+  // Local atmospheric pressure estimate used for boost conversion (about 5,000 ft).
+  float baroKpa{90.0f};
 };
 
 struct BoostThresholdsPsi {
@@ -64,17 +66,21 @@ struct KnockConfig {
   // Detection is only active when both arming conditions are met.
   // RPM can remain unused if no reliable crank signal is available.
   uint16_t minRpmToArm{0};
+  // Absolute. The car lives at about 5,000 ft (barometer 85-87 kPa), where 120 kPa is
+  // 5 psi of boost and the logs spend only seconds a drive above it; 100 kPa is about
+  // 2 psi there. A stock 9.5:1 engine on 91 can knock from light boost on.
   float minMapKpaToArm{100.0f};
-  float minLoadPercentToArm{30.0f};
+  float minLoadPercentToArm{35.0f};
 
   // Front-end ADC sampling and analysis block sizing.
-  uint16_t sampleRateHz{19231};
+  uint16_t sampleRateHz{19231};  // What the Nano's ADC actually delivers (knock_band.h).
   uint8_t samplesPerUpdate{64};
 
   // Knock band targeting. Sensor operating frequency range is 3-25 kHz.
   // If autoCenterFromBore is true, centerFreqHz is
   // estimated from bore and harmonic assumptions at runtime.
   bool autoCenterFromBore{true};
+  // Ford 2.3 L Lima: 96.0 mm (3.780 in) bore, so knock rings at about 6.0 kHz.
   float boreMm{96.0f};
   float centerFreqHz{6000.0f};
   float bandwidthHz{1800.0f};
@@ -203,6 +209,9 @@ struct AppConfig {
   KnockConfig knock{};
 };
 
+// The defaults are the field initializers above, so `AppConfig config{};` is built
+// when compiling: on the Nano that puts the settings straight into RAM from flash at
+// start, instead of also keeping a second copy of them in RAM to build them from.
 AppConfig defaultConfig();
 
 TankBlend computeTankBlend(float waterLiters, float methLiters);

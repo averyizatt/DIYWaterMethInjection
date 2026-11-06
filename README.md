@@ -15,7 +15,11 @@ Standalone Arduino Nano firmware for a water/meth controller with:
 - MCP2515 (SPI) CAN bus only
 - Float/temperature/pressure analog sensing; boost from the ECU over CAN (`include/ecu_broadcast.h`)
 - Pump control and failsafe handling
-- Knock DSP detection with CAN telemetry hooks for a remote UI/main controller
+- Knock DSP detection with CAN telemetry hooks for a remote UI/main controller. **Off
+  on the Nano for now** (November 2026, the owner's choice, to free flash and RAM):
+  `NANO_KNOCK` in `src/main_nano.cpp`, 0 by default; add `-DNANO_KNOCK=1` to the
+  `arduino_nano` build flags to bring it back. The Nano still sends the knock state
+  (`0x307`) marked not enabled, and refuses knock commands.
 
 ## Hardware and firmware model
 

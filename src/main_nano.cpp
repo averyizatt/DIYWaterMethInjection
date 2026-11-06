@@ -1,4 +1,14 @@
 #include <Arduino.h>
+
+// Knock listening on the Nano's own sensor input (knock_band.h). Off for now at the
+// owner's request (November 2026), to free the Nano's flash and RAM. The knock state frame
+// (0x307) still goes out, reporting knock not enabled, so the dash shows it unavailable;
+// knock commands are refused as unsupported. The ESP32 board has its own knock code.
+// Build with -DNANO_KNOCK=1 to bring it back.
+#ifndef NANO_KNOCK
+#define NANO_KNOCK 0
+#endif
+
 #include <EEPROM.h>
 #include <avr/wdt.h>
 #include <SPI.h>
@@ -10,7 +20,9 @@
 #include "can_contract/can_protocol.h"
 #include "ecu_broadcast.h"
 #include "injection_controller.h"
+#if NANO_KNOCK
 #include "knock_band.h"
+#endif
 #include "meth_tune.h"
 #include "pins.h"
 #include "sensors.h"
@@ -54,7 +66,7 @@ static_assert(meth_tune::kCount == can_protocol::meth_tune_setting::COUNT &&
               "meth_tune.h does not match the shared CAN contract");
 
 namespace {
-AppConfig config = defaultConfig();
+AppConfig config{};  // The defaults, built when compiling (app_config.h).
 TankBlend blend = computeTankBlend(1.5f, 0.5f);
 
 // Manifold pressure, barometer, RPM and intake temperature from the MicroSquirt's CAN
@@ -117,10 +129,12 @@ uint32_t lastCanTxFailureLogMs = 0;
 uint32_t lastEngineRuntimeRxMs = 0;
 uint32_t manualTestStartMs = 0;
 uint32_t lastCanHealthLogMs = 0;
+#if NANO_KNOCK
 // Knock listening (knock_band.h): one fast burst per loop pass, judged by the detector.
 knock_band::Detector knockDetector;
 knock_band::Burst knockBurst;
 uint16_t knockSamples[knock_band::kSamples];
+#endif  // NANO_KNOCK
 bool canOnline = false;
 bool canCommandSeen = false;
 bool canCommandTimedOut = false;
@@ -217,6 +231,7 @@ const char *pressureFaultName(PressureFault fault) {
 }
 #endif  // NANO_VERBOSE_SERIAL
 
+#if NANO_KNOCK
 // The frequency the detector listens at: from the bore, or the value set over CAN.
 uint16_t knockCenterHz() {
   if (config.knock.autoCenterFromBore) {
@@ -259,6 +274,7 @@ void captureKnockBurst(uint16_t *samples) {
   while (ADCSRA & (1 << ADSC)) {
   }
 }
+#endif  // NANO_KNOCK
 
 #if NANO_VERBOSE_SERIAL
 const char *canSpeedName(uint8_t speed) {
@@ -707,6 +723,9 @@ bool sendMethConfigAck(uint8_t version, uint8_t status, uint8_t rejectReason) {
 }
 
 bool sendKnockConfigPages() {
+#if !NANO_KNOCK
+  return true;  // Nothing to report: knock is not built in.
+#else
   can_protocol::KnockConfigPage1 page1{};
   page1.config_flags = (config.knock.enabled ? (1U << 0) : 0U) |
                        (config.knock.autoCenterFromBore ? (1U << 1) : 0U);
@@ -731,6 +750,7 @@ bool sendKnockConfigPages() {
   const bool page1Sent = transmitCanFrame(can_protocol::packKnockConfigPage1(page1), "0x30C");
   const bool page2Sent = transmitCanFrame(can_protocol::packKnockConfigPage2(page2), "0x30D");
   return page1Sent && page2Sent;
+#endif
 }
 
 // Boost thresholds and the relay period live in the tune; the controller reads copies.
@@ -1096,6 +1116,7 @@ void handleCanFrame(unsigned long id, byte len, const byte *data) {
       Serial.println(F("CAN CMD: clear faults"));
     }
     break;
+#if NANO_KNOCK
   case can_protocol::meth_command::KNOCK_SET_ENABLE:
     if (len >= 2) {
       config.knock.enabled = data[1] != 0;
@@ -1195,6 +1216,7 @@ void handleCanFrame(unsigned long id, byte len, const byte *data) {
     lastKnockClippingDetected = false;
     knockFaultPending = false;
     break;
+#endif  // NANO_KNOCK
   default:
     if (kSerialCanVerbose) {
       Serial.print(F("CAN CMD: unsupported 0x"));
@@ -1359,13 +1381,14 @@ void serviceCanBus(uint32_t now,
   if (elapsed(now, lastKnockStateTxMs, kKnockStateTxMs)) {
     lastKnockStateTxMs = now;
     can_protocol::EngineKnockState state{};
-    state.status_flags |= config.knock.enabled ? (1U << 0) : 0U;
+    state.status_flags |= (NANO_KNOCK && config.knock.enabled) ? (1U << 0) : 0U;
     state.status_flags |= knockSignalValid ? (1U << 1) : 0U;
     state.status_flags |= knockWarningActive ? (1U << 2) : 0U;
     state.status_flags |= knockCriticalActive ? (1U << 3) : 0U;
     state.status_flags |= knockBaselineLearned ? (1U << 4) : 0U;
     state.status_flags |= knockSensorFault ? (1U << 5) : 0U;
     state.status_flags |= knockClippingDetected ? (1U << 6) : 0U;
+#if NANO_KNOCK
     state.energy = knockDetector.level();
     state.baseline = knockDetector.baseline();
     state.threshold = knockDetector.threshold();
@@ -1374,6 +1397,7 @@ void serviceCanBus(uint32_t now,
     state.last_event_boost_kpa = lastKnockBoostKpa;
     // Spare byte: how much of the signal sits at the knock frequency, 0..255.
     state.reserved = knockDetector.share();
+#endif
 
     if (!transmitCanFrame(can_protocol::packEngineKnockState(state), "0x307")) {
       return;
@@ -1390,6 +1414,7 @@ void serviceCanBus(uint32_t now,
     }
   }
 
+#if NANO_KNOCK
   if (elapsed(now, lastKnockHookTxMs, kKnockHookTxMs)) {
     lastKnockHookTxMs = now;
     can_protocol::KnockLiveHook hook{};
@@ -1414,6 +1439,7 @@ void serviceCanBus(uint32_t now,
       return;
     }
   }
+#endif  // NANO_KNOCK
 
   if (elapsed(now, lastCanConfigTxMs, kCanConfigTxMs)) {
     lastCanConfigTxMs = now;
@@ -1531,6 +1557,7 @@ void loop() {
   updateIntakeTemps(now);
   const uint16_t rpm = currentEngineRpm(now);
 
+#if NANO_KNOCK
   // Knock: one fast burst per pass. It is judged only while armed (enough RPM and
   // manifold pressure for knock to matter), but measured and learned all the time.
   captureKnockBurst(knockSamples);
@@ -1577,6 +1604,10 @@ void loop() {
   lastKnockCriticalActive = knockCriticalActive;
   lastKnockSensorFault = knockSensorFault;
   lastKnockClippingDetected = knockClippingDetected;
+#else
+  const int knockRaw = 0;
+  const bool knockDetected = false;
+#endif
 
   applyCanCommandTimeout(now);
   if (manualTestActive && (elapsed(now, manualTestStartMs, kManualTestTimeoutMs) ||
