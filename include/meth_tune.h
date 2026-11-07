@@ -352,10 +352,12 @@ private:
       // After a pause, start again from the minimum on-time and grow from there.
       const bool fresh = !everCycled_ || now - cycleStart_ >= 2UL * cyclePeriod_;
       uint16_t on = targetOn;
+      cycleLimit_ = 0xFFFF;
       if (rampMs > 0) {
         const uint32_t limit = fresh ? minOn : static_cast<uint32_t>(lastOn_) + rampMs;
-        if (on > limit) on = static_cast<uint16_t>(limit);
+        if (limit < cycleLimit_) cycleLimit_ = static_cast<uint16_t>(limit);
       }
+      if (on > cycleLimit_) on = cycleLimit_;
       on = relaySafeOnMs(on, period);
       if (on == 0) return false;
       cycleActive_ = true;
@@ -367,6 +369,14 @@ private:
       lastOn_ = on;
     }
     if (!want) cut_ = true;
+    // A run still going may grow as boost and airflow rise (more wanted, a higher dose
+    // limit), up to this cycle's ramp step. The relay just stays on: no extra switch.
+    // Before, the length was fixed at the start of the pull (0.5 psi, low airflow), so
+    // short pulls only ever got the minimum.
+    if (!cut_ && now - cycleStart_ < cycleOn_ && targetOn > cycleOn_) {
+      const uint16_t grown = relaySafeOnMs(targetOn < cycleLimit_ ? targetOn : cycleLimit_, cyclePeriod_);
+      if (grown > cycleOn_) cycleOn_ = lastOn_ = grown;
+    }
     return !cut_ && now - cycleStart_ < cycleOn_;
   }
 
@@ -377,6 +387,7 @@ private:
   uint16_t cyclePeriod_{1000};
   uint16_t cycleOn_{0};
   uint16_t lastOn_{0};
+  uint16_t cycleLimit_{0xFFFF};  // This cycle's ramp step: the longest the run may grow to
   uint8_t hold_{kHoldDisarmed};
   bool started_{false};
   bool cycleActive_{false};

@@ -271,6 +271,40 @@ void sprayTimeLimitForcesARest() {
   check(endless.risingEdges == 30, "rest 0 turns the time limit off");
 }
 
+// 2026-11-06 in the car: every pull got exactly the 1 s minimum, because the run's length
+// was fixed at 0.5 psi with little airflow and the pull was over before the next cycle.
+void aRunningPulseGrowsWithTheDoseLimitButNotPastItsRampStep() {
+  Settings s = defaults();
+  change(s, kStartPsiX10, 5);
+  change(s, kMaxOnMs, 4000);
+  change(s, kMinOnMs, 2500);   // The first run of a pull may be up to 2.5 s
+  change(s, kRestS, 0);
+  auto pull = [](uint32_t now) {
+    Inputs in = spraying(1.0f, 2800);   // Pull start: 92 kPa, 10% of fuel allows about 1.5 s
+    in.mapKpa = 92.0f;
+    if (now >= 500) {                     // Half a second later: 8 psi at 3200 RPM
+      in.boostPsi = 8.0f;
+      in.mapKpa = 140.0f;
+      in.rpm = 3200;
+    }
+    return in;
+  };
+  Governor g;
+  g.update(0, s, pull(0));
+  check(g.onMs() >= 1450 && g.onMs() <= 1560, "the run starts at what the dose limit allows then");
+  const Run run = simulate(g, s, 20, 4000, pull);
+  check(run.risingEdges == 1, "growing is not a new switch: one run, the relay stays on");
+  check(run.onMs >= 2460 && run.onMs <= 2500, "it grows to the ramp step, no further");
+  // Low airflow the whole way: the dose limit still holds it.
+  Governor g2;
+  const Run held = simulate(g2, s, 0, 4000, [](uint32_t) {
+    Inputs in = spraying(1.0f, 2800);
+    in.mapKpa = 92.0f;
+    return in;
+  });
+  check(held.onMs >= 1440 && held.onMs <= 1560, "without more airflow it does not grow");
+}
+
 void doseLimitFollowsFuelFlow() {
   check(fabsf(fuelGPerMin(5500, 154.0f) - 744.0f) < 3.0f, "about 744 g of fuel a minute at 5500 RPM and 10 psi");
   Settings s = defaults();
@@ -498,6 +532,7 @@ int main() {
   relayIsNeverAbused();
   steadyInjectionMatchesTheSettings();
   rampStartsAtMinimumAndGrowsPerCycle();
+  aRunningPulseGrowsWithTheDoseLimitButNotPastItsRampStep();
   rpmGateBlocksAndNamesTheReason();
   temperatureGate();
   sprayTimeLimitForcesARest();
