@@ -154,6 +154,20 @@ on trial, it restarted itself over CAN or the ADC, or the pump's soft start is l
 The dash writes it to its event log, so a restart in the middle of a drive shows up in the
 drive report with its reason.
 
+**It keeps a black box.** Ten times a second the board writes what it is doing into RTC
+memory, which a crash, a watchdog, a supply dip and a restart leave alone
+(`include/black_box.h`): pump duty at the end of each 100 ms and its highest, manifold
+pressure and RPM from the ECU, the hold reason, armed, soft start, pump test and crash
+hold, the pump starting and stopping, the longest time with nothing received on CAN, the
+CAN controller set up again or a frame not getting out, the longest gap between control
+passes, the pump keeper stepping in, the air before the nozzle and the least free memory.
+The sample being filled is rewritten on every 20 ms pass, so a reset loses at most that
+pass. The last 10 s are kept (1.1 KB). After a reset nobody asked for, the record left
+behind goes to the dash on 0x310 (contract extension 9), and again every 5 s, six times at
+most, until the dash answers `0x301 0x13`; the dash writes it to its event log with a
+summary in words. After power on the memory holds noise and its checks reject it; a
+firmware update or the dash's Restart starts a new record without sending one.
+
 **The pump is started gently.** From rest the duty climbs from 5% to full over 0.4 s (a
 motor starting draws its largest current, and slamming it on dips the 12 V supply), runs
 at least 0.5 s apart from the run before, and the dose limit must allow a little above

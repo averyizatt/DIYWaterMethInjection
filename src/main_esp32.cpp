@@ -43,6 +43,7 @@
 #include "meth_tune.h"
 #include "pins_esp32.h"
 #include "reset_guard.h"
+#include "black_box.h"
 #include "x9c.h"
 
 // The knock amplifier's gain is set by an X9C104 potentiometer and controlled
@@ -94,6 +95,12 @@ static_assert(CCM_CAN_PROTOCOL_VERSION == can_protocol::CAN_PROTOCOL_SCHEMA_VERS
 #ifndef CAN_PROTOCOL_HAS_METH_START_REPORT
 #error "Update DIYComfortControlModule: the shared CAN contract needs the water/meth start report (extension 8)."
 #endif
+#ifndef CAN_PROTOCOL_HAS_METH_BLACK_BOX
+#error "Update DIYComfortControlModule: the shared CAN contract needs the water/meth black box (extension 9)."
+#endif
+static_assert(black_box::kSampleBytes == can_protocol::meth_black_box::SAMPLE_BYTES &&
+                  black_box::kSlots == can_protocol::meth_black_box::MAX_SAMPLES && black_box::kWindowMs % 10 == 0,
+              "black_box.h does not match the shared CAN contract");
 static_assert(meth_tune::kCount == can_protocol::meth_tune_setting::COUNT &&
               meth_tune::kPeriodMs == can_protocol::meth_tune_setting::PERIOD_MS &&
               meth_tune::kMaxDosePct == can_protocol::meth_tune_setting::MAX_DOSE_PCT &&
@@ -570,6 +577,8 @@ volatile uint32_t canRxOverflows = 0;
 // the bench with nothing connected is left alone.
 uint32_t lastCanRxMs = 0;
 uint32_t lastCanInitMs = 0;
+uint32_t canInits = 0;                     // Times the controller was set up (black box)
+uint32_t canSendFailures = 0;              // Frames that did not get out (black box)
 bool canHeardSinceBoot = false;
 uint32_t canSilentResets = 0;              // Times it was set up again for silence (heartbeat)
 constexpr uint32_t kCanSilentMs = 1500;
@@ -579,6 +588,23 @@ constexpr uint32_t kCanRestartAfterMs = 15000;
 // The bus has worked this ignition cycle: frames since this start, or the last start was
 // a restart over a silent bus (it had worked before that).
 bool canHeardOnce() { return canHeardSinceBoot || bootCause == reset_guard::Cause::CanRestart; }
+
+// The black box's state (its functions are with the start report, below).
+RTC_NOINIT_ATTR black_box::Box blackBox;
+black_box::Recorder blackBoxRecorder;
+uint8_t blackBoxLeft[black_box::kSlots][black_box::kSampleBytes];   // The record from before this start
+uint8_t blackBoxLeftCount = 0;
+bool blackBoxToSend = false;
+bool blackBoxSending = false;
+uint8_t blackBoxFrame = 0;       // Next to send: 0 the header, then data frame n - 1
+uint8_t blackBoxTries = 0;
+uint32_t blackBoxTriedMs = 0;
+uint32_t blackBoxCanInitsSeen = 0;
+uint32_t blackBoxSendFailuresSeen = 0;
+uint32_t blackBoxKeeperTripsSeen = 0;
+constexpr uint32_t kBlackBoxRetryMs = 5000;
+constexpr uint8_t kBlackBoxTries = 6;
+constexpr uint8_t kBlackBoxFramesPerPass = 4;   // 0.7 s for a full record, without crowding the bus
 
 uint8_t readRegister(uint8_t address) {
   SPI.beginTransaction(SPISettings(kCanSpiHz, MSBFIRST, SPI_MODE0));
@@ -627,6 +653,7 @@ bool initCanBus() {
   ok = ok && (readRegister(0x0F) & 0xE8) == 0x00;
   txStuck = false;
   lastCanInitMs = millis();
+  canInits = canInits + 1;
   xSemaphoreGive(canLock);
   Serial.println(ok ? F("CAN: MCP2515 ready, 500 kbit/s") : F("CAN: MCP2515 not answering; will retry"));
   return ok;
@@ -695,6 +722,7 @@ bool transmitCanFrame(const can_protocol::CanFrame &frame, const char *label) {
     return true;
   }
   if (consecutiveCanTxFailures < 255) ++consecutiveCanTxFailures;
+  canSendFailures = canSendFailures + 1;
   const uint32_t now = millis();
   if (consecutiveCanTxFailures == 1 || elapsed(now, lastCanTxFailureLogMs, kCanTxFailureLogMs)) {
     lastCanTxFailureLogMs = now;
@@ -1035,6 +1063,14 @@ void handleCanFrame(unsigned long id, byte len, const byte *data) {
       ecuIntakeSeenMs = now;
       ecuIntakeSeen = true;
     }
+    return;
+  }
+
+  if (data[0] == can_protocol::meth_tune_command::BLACK_BOX_RECEIVED) {
+    // The dash has the black box record: no more sending it. Not acknowledged.
+    if (blackBoxToSend) Serial.println(F("BLACKBOX: the dash has the record"));
+    blackBoxToSend = false;
+    blackBoxSending = false;
     return;
   }
 
@@ -1400,6 +1436,78 @@ void sendStartReportOnce(uint32_t now) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// The black box (black_box.h): the last ten seconds, in memory a reset does not clear.
+// After a reset nobody asked for, the record left behind goes to the dash (contract
+// extension 9) and is sent again every few seconds until the dash says it has it.
+// ---------------------------------------------------------------------------
+
+uint8_t blackBoxDataFrames() {
+  const uint16_t total = static_cast<uint16_t>(blackBoxLeftCount * black_box::kSampleBytes);
+  return static_cast<uint8_t>((total + can_protocol::meth_black_box::BYTES_PER_FRAME - 1) / can_protocol::meth_black_box::BYTES_PER_FRAME);
+}
+
+void serviceBlackBoxSend(uint32_t now) {
+  if (!blackBoxToSend || now < 2000) return;   // After the start report
+  if (!blackBoxSending) {
+    if (blackBoxTries >= kBlackBoxTries) {
+      Serial.println(F("BLACKBOX: the dash never said it had the record; dropped"));
+      blackBoxToSend = false;
+      return;
+    }
+    if (blackBoxTries > 0 && !elapsed(now, blackBoxTriedMs, kBlackBoxRetryMs)) return;
+    blackBoxSending = true;
+    blackBoxFrame = 0;
+  }
+  const uint8_t frames = blackBoxDataFrames();
+  const uint16_t total = static_cast<uint16_t>(blackBoxLeftCount * black_box::kSampleBytes);
+  for (uint8_t n = 0; n < kBlackBoxFramesPerPass && blackBoxSending; ++n) {
+    // A frame that does not get out is not chased: the dash asks for none, it waits for
+    // the whole record again, and says when it has it.
+    if (blackBoxFrame == 0) {
+      transmitCanFrame(can_protocol::packMethBlackBoxHeader(blackBoxLeftCount, black_box::kWindowMs / 10,
+                                                            static_cast<uint8_t>(esp_reset_reason()), frames,
+                                                            black_box::sumOf(blackBoxLeft, blackBoxLeftCount)), "0x310");
+    } else {
+      transmitCanFrame(can_protocol::packMethBlackBoxData(static_cast<uint8_t>(blackBoxFrame - 1), &blackBoxLeft[0][0], total), "0x310");
+    }
+    if (++blackBoxFrame > frames) {
+      blackBoxSending = false;
+      ++blackBoxTries;
+      blackBoxTriedMs = now;
+    }
+  }
+}
+
+// Every control pass, into the record.
+void recordBlackBox(uint32_t now, uint32_t passGapMs, const SensorReadings &readings, uint16_t rpm, float duty) {
+  black_box::Pass p;
+  p.dutyPct = duty;
+  p.ecuFresh = readings.mapValid;
+  p.mapKpa = readings.mapKpa;
+  p.rpmValid = engineRpmValid;
+  p.rpm = rpm;
+  p.hold = manualTestActive ? meth_tune::kHoldNone : governor.hold();
+  p.armed = config.mode != InjectionMode::Off;
+  p.softStarting = governor.softStarting(now);
+  p.manualTest = manualTestActive;
+  p.crashHold = crashHold;
+  p.tankLow = readings.tankLow;
+  p.canOnline = canOnline;
+  p.canSetUpAgain = canInits != blackBoxCanInitsSeen;
+  p.canSendFailed = canSendFailures != blackBoxSendFailuresSeen;
+  p.keeperTripped = pumpKeeperTrips != blackBoxKeeperTripsSeen;
+  blackBoxCanInitsSeen = canInits;
+  blackBoxSendFailuresSeen = canSendFailures;
+  blackBoxKeeperTripsSeen = pumpKeeperTrips;
+  p.canRxAgeMs = canHeardSinceBoot ? now - lastCanRxMs : now;
+  p.loopGapMs = passGapMs;
+  p.preValid = preTempValid;
+  p.preC = preTempC;
+  p.freeHeapBytes = ESP.getFreeHeap();
+  blackBoxRecorder.record(blackBox, now, p);
+}
+
 uint8_t boostGaugeKpaForCan(const SensorReadings &readings) {
   const float boostGaugeKpa = readings.mapKpa - config.map.baroKpa;
   return can_protocol::clampU8(static_cast<int>(boostGaugeKpa > 0.0f ? boostGaugeKpa + 0.5f : 0.0f));
@@ -1434,6 +1542,7 @@ void serviceCanBus(uint32_t now,
 
   if (!serviceCanHealth(now)) return;
   sendStartReportOnce(now);
+  serviceBlackBoxSend(now);
   applyCanCommandTimeout(now);
   // Received frames were already handled by drainCanFrames() at the top of loop().
 
@@ -1953,6 +2062,17 @@ void setup() {
   reset_guard::notePump(resetRecord, false);
   const uint32_t softStartMs = reset_guard::softStartMs(resetRecord, meth_tune::kSoftStartMs);
   governor.setSoftStartMs(softStartMs);
+  // The black box: the record a reset nobody asked for left behind goes to the dash; after
+  // power on (noise) or a deliberate restart there is nothing to send. Then a new record.
+  {
+    using reset_guard::Cause;
+    const bool unasked = bootCause == Cause::Crash || bootCause == Cause::Brownout || bootCause == Cause::FaultRestart ||
+                         bootCause == Cause::CanRestart || bootCause == Cause::Other;
+    blackBoxLeftCount = unasked ? black_box::take(blackBox, blackBoxLeft) : 0;
+    blackBoxToSend = blackBoxLeftCount > 0;
+    black_box::forget(blackBox);
+    blackBoxRecorder.start(blackBox, millis());
+  }
 
   Serial.begin(config.serialBaud);
 #if ARDUINO_USB_CDC_ON_BOOT && ARDUINO_USB_MODE
@@ -1975,6 +2095,10 @@ void setup() {
                                 : F("BOOT: the crash handler did not run (the pull-downs held the pump off once the pins floated)"));
   }
   if (armedAgain) Serial.println(F("BOOT: armed again, as before the reset"));
+  if (blackBoxToSend) {
+    Serial.printf("BOOT: black box from before the reset: %.1f s, sending it to the dash\n",
+                  blackBoxLeftCount * black_box::kWindowMs / 1000.0f);
+  }
   if (softStartMs > meth_tune::kSoftStartMs) {
     Serial.printf("BOOT: %u resets with the pump running this ignition cycle: soft start %lu ms\n",
                   static_cast<unsigned>(resetRecord.pumpResets), static_cast<unsigned long>(softStartMs));
@@ -2096,7 +2220,8 @@ void loop() {
   }
   // The longest gap between control passes since the last heartbeat (normally 20 ms):
   // anything near the pump keeper's 250 ms is worth knowing about.
-  if (lastLoopMs != 0 && now - lastLoopMs > loopGapMaxMs) loopGapMaxMs = now - lastLoopMs;
+  const uint32_t passGapMs = lastLoopMs != 0 ? now - lastLoopMs : 0;
+  if (passGapMs > loopGapMaxMs) loopGapMaxMs = passGapMs;
   lastLoopMs = now;
   endCrashHoldWhenDue(now);
   if (pumpKeeperTrips != keeperTripsReported) {
@@ -2191,6 +2316,7 @@ void loop() {
                                    result.overboostAssistFaultLatched || knockDetected) ? HIGH : LOW);
 
   serviceCanBus(now, readings, result, knockDetected, knockRaw);
+  recordBlackBox(now, passGapMs, readings, rpm, duty);
 
   // The ADC feeds knock, the pressures and the air temperature sensors: if it has gone
   // quiet, start again from reset. Twice at most per ignition cycle (reset_guard.h);
