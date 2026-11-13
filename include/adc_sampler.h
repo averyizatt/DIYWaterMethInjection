@@ -69,6 +69,10 @@ bool knockSecondActive();
 // Returns false when no sample arrived in that time.
 bool averageMv(Slow input, float &millivolts);
 
+// The highest voltage the ADC can report on this input (its full-scale reading, about
+// 3.17 V): a pin pulled to 3.3 V reads this, not 3.3 V. Valid after begin().
+float topMv(Slow input);
+
 // Milliseconds since data last arrived from the ADC (for the self-check).
 uint32_t silentForMs(uint32_t nowMs);
 

@@ -17,12 +17,17 @@
 #include <Preferences.h>
 #include <SPI.h>
 #include <esp_ota_ops.h>
+#include <esp_rom_gpio.h>
+#include <esp_system.h>
+#include <esp_task_wdt.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
 #include <freertos/semphr.h>
 #include <freertos/task.h>
+#include <hal/gpio_ll.h>
 #include <math.h>
 #include <mcp2515.h>
+#include <soc/gpio_sig_map.h>
 
 #include "adc_sampler.h"
 #include "analog_inputs.h"
@@ -37,6 +42,7 @@
 #include "knock_spectrum.h"
 #include "meth_tune.h"
 #include "pins_esp32.h"
+#include "reset_guard.h"
 #include "x9c.h"
 
 // The knock amplifier's gain is set by an X9C104 potentiometer and controlled
@@ -44,6 +50,26 @@
 // fixed gain; the firmware also stops by itself if changing the gain shows no effect.
 #ifndef KNOCK_GAIN_POT
 #define KNOCK_GAIN_POT 1
+#endif
+
+// Knock listening: the filters' verdicts, the amplifier's automatic gain and the knock
+// frequency finder. Off for now at the owner's request (November 2026), until the knock
+// amplifier's input works on the bench, as on the Nano (NANO_KNOCK). The knock state
+// frame (0x307) still goes out, reporting knock not enabled, so the dash shows it
+// unavailable; knock commands are refused as unsupported; the knock detail (0x30B,
+// 0x30C/0x30D, 0x30E) is not sent; the gain potentiometer is left alone. Injection never
+// depended on knock. The ADC still samples the knock input with the others: the
+// pressures and air temperatures come from the same conversions. Build with
+// -DESP32_KNOCK=1 to bring it all back.
+#ifndef ESP32_KNOCK
+#define ESP32_KNOCK 0
+#endif
+constexpr bool kKnockOn = ESP32_KNOCK != 0;
+
+// Bench only (environment esp32s3_safety_test): serial commands that make this firmware
+// fail on purpose, one way at a time, to watch it recover. Never in the car's build.
+#ifndef METH_SAFETY_TEST
+#define METH_SAFETY_TEST 0
 #endif
 
 // Identifies this build to the dash. The published firmware is built with the first
@@ -118,6 +144,8 @@ constexpr uint8_t kTuneCountBeforeDuty = 17;
 constexpr uint32_t kIntakeTempSampleMs = 50;
 
 uint32_t lastLoopMs = 0;
+uint32_t loopGapMaxMs = 0;          // Longest gap between control passes since the last heartbeat
+uint32_t keeperTripsReported = 0;
 uint32_t lastDebugMs = 0;
 uint32_t lastMethStateTxMs = 0;
 uint32_t lastSensorExtTxMs = 0;
@@ -250,10 +278,18 @@ void loadKnockFrequency() {
 }
 
 // Setting the frequency by hand discards what was learned: going back to automatic
-// then starts again from the bore's figure.
+// then starts again from the bore's figure. It leaves the flash from loop(), away from
+// boost (flashWriteAllowed()).
+bool knockFrequencyErasePending = false;
+
 void forgetKnockFrequency() {
   knockLearnedHz = knockSavedHz = 0.0f;
   knockFinder.begin(knockBoreHz());
+  knockFrequencyErasePending = true;
+}
+
+void eraseKnockFrequency() {
+  knockFrequencyErasePending = false;
   Preferences store;
   if (!store.begin("knockfreq", false)) return;
   store.remove("hz");
@@ -261,6 +297,7 @@ void forgetKnockFrequency() {
 }
 
 void saveKnockFrequency() {
+  knockFrequencyErasePending = false;   // Overwritten anyway
   Preferences store;
   if (!store.begin("knockfreq", false)) return;
   store.putUShort("bore", knockBoreHz());
@@ -412,12 +449,72 @@ void setPump(float dutyPercent) {
 // keep asking for it: it sets the pump every 20 ms, and if that stops, the CAN task
 // (another task, on the other processor core) switches the pump and the relay off
 // through here - seconds before the watchdog restarts the board.
+volatile uint32_t pumpKeeperTrips = 0;   // Times the keeper had to step in (shown on the serial heartbeat)
+
 void keepPumpSafe() {
   if ((pumpRunning || relayClosed) && static_cast<int32_t>(millis() - pumpSetMs) > kPumpKeeperMs) {
     pumpRunning = false;
     relayClosed = false;
     ledcWrite(pins::PUMP_OUT, 0);
     digitalWrite(pins::PUMP_RELAY_OUT, LOW);
+    pumpKeeperTrips = pumpKeeperTrips + 1;
+  }
+}
+
+// When the firmware itself fails, the pump stops before anything else happens. A crash
+// (an exception, the task or interrupt watchdog) runs this first, then prints its report
+// and writes a core dump to flash before the chip resets: that takes long enough to
+// matter, and the PWM hardware would go on driving the pump through all of it. Any
+// restart runs it too. Registers only: nothing here may need a lock, the flash or
+// another task. After the reset the pins float and the board's pull-downs hold the
+// MOSFET and the relay off.
+void IRAM_ATTR pumpOffNow() {
+  gpio_ll_set_level(&GPIO, pins::PUMP_OUT, 0);
+  gpio_ll_set_level(&GPIO, pins::PUMP_RELAY_OUT, 0);
+  // The pump pin belongs to the PWM peripheral: give it back to the plain output, now low.
+  esp_rom_gpio_connect_out_signal(pins::PUMP_OUT, SIG_GPIO_OUT_IDX, false, false);
+}
+// Left by the crash handler in memory a reset does not clear, so the next start can say
+// whether the pump was switched off before the reset.
+RTC_NOINIT_ATTR uint32_t crashHookMark;
+constexpr uint32_t kCrashHookRan = 0x50554D50UL;   // "PUMP"
+void IRAM_ATTR pumpOffAtCrash(arduino_panic_info_t *, void *) {
+  pumpOffNow();
+  crashHookMark = kCrashHookRan;
+}
+void pumpOffAtRestart() { pumpOffNow(); }
+
+// ---------------------------------------------------------------------------
+// Crash loops (reset_guard.h): counted across resets in memory a reset does not clear.
+// ---------------------------------------------------------------------------
+constexpr uint32_t kWatchdogMs = 2000;   // Main loop or CAN task silent this long: restart
+RTC_NOINIT_ATTR reset_guard::Record resetRecord;
+reset_guard::Cause bootCause = reset_guard::Cause::Other;
+bool crashHold = false;   // Too many crashes since the ignition came on: injection held off
+
+// The dash cleared faults: crashes so far are forgiven and injection is allowed again.
+void clearCrashHold() {
+  if (crashHold) Serial.println(F("SAFETY: crash hold cleared; injection allowed again"));
+  reset_guard::clearCrashes(resetRecord);
+  crashHold = false;
+}
+
+reset_guard::Cause reportedResetCause(esp_reset_reason_t reason) {
+  using reset_guard::Cause;
+  switch (reason) {
+  case ESP_RST_POWERON: return Cause::PowerOn;
+  case ESP_RST_SW:
+  case ESP_RST_EXT:
+  case ESP_RST_USB:
+  case ESP_RST_JTAG: return Cause::Requested;
+  case ESP_RST_PANIC:
+  case ESP_RST_INT_WDT:
+  case ESP_RST_TASK_WDT:
+  case ESP_RST_WDT:
+  case ESP_RST_CPU_LOCKUP: return Cause::Crash;
+  case ESP_RST_BROWNOUT:
+  case ESP_RST_PWR_GLITCH: return Cause::Brownout;
+  default: return Cause::Other;
   }
 }
 
@@ -466,7 +563,8 @@ void modifyRegister(uint8_t address, uint8_t mask, uint8_t value) {
 //   0x680-0x68F  firmware update
 //   0x5E8-0x5EB, 0x5F0-0x5F3, 0x700-0x703  the ECU's broadcast (ecu_broadcast.h)
 bool initCanBus() {
-  xSemaphoreTake(canLock, portMAX_DELAY);
+  // Never waits for ever: if the lock is not free, this is tried again in two seconds.
+  if (xSemaphoreTake(canLock, pdMS_TO_TICKS(50)) != pdTRUE) return false;
   if (!spiStarted) {
     SPI.begin(pins::CAN_SPI_SCK, pins::CAN_SPI_MISO, pins::CAN_SPI_MOSI, pins::CAN_SPI_CS);
     spiStarted = true;
@@ -489,8 +587,20 @@ bool initCanBus() {
   return ok;
 }
 
+#if METH_SAFETY_TEST
+volatile bool safetyTestHangCanTask = false;
+#endif
+
 void canReceiveTask(void *) {
+  // This task carries the pump keeper, so it is watched like the main loop: silent for
+  // kWatchdogMs and the board restarts (through pumpOffAtCrash).
+  esp_task_wdt_add(nullptr);
   for (;;) {
+#if METH_SAFETY_TEST
+    while (safetyTestHangCanTask) {
+    }
+#endif
+    esp_task_wdt_reset();
     keepPumpSafe();
     if (canOnline && xSemaphoreTake(canLock, pdMS_TO_TICKS(5)) == pdTRUE) {
       if (mcp.getErrorFlags() & 0xC0) {
@@ -594,6 +704,7 @@ bool sendMethConfigAck(uint8_t version, uint8_t status, uint8_t rejectReason) {
 }
 
 bool sendKnockConfigPages() {
+  if (!kKnockOn) return true;   // Nothing to report: knock is not built in.
   can_protocol::KnockConfigPage1 page1{};
   page1.config_flags = (config.knock.enabled ? (1U << 0) : 0U) |
                        (config.knock.autoCenterFromBore ? (1U << 1) : 0U);
@@ -710,6 +821,7 @@ void handleTuneCommand(byte len, const byte *data) {
 
 uint8_t idleHoldFor(const ControlResult &result) {
   if (config.mode == InjectionMode::Off) return meth_tune::kHoldDisarmed;
+  if (crashHold) return meth_tune::kHoldFault;
   if (result.failsafe == FailsafeReason::LowFluid) return meth_tune::kHoldTankLow;
   if (result.failsafe != FailsafeReason::None) return meth_tune::kHoldFault;
   return meth_tune::kHoldBelowBoost;
@@ -872,8 +984,14 @@ void handleCanFrame(unsigned long id, byte len, const byte *data) {
   uint8_t ackStatus = can_protocol::config_ack_status::OK;
   uint8_t ackValue = len >= 2 ? data[1] : 0;
   bool commandAccepted = true;
+  const bool knockCommand = data[0] >= can_protocol::meth_command::KNOCK_SET_ENABLE &&
+                            data[0] <= can_protocol::knock_detail_command::RELEARN_FREQUENCY;
 
-  switch (data[0]) {
+  if (!kKnockOn && knockCommand) {
+    // Knock is not built in (ESP32_KNOCK): refused, as the Nano refuses them.
+    ackStatus = can_protocol::config_ack_status::UNSUPPORTED_COMMAND;
+    commandAccepted = false;
+  } else switch (data[0]) {
   case can_protocol::meth_command::ARM:
     if (len >= 2) {
       config.mode = data[1] ? InjectionMode::BoostOnly : InjectionMode::Off;
@@ -889,7 +1007,7 @@ void handleCanFrame(unsigned long id, byte len, const byte *data) {
   case can_protocol::meth_command::MANUAL_TEST_DUTY:
     if (len >= 2) {
       // Repeated requests must not extend the five-second test window.
-      if (manualTestActive || config.mode != InjectionMode::Off ||
+      if (manualTestActive || config.mode != InjectionMode::Off || crashHold ||
           (config.tankProtectionEnabled && floatSensor.isLow())) {
         ackStatus = can_protocol::config_ack_status::VALUE_CLAMPED;
         ackValue = 0;
@@ -930,6 +1048,7 @@ void handleCanFrame(unsigned long id, byte len, const byte *data) {
   case can_protocol::meth_command::CLEAR_FAULTS:
     controller.clearLatchedFaults();
     canCommandTimedOut = false;
+    clearCrashHold();
     if (kSerialCanVerbose) {
       Serial.println(F("CAN CMD: clear faults"));
     }
@@ -1126,6 +1245,13 @@ bool injectionNeeded(uint32_t now) {
   return boostPsi >= config.boost.startPsi - 1.0f;
 }
 
+// Settings are written to flash only away from boost. While flash is written both
+// processors stop running from it, for tens of milliseconds and occasionally more: the
+// pump holds its duty meanwhile, but the CAN task's keeper can find the main loop late
+// afterwards and cut the pump mid-spray. What is waiting is written once boost is gone
+// (the dash keeps showing "unsaved" until then).
+bool flashWriteAllowed(uint32_t now) { return !injectionNeeded(now) && !updater.active(); }
+
 void handleUpdateFrame(const RxFrame &rx, uint32_t now) {
   if (rx.len != 8) return;
   can_protocol::CanFrame in{}, reply{};
@@ -1168,7 +1294,7 @@ void drainCanFrames(uint32_t now) {
 
 uint8_t methStateFor(const ControlResult &result, const SensorReadings &readings) {
   if (manualTestActive) return static_cast<uint8_t>(can_protocol::MethState::TEST);
-  if (result.failsafe != FailsafeReason::None || result.overboostAssistFaultLatched) {
+  if (crashHold || result.failsafe != FailsafeReason::None || result.overboostAssistFaultLatched) {
     return static_cast<uint8_t>(can_protocol::MethState::FAULT);
   }
   if (result.pump.enabled && result.finalDutyPercent > 0.0f) {
@@ -1279,7 +1405,7 @@ void serviceCanBus(uint32_t now,
   if (elapsed(now, lastKnockStateTxMs, kKnockStateTxMs)) {
     lastKnockStateTxMs = now;
     can_protocol::EngineKnockState state{};
-    state.status_flags |= config.knock.enabled ? (1U << 0) : 0U;
+    state.status_flags |= (kKnockOn && config.knock.enabled) ? (1U << 0) : 0U;
     state.status_flags |= knockSignalValid ? (1U << 1) : 0U;
     state.status_flags |= knockWarningActive ? (1U << 2) : 0U;
     state.status_flags |= knockCriticalActive ? (1U << 3) : 0U;
@@ -1310,7 +1436,7 @@ void serviceCanBus(uint32_t now,
     }
   }
 
-  if (elapsed(now, lastKnockHookTxMs, kKnockHookTxMs)) {
+  if (kKnockOn && elapsed(now, lastKnockHookTxMs, kKnockHookTxMs)) {
     lastKnockHookTxMs = now;
     can_protocol::KnockLiveHook hook{};
     hook.flags |= config.knock.enabled ? (1U << 0) : 0U;
@@ -1387,7 +1513,8 @@ void serviceCanBus(uint32_t now,
     }
   }
 
-  // ---- Knock detail for the dash's knock page (0x30E) ----
+  // ---- Knock detail for the dash's knock page (0x30E); none when knock is not built in ----
+  if (!kKnockOn) return;
   if (elapsed(now, lastKnockDetailTxMs, kKnockDetailTxMs)) {
     lastKnockDetailTxMs = now;
     namespace amp = can_protocol::knock_amplifier_flag;
@@ -1487,139 +1614,33 @@ void updateIntakeTemps(uint32_t now) {
   lastIntakeTempMs = now;
   float millivolts = 0.0f, sample = 0.0f;
   // Light smoothing only: these sensors are there to show the spray cooling the air.
+  // An unplugged sensor reads at the ADC's top and counts as missing (analog_inputs.h):
+  // the temperature features then use the ECU's intake temperature instead.
   if (adc_sampler::averageMv(adc_sampler::kPre, millivolts) &&
-      analog_inputs::thermistorC(millivolts, pins::INTAKE_TEMP_SUPPLY_MV, pins::INTAKE_TEMP_PULLUP_OHMS, sample)) {
+      analog_inputs::thermistorC(millivolts, pins::INTAKE_TEMP_SUPPLY_MV, pins::INTAKE_TEMP_PULLUP_OHMS,
+                                 adc_sampler::topMv(adc_sampler::kPre), sample)) {
     preTempC = preTempValid ? preTempC + (sample - preTempC) * 0.3f : sample;
     preTempValid = true;
   } else {
     preTempValid = false;
   }
   if (adc_sampler::averageMv(adc_sampler::kPost, millivolts) &&
-      analog_inputs::thermistorC(millivolts, pins::INTAKE_TEMP_SUPPLY_MV, pins::INTAKE_TEMP_PULLUP_OHMS, sample)) {
+      analog_inputs::thermistorC(millivolts, pins::INTAKE_TEMP_SUPPLY_MV, pins::INTAKE_TEMP_PULLUP_OHMS,
+                                 adc_sampler::topMv(adc_sampler::kPost), sample)) {
     postTempC = postTempValid ? postTempC + (sample - postTempC) * 0.3f : sample;
     postTempValid = true;
   } else {
     postTempValid = false;
   }
 }
-} // namespace
 
-void setup() {
-  // The pump is off before anything else happens.
-  pinMode(pins::PUMP_RELAY_OUT, OUTPUT);
-  digitalWrite(pins::PUMP_RELAY_OUT, LOW);
-  pinMode(pins::PUMP_OUT, OUTPUT);
-  digitalWrite(pins::PUMP_OUT, LOW);
-  const bool pumpReady = ledcAttach(pins::PUMP_OUT, PUMP_PWM_HZ, PUMP_PWM_BITS);
-  ledcWrite(pins::PUMP_OUT, 0);
+// ---------------------------------------------------------------------------
+// Knock, one pass every 20 ms from loop(); only when built in (ESP32_KNOCK).
+// ---------------------------------------------------------------------------
+bool knockDetected = false;   // A knock warning on this pass
+int knockRaw = 0;             // The largest knock sample of the pass
 
-  Serial.begin(config.serialBaud);
-  if (!pumpReady) Serial.println(F("BOOT: pump PWM did not start; the pump will not run"));
-  // Fail safe until the dash explicitly arms this controller.
-  config.mode = InjectionMode::Off;
-  Serial.println();
-  Serial.printf("BOOT: ESP32-S3 water/meth and knock firmware, build %08lX\n", static_cast<unsigned long>(METH_FW_BUILD));
-
-  pinMode(pins::WARNING_LED, OUTPUT);
-  digitalWrite(pins::WARNING_LED, LOW);
-  pinMode(pins::FLOAT_SENSOR_DIGITAL, INPUT_PULLUP);
-  floatSensor.begin(rawFloatLow(), millis(), config.floatDebounceMs, config.floatLowShutdownDelayMs);
-
-  // Saved tuning, or the conservative defaults on a new or damaged store.
-  if (!loadTune()) meth_tune::loadDefaults(tune);
-  syncTuneToConfig();
-
-  // A firmware that hangs is restarted by the watchdog; if it was on trial, that
-  // restart goes back to the previous one.
-  enableLoopWDT();
-  esp_ota_img_states_t imageState;
-  const esp_partition_t *running = esp_ota_get_running_partition();
-  updater.setOnTrial(running && esp_ota_get_state_partition(running, &imageState) == ESP_OK &&
-                     imageState == ESP_OTA_IMG_PENDING_VERIFY);
-  if (updater.onTrial()) Serial.println(F("BOOT: new firmware, on trial until the dash confirms it"));
-
-  // On the Nano the threshold offset covers its coarse measurement (8 half counts).
-  // This board measures finely, and an offset that size hides knock when the signal is
-  // small: replaying the owner's LTspice simulation, 8 missed every knock at low
-  // amplitudes that 2 catches. The dash can still set it.
-  config.knock.thresholdOffset = 2.0f;
-  loadKnockSettings();   // What was set from the dash, if anything.
-  loadKnockFrequency();
-  knockFinder.begin(knockBoreHz());
-  adc_sampler::setKnockExpected(knockBoreHz());
-  if (knockLearnedHz > 0.0f) {
-    Serial.printf("BOOT: knock filter at %.0f Hz, learned earlier (the bore suggests %u)\n", knockLearnedHz, knockBoreHz());
-  }
-  beginKnockGain();
-  adc_sampler::setKnockLimitsMv(KNOCK_ADC_LOW_MV, KNOCK_ADC_HIGH_MV);
-  adcReady = adc_sampler::begin(pins::KNOCK_SENSOR_ADC, pins::OIL_PRESSURE_ADC, pins::FUEL_PRESSURE_ADC,
-                                pins::PRE_INJECTION_TEMP_ADC, pins::POST_INJECTION_TEMP_ADC);
-  if (!adcReady) Serial.println(F("BOOT: analog inputs did not start; knock and pressures unavailable"));
-
-  canLock = xSemaphoreCreateMutex();
-  canRxQueue = xQueueCreate(128, sizeof(RxFrame));
-  canOnline = initCanBus();
-  lastCanRetryMs = millis();
-  xTaskCreatePinnedToCore(canReceiveTask, "can-rx", 4096, nullptr, 6, nullptr, 0);
-}
-
-void loop() {
-  // Received frames first, so every time they record is at or before this pass's "now".
-  drainCanFrames(millis());
-  const uint32_t now = millis();
-  if (restartAtMs && static_cast<int32_t>(now - restartAtMs) >= 0) {
-    setPump(0.0f);
-    ESP.restart();
-  }
-
-  // ---- Firmware update: nothing but the transfer, with the pump held off ----
-  if (updater.active()) {
-    setPump(0.0f);
-    if (injectionNeeded(now)) {
-      updater.cancel();
-      transmitCanFrame(fw::packAck(fw::TARGET_WATER_METH, fw::ABORT, fw::STATUS_BUSY), "0x681");
-      Serial.println(F("UPDATE: boost is near; transfer dropped, running firmware kept"));
-    } else {
-      if (updater.expired(now)) Serial.println(F("UPDATE: transfer abandoned: the dash went quiet"));
-      delay(1);
-      return;
-    }
-  }
-  if (updater.onTrial() && now >= kTrialMs) {
-    Serial.println(F("UPDATE: new firmware not confirmed by the dash; going back to the previous one"));
-    setPump(0.0f);
-    esp_ota_mark_app_invalid_rollback_and_reboot();
-    updater.setOnTrial(false);   // Only reached if there is nothing to go back to.
-  }
-
-  if (!elapsed(now, lastLoopMs, config.loopPeriodMs)) {
-    delay(1);
-    return;
-  }
-  lastLoopMs = now;
-
-  // ---- Manifold pressure and engine speed, from the ECU ----
-  SensorReadings readings;
-  const bool mapFresh = ecuData.mapFresh(now);
-  if (ecuData.baroKnown()) {
-    config.map.baroKpa = ecuData.baroKpa;
-  } else if (mapFresh && ecuData.rpmFresh(now) && ecuData.rpm == 0 &&
-             ecuData.mapKpa >= ecu::kMinBaroKpa && ecuData.mapKpa <= ecu::kMaxBaroKpa) {
-    config.map.baroKpa = ecuData.mapKpa;   // Key on, engine stopped: the manifold is at atmospheric pressure.
-  }
-  readings.mapValid = mapFresh;
-  readings.mapKpa = mapFresh ? ecuData.mapKpa : config.map.baroKpa;
-  readings.boostPsi = (readings.mapKpa - config.map.baroKpa) * kPsiPerKpa;
-  if (ecuData.intakeFresh(now)) {
-    ecuIntakeC = ecuData.intakeC;
-    ecuIntakeSeenMs = now;
-    ecuIntakeSeen = true;
-  }
-  readings.tankLow = floatSensor.update(rawFloatLow(), now);
-  updatePressureReadings(readings);
-  updateIntakeTemps(now);
-  const uint16_t rpm = currentEngineRpm(now);
-
+void serviceKnock(uint32_t now, const SensorReadings &readings, uint16_t rpm) {
   // ---- Knock: the ADC task has filtered every sample of the last 20 ms (knock_dsp.h) ----
   adc_sampler::setKnockBand(knockCenterHz(), knockBandwidthHz());
   const size_t knockFrameCount = adc_sampler::takeKnockFrames(knockFrames, knock_dsp::kMaxFrames);
@@ -1632,7 +1653,7 @@ void loop() {
   const bool knockRangeFresh = adc_sampler::takeKnockStats(knockFresh);
   if (knockRangeFresh) knockStats = knockFresh;
   const bool knockInputDead = !adcReady || adc_sampler::silentForMs(now) > 500;
-  const int knockRaw = knockStats.high;   // The largest sample of the pass
+  knockRaw = knockStats.high;   // The largest sample of the pass
   // With automatic gain a clipped burst is the gain control's business (it backs off at
   // once); it is a fault only when it clips with no gain left to take off, or when
   // nothing is heard at full gain with the engine at speed.
@@ -1683,9 +1704,13 @@ void loop() {
       knockDetector.relearn();   // Levels learned through the old filter no longer apply.
     }
   }
-  if (knockLearnedHz > 0.0f && fabsf(knockLearnedHz - knockSavedHz) >= 50.0f && elapsed(now, knockSavedMs, kKnockSaveEveryMs)) {
+  const bool flashOk = flashWriteAllowed(now);
+  if (flashOk && knockLearnedHz > 0.0f && fabsf(knockLearnedHz - knockSavedHz) >= 50.0f &&
+      elapsed(now, knockSavedMs, kKnockSaveEveryMs)) {
     knockSavedMs = now;
     saveKnockFrequency();
+  } else if (flashOk && knockFrequencyErasePending) {
+    eraseKnockFrequency();
   }
   // Who sets the gain: the controller, or a position held from the dash.
   if (KNOCK_GAIN_POT != 0) {
@@ -1702,7 +1727,7 @@ void loop() {
       knockGainAuto = true;
     }
   }
-  if (knockSettingsDirty && elapsed(now, knockSettingsChangedMs, kKnockSettingsSaveMs)) {
+  if (flashOk && knockSettingsDirty && elapsed(now, knockSettingsChangedMs, kKnockSettingsSaveMs)) {
     knockSettingsDirty = false;
     saveKnockSettings();
   }
@@ -1736,7 +1761,7 @@ void loop() {
   knockSignalValid = knockArmed && knockBaselineLearned;
   knockWarningActive = knockDetector.warning();
   knockCriticalActive = knockDetector.critical();
-  const bool knockDetected = knockWarningActive;
+  knockDetected = knockWarningActive;
 
   if (knockWarningActive && !lastKnockWarningActive) {
     queueKnockFault(can_protocol::knock_fault_code::KNOCK_WARNING,
@@ -1766,6 +1791,234 @@ void loop() {
   lastKnockCriticalActive = knockCriticalActive;
   lastKnockSensorFault = knockSensorFault;
   lastKnockClippingDetected = knockClippingDetected;
+}
+
+#if METH_SAFETY_TEST
+// One letter on the serial monitor, then Enter. Each failure starts with the pump on at
+// 30 % (have nothing connected to it, or no fluid in the line), so the layer that
+// switches it off has something to do.
+void serviceSafetyTest() {
+  while (Serial.available() > 0) {
+    const int c = Serial.read();
+    if (c == 's') {
+      Serial.println(F("TEST s: pump on, then the main loop stalls for 600 ms"));
+      setPump(30.0f);
+      const uint32_t start = millis();
+      uint32_t offAfterMs = 0;
+      while (millis() - start < 600) {
+        if (!offAfterMs && !pumpRunning) offAfterMs = millis() - start;
+        delay(1);
+      }
+      Serial.printf("TEST s: the CAN task switched the pump off after %lu ms; PWM duty now %lu, relay %s\n",
+                    static_cast<unsigned long>(offAfterMs), static_cast<unsigned long>(ledcRead(pins::PUMP_OUT)),
+                    digitalRead(pins::PUMP_RELAY_OUT) ? "CLOSED" : "open");
+    } else if (c == 'h') {
+      Serial.println(F("TEST h: pump on, then the main loop hangs: the keeper at 250 ms, the watchdog at 2 s"));
+      setPump(30.0f);
+      delay(20);
+      for (;;) {
+      }
+    } else if (c == 'c') {
+      Serial.println(F("TEST c: the CAN task hangs, pump keeper and all: the watchdog at 2 s"));
+      safetyTestHangCanTask = true;
+    } else if (c == 'x') {
+      Serial.println(F("TEST x: pump on, then a crash (a write through a null pointer)"));
+      setPump(30.0f);
+      delay(20);
+      volatile int *nowhere = nullptr;
+      *nowhere = 1;
+    } else if (c == 'i') {
+      Serial.println(F("TEST i: pump on, then this core stops with interrupts off: the interrupt watchdog at 300 ms"));
+      setPump(30.0f);
+      delay(20);
+      portDISABLE_INTERRUPTS();
+      for (;;) {
+      }
+    } else if (c == 'f') {
+      Serial.println(F("TEST f: clear faults, as the dash does"));
+      clearCrashHold();
+    } else if (c == '?') {
+      Serial.println(F("TEST: s stall 600 ms | h hang loop | c hang CAN task | x crash | i interrupts off | f clear faults"));
+    }
+  }
+}
+#endif
+} // namespace
+
+void setup() {
+  // The pump is off before anything else happens.
+  pinMode(pins::PUMP_RELAY_OUT, OUTPUT);
+  digitalWrite(pins::PUMP_RELAY_OUT, LOW);
+  pinMode(pins::PUMP_OUT, OUTPUT);
+  digitalWrite(pins::PUMP_OUT, LOW);
+  const bool pumpReady = ledcAttach(pins::PUMP_OUT, PUMP_PWM_HZ, PUMP_PWM_BITS);
+  ledcWrite(pins::PUMP_OUT, 0);
+  // From here on, a crash or a restart switches the pump off before anything else.
+  set_arduino_panic_handler(pumpOffAtCrash, nullptr);
+  esp_register_shutdown_handler(pumpOffAtRestart);
+
+  // What the last reset was, and whether this ignition cycle has seen too many crashes.
+  bootCause = reset_guard::boot(resetRecord, reportedResetCause(esp_reset_reason()));
+  crashHold = reset_guard::injectionHeld(resetRecord);
+  const bool crashHookRan = crashHookMark == kCrashHookRan;
+  crashHookMark = 0;
+
+  Serial.begin(config.serialBaud);
+#if ARDUINO_USB_CDC_ON_BOOT && ARDUINO_USB_MODE
+  // The USB serial waits up to 100 ms per print for a computer that is plugged in but
+  // not reading (the serial monitor closed). The once-a-second report and the spectrum
+  // are dozens of prints: seconds of stalled control. Prints are dropped instead.
+  Serial.setTxTimeoutMs(0);
+#endif
+  if (!pumpReady) Serial.println(F("BOOT: pump PWM did not start; the pump will not run"));
+  // Fail safe until the dash explicitly arms this controller.
+  config.mode = InjectionMode::Off;
+  Serial.println();
+  Serial.printf("BOOT: ESP32-S3 water/meth and knock firmware, build %08lX\n", static_cast<unsigned long>(METH_FW_BUILD));
+  Serial.printf("BOOT: last reset: %s; crashes since the ignition came on: %u\n", reset_guard::name(bootCause),
+                static_cast<unsigned>(resetRecord.crashes));
+  if (bootCause == reset_guard::Cause::Crash) {
+    Serial.println(crashHookRan ? F("BOOT: the crash handler switched the pump off before the reset")
+                                : F("BOOT: the crash handler did not run (the pull-downs held the pump off once the pins floated)"));
+  }
+  if (crashHold) {
+    Serial.printf("SAFETY: %u crashes since the ignition came on: injection held off until the dash clears "
+                  "faults or the ignition is cycled\n", static_cast<unsigned>(resetRecord.crashes));
+  }
+
+  pinMode(pins::WARNING_LED, OUTPUT);
+  digitalWrite(pins::WARNING_LED, LOW);
+  pinMode(pins::FLOAT_SENSOR_DIGITAL, INPUT_PULLUP);
+  floatSensor.begin(rawFloatLow(), millis(), config.floatDebounceMs, config.floatLowShutdownDelayMs);
+
+  // Saved tuning, or the conservative defaults on a new or damaged store.
+  if (!loadTune()) meth_tune::loadDefaults(tune);
+  syncTuneToConfig();
+
+  // Watchdogs. The task watchdog (a hardware timer) restarts the board if the main loop
+  // or the CAN task, which carries the pump keeper, goes silent for kWatchdogMs. The
+  // interrupt watchdog (300 ms) catches a processor stuck with interrupts off; the
+  // brownout detector resets on a supply dip. Each goes through pumpOffAtCrash first.
+  // A firmware that hangs while on trial goes back to the previous one.
+  esp_task_wdt_config_t watchdog = {};
+  watchdog.timeout_ms = kWatchdogMs;
+  watchdog.idle_core_mask = 1U << 0;   // Core 0's idle task too, as the framework has it
+  watchdog.trigger_panic = true;
+  if (esp_task_wdt_reconfigure(&watchdog) != ESP_OK) Serial.println(F("BOOT: watchdog kept at its default (5 s)"));
+  enableLoopWDT();
+  esp_ota_img_states_t imageState;
+  const esp_partition_t *running = esp_ota_get_running_partition();
+  updater.setOnTrial(running && esp_ota_get_state_partition(running, &imageState) == ESP_OK &&
+                     imageState == ESP_OTA_IMG_PENDING_VERIFY);
+  if (updater.onTrial()) Serial.println(F("BOOT: new firmware, on trial until the dash confirms it"));
+
+  if (kKnockOn) {
+    // On the Nano the threshold offset covers its coarse measurement (8 half counts).
+    // This board measures finely, and an offset that size hides knock when the signal is
+    // small: replaying the owner's LTspice simulation, 8 missed every knock at low
+    // amplitudes that 2 catches. The dash can still set it.
+    config.knock.thresholdOffset = 2.0f;
+    loadKnockSettings();   // What was set from the dash, if anything.
+    loadKnockFrequency();
+    knockFinder.begin(knockBoreHz());
+    adc_sampler::setKnockExpected(knockBoreHz());
+    if (knockLearnedHz > 0.0f) {
+      Serial.printf("BOOT: knock filter at %.0f Hz, learned earlier (the bore suggests %u)\n", knockLearnedHz, knockBoreHz());
+    }
+    beginKnockGain();
+  } else {
+    config.knock.enabled = false;
+    // The potentiometer's control pins held at rest (deselected), so nothing floating
+    // can step it.
+    pinMode(pins::KNOCK_GAIN_CS, OUTPUT);
+    pinMode(pins::KNOCK_GAIN_INC, OUTPUT);
+    pinMode(pins::KNOCK_GAIN_UD, OUTPUT);
+    digitalWrite(pins::KNOCK_GAIN_CS, HIGH);
+    digitalWrite(pins::KNOCK_GAIN_INC, HIGH);
+    digitalWrite(pins::KNOCK_GAIN_UD, LOW);
+    Serial.println(F("BOOT: knock listening is off in this build (ESP32_KNOCK=0)"));
+  }
+  adc_sampler::setKnockLimitsMv(KNOCK_ADC_LOW_MV, KNOCK_ADC_HIGH_MV);
+  adcReady = adc_sampler::begin(pins::KNOCK_SENSOR_ADC, pins::OIL_PRESSURE_ADC, pins::FUEL_PRESSURE_ADC,
+                                pins::PRE_INJECTION_TEMP_ADC, pins::POST_INJECTION_TEMP_ADC);
+  if (!adcReady) Serial.println(F("BOOT: analog inputs did not start; knock and pressures unavailable"));
+
+  canLock = xSemaphoreCreateMutex();
+  canRxQueue = xQueueCreate(128, sizeof(RxFrame));
+  canOnline = initCanBus();
+  lastCanRetryMs = millis();
+  xTaskCreatePinnedToCore(canReceiveTask, "can-rx", 4096, nullptr, 6, nullptr, 0);
+}
+
+void loop() {
+  // Received frames first, so every time they record is at or before this pass's "now".
+  drainCanFrames(millis());
+#if METH_SAFETY_TEST
+  serviceSafetyTest();
+#endif
+  const uint32_t now = millis();
+  if (restartAtMs && static_cast<int32_t>(now - restartAtMs) >= 0) {
+    setPump(0.0f);
+    ESP.restart();
+  }
+
+  // ---- Firmware update: nothing but the transfer, with the pump held off ----
+  if (updater.active()) {
+    setPump(0.0f);
+    if (injectionNeeded(now)) {
+      updater.cancel();
+      transmitCanFrame(fw::packAck(fw::TARGET_WATER_METH, fw::ABORT, fw::STATUS_BUSY), "0x681");
+      Serial.println(F("UPDATE: boost is near; transfer dropped, running firmware kept"));
+    } else {
+      if (updater.expired(now)) Serial.println(F("UPDATE: transfer abandoned: the dash went quiet"));
+      delay(1);
+      return;
+    }
+  }
+  if (updater.onTrial() && now >= kTrialMs) {
+    Serial.println(F("UPDATE: new firmware not confirmed by the dash; going back to the previous one"));
+    setPump(0.0f);
+    esp_ota_mark_app_invalid_rollback_and_reboot();
+    updater.setOnTrial(false);   // Only reached if there is nothing to go back to.
+  }
+
+  if (!elapsed(now, lastLoopMs, config.loopPeriodMs)) {
+    delay(1);
+    return;
+  }
+  // The longest gap between control passes since the last heartbeat (normally 20 ms):
+  // anything near the pump keeper's 250 ms is worth knowing about.
+  if (lastLoopMs != 0 && now - lastLoopMs > loopGapMaxMs) loopGapMaxMs = now - lastLoopMs;
+  lastLoopMs = now;
+  if (pumpKeeperTrips != keeperTripsReported) {
+    keeperTripsReported = pumpKeeperTrips;
+    Serial.printf("SAFETY: the main loop went %ld ms without setting the pump; the CAN task switched it off (%lu times)\n",
+                  static_cast<long>(kPumpKeeperMs), static_cast<unsigned long>(keeperTripsReported));
+  }
+
+  // ---- Manifold pressure and engine speed, from the ECU ----
+  SensorReadings readings;
+  const bool mapFresh = ecuData.mapFresh(now);
+  if (ecuData.baroKnown()) {
+    config.map.baroKpa = ecuData.baroKpa;
+  } else if (mapFresh && ecuData.rpmFresh(now) && ecuData.rpm == 0 &&
+             ecuData.mapKpa >= ecu::kMinBaroKpa && ecuData.mapKpa <= ecu::kMaxBaroKpa) {
+    config.map.baroKpa = ecuData.mapKpa;   // Key on, engine stopped: the manifold is at atmospheric pressure.
+  }
+  readings.mapValid = mapFresh;
+  readings.mapKpa = mapFresh ? ecuData.mapKpa : config.map.baroKpa;
+  readings.boostPsi = (readings.mapKpa - config.map.baroKpa) * kPsiPerKpa;
+  if (ecuData.intakeFresh(now)) {
+    ecuIntakeC = ecuData.intakeC;
+    ecuIntakeSeenMs = now;
+    ecuIntakeSeen = true;
+  }
+  readings.tankLow = floatSensor.update(rawFloatLow(), now);
+  updatePressureReadings(readings);
+  updateIntakeTemps(now);
+  const uint16_t rpm = currentEngineRpm(now);
+
+  if (kKnockOn) serviceKnock(now, readings, rpm);
 
   // ---- Pump test and injection ----
   applyCanCommandTimeout(now);
@@ -1792,7 +2045,8 @@ void loop() {
     duty = governor.manual(now, tune, manualTestDuty);
   } else {
     meth_tune::Inputs inputs;
-    inputs.wantSpray = result.pump.enabled;
+    // Held off after repeated crashes (reset_guard.h): the governor then reports a fault.
+    inputs.wantSpray = result.pump.enabled && !crashHold;
     inputs.idleHold = idleHoldFor(result);
     inputs.boostPsi = readings.boostPsi;
     inputs.mapKpa = readings.mapKpa;
@@ -1819,21 +2073,30 @@ void loop() {
     lastPumpOn = pumpOn;
     lastTuneStatusTxMs = now - can_protocol::METH_TUNE_STATUS_TX_MS;
   }
-  if (tuneSavePending) {
+  if (tuneSavePending && flashWriteAllowed(now)) {
     saveTune();
     tuneSavePending = false;
     tuneUnsaved = false;
   }
-  digitalWrite(pins::WARNING_LED, (result.failsafe != FailsafeReason::None || result.overboostAssistFaultLatched ||
-                                   knockDetected) ? HIGH : LOW);
+  digitalWrite(pins::WARNING_LED, (crashHold || result.failsafe != FailsafeReason::None ||
+                                   result.overboostAssistFaultLatched || knockDetected) ? HIGH : LOW);
 
   serviceCanBus(now, readings, result, knockDetected, knockRaw);
 
-  // The ADC feeds knock and every pressure: if it has gone quiet, start again from reset.
+  // The ADC feeds knock, the pressures and the air temperature sensors: if it has gone
+  // quiet, start again from reset. Twice at most per ignition cycle (reset_guard.h);
+  // after that the board carries on without it: knock reports a sensor fault, the
+  // pressures read as missing, and injection uses the ECU's intake temperature.
   if (adcReady && adc_sampler::silentForMs(now) > 3000) {
-    Serial.println(F("FAULT: no data from the ADC for 3 s; restarting"));
-    setPump(0.0f);
-    ESP.restart();
+    if (reset_guard::mayRestartForFault(resetRecord)) {
+      Serial.println(F("FAULT: no data from the ADC for 3 s; restarting"));
+      setPump(0.0f);
+      reset_guard::markFaultRestart(resetRecord);
+      ESP.restart();
+    }
+    Serial.println(F("FAULT: no data from the ADC for 3 s, and restarting has not cured it; carrying on without it "
+                     "(no knock, pressures or air temperature sensors)"));
+    adcReady = false;
   }
 
   if (knockSpectrum.valid && elapsed(now, knockSpectrumPrintMs, kKnockSpectrumPrintMs)) {
@@ -1851,7 +2114,8 @@ void loop() {
   if (elapsed(now, lastDebugMs, kSerialHeartbeatMs)) {
     lastDebugMs = now;
     Serial.printf("HB t=%lu map=%.1f%s boostPsi=%.2f baro=%.1f rpm=%u%s duty=%.0f%% hold=%u mode=%u tankLow=%d can=%d "
-                  "oilPsi=%.1f%s fuelPsi=%.1f%s pre=%.1f%s knock=%d krest=%umV knockHz=%lu klvl=%.1f kbase=%.1f k2=%.1f kshare=%.2f kfreq=%u kfound=%.0f ktone=%.0f kgain=%.1f%s kpeak=%umV rxOvf=%lu\n",
+                  "oilPsi=%.1f%s fuelPsi=%.1f%s pre=%.1f%s knock=%d krest=%umV knockHz=%lu klvl=%.1f kbase=%.1f k2=%.1f kshare=%.2f kfreq=%u kfound=%.0f ktone=%.0f kgain=%.1f%s kpeak=%umV rxOvf=%lu "
+                  "loopMax=%lums keeper=%lu crashes=%u%s\n",
                   static_cast<unsigned long>(now), readings.mapKpa, readings.mapValid ? "" : "!", readings.boostPsi,
                   config.map.baroKpa, rpm, engineRpmValid ? "" : "!", pumpDutyPercent, governor.hold(),
                   static_cast<unsigned>(config.mode), readings.tankLow ? 1 : 0, canOnline ? 1 : 0,
@@ -1861,6 +2125,9 @@ void loop() {
                   knockDetector.level(), knockDetector.baseline(), knockDetector.second(), knockDetector.share(),
                   knockCenterHz(), knockFinder.estimateHz(), knockToneHz,
                   knockGain.gain(), knockGainAuto ? "" : "(fixed)", static_cast<unsigned>(knockGain.typicalPeak()),
-                  static_cast<unsigned long>(canRxOverflows));
+                  static_cast<unsigned long>(canRxOverflows), static_cast<unsigned long>(loopGapMaxMs),
+                  static_cast<unsigned long>(pumpKeeperTrips), static_cast<unsigned>(resetRecord.crashes),
+                  crashHold ? "(HOLD)" : "");
+    loopGapMaxMs = 0;
   }
 }

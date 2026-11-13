@@ -95,12 +95,20 @@ void pressureTransducer() {
 void intakeThermistor() {
   float c = 0.0f;
   // 2238 ohm at 30 C on a 2490 ohm pull-up to 3300 mV: 3300 * 2238 / 4728 = 1562 mV.
-  check(analog_inputs::thermistorC(1562.0f, 3300.0f, 2490.0f, c) && near(c, 30.0f, 1.0f), "30 C");
+  const float top = 3170.0f;   // Where this ESP32-S3's ADC tops out
+  check(analog_inputs::thermistorC(1562.0f, 3300.0f, 2490.0f, top, c) && near(c, 30.0f, 1.0f), "30 C");
   // 177 ohm at 99 C: 3300 * 177 / 2667 = 219 mV.
-  check(analog_inputs::thermistorC(219.0f, 3300.0f, 2490.0f, c) && near(c, 99.0f, 2.0f), "99 C");
-  check(!analog_inputs::thermistorC(3295.0f, 3300.0f, 2490.0f, c), "open sensor");
-  check(!analog_inputs::thermistorC(5.0f, 3300.0f, 2490.0f, c), "shorted sensor");
-  check(!analog_inputs::thermistorC(1500.0f, 0.0f, 2490.0f, c), "no supply reading");
+  check(analog_inputs::thermistorC(219.0f, 3300.0f, 2490.0f, top, c) && near(c, 99.0f, 2.0f), "99 C");
+  check(!analog_inputs::thermistorC(3295.0f, 3300.0f, 2490.0f, top, c), "open sensor");
+  check(!analog_inputs::thermistorC(5.0f, 3300.0f, 2490.0f, top, c), "shorted sensor");
+  check(!analog_inputs::thermistorC(1500.0f, 0.0f, 2490.0f, top, c), "no supply reading");
+  // An unplugged sensor on the ESP32 reads at the ADC's top, below the 3.3 V supply. It
+  // passed for -32 C before the top was taken into account.
+  check(!analog_inputs::thermistorC(top, 3300.0f, 2490.0f, top, c), "open sensor at the ADC's top");
+  check(!analog_inputs::thermistorC(top - 20.0f, 3300.0f, 2490.0f, top, c), "open sensor, a little noise");
+  // A cold winter morning still reads: about 3.04 V at -20 C.
+  check(analog_inputs::thermistorC(3036.0f, 3300.0f, 2490.0f, top, c) && c < -15.0f && c > -25.0f, "-20 C still reads");
+  check(analog_inputs::thermistorC(1562.0f, 3300.0f, 2490.0f, 3100.0f, c), "an ADC with a lower top still reads 30 C");
 }
 
 void tankFloatSwitch() {

@@ -333,6 +333,16 @@ bool averageMv(Slow input, float &millivolts) {
   return true;
 }
 
+float topMv(Slow input) {
+  if (input >= kSlowCount) return 3100.0f;
+  int calibrated = 0;
+  // The same conversion as averageMv(), at the largest raw value.
+  if (calibration[input] && adc_cali_raw_to_voltage(calibration[input], 4095, &calibrated) == ESP_OK) {
+    return static_cast<float>(calibrated);
+  }
+  return 3100.0f;
+}
+
 uint32_t silentForMs(uint32_t nowMs) {
   const uint32_t last = lastDataMs;
   // The collecting task may have stamped a later time than the caller's.

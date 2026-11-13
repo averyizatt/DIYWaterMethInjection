@@ -8,7 +8,12 @@ Two boards run this controller, with the same CAN messages:
 - **ESP32-S3** (`src/main_esp32.cpp`, the replacement): pump on a MOSFET with PWM,
   manifold pressure and RPM from the MicroSquirt over CAN, firmware updates from the
   dash over CAN. See [ESP32-S3 board](#esp32-s3-board-pump-on-a-mosfet-with-pwm) and
-  [docs/ESP32_HARDWARE.md](docs/ESP32_HARDWARE.md).
+  [docs/ESP32_HARDWARE.md](docs/ESP32_HARDWARE.md). **Knock listening is off on this
+  board for now too** (November 2026, the owner's choice, until the knock amplifier's
+  input works on the bench): `ESP32_KNOCK` in `src/main_esp32.cpp`, 0 by default; add
+  `-DESP32_KNOCK=1` to the `esp32s3_water_meth` build flags to bring it back. As on the
+  Nano, the knock state (`0x307`) goes out marked not enabled and knock commands are
+  refused; injection never depended on knock.
 
 Standalone Arduino Nano firmware for a water/meth controller with:
 
@@ -380,11 +385,14 @@ platformio test -c platformio-tests.ini -e native_knock_tests
 The ESP32 board's logic has host tests too: the PWM pump rules
 ([test/test_meth_pwm/test_main.cpp](test/test_meth_pwm/test_main.cpp)) and the ECU
 broadcast decoding and sensor scaling
-([test/test_esp32_inputs/test_main.cpp](test/test_esp32_inputs/test_main.cpp)).
+([test/test_esp32_inputs/test_main.cpp](test/test_esp32_inputs/test_main.cpp)), and the
+crash-loop guard that holds injection off after repeated crashes
+([test/test_reset_guard/test_main.cpp](test/test_reset_guard/test_main.cpp)).
 
 ```bash
 g++ -std=c++11 -I include test/test_meth_pwm/test_main.cpp -o meth_pwm_test && ./meth_pwm_test
 g++ -std=c++11 -I include test/test_esp32_inputs/test_main.cpp -o esp32_inputs_test && ./esp32_inputs_test
+g++ -std=c++11 -I include test/test_reset_guard/test_main.cpp -o reset_guard_test && ./reset_guard_test
 ```
 
 The knock spectrum and frequency finder ([test/test_knock_spectrum/test_main.cpp](test/test_knock_spectrum/test_main.cpp)):

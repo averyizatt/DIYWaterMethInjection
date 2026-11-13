@@ -36,8 +36,17 @@ struct Pressure {
 
 // GM-style intake air thermistor on a 2.49k pull-up to the 3.3 V rail. The curve is the
 // one the relay controller used; only the reference voltage differs.
-inline bool thermistorC(float pinMv, float supplyMv, float pullupOhms, float &tempC) {
+//
+// adcTopMv is the highest the ADC can read on that pin (adc_sampler::topMv(), about
+// 3.17 V on the ESP32-S3). It is below the 3.3 V that an unplugged sensor pulls the pin
+// to, so an open sensor reads at the ADC's top, not at the supply, and would otherwise
+// pass for air at -32 C. A reading that close to the top is no sensor; a real one there
+// would be colder than about -25 C, which this circuit cannot measure on this ADC either.
+constexpr float kAdcTopMarginMv = 40.0f;
+
+inline bool thermistorC(float pinMv, float supplyMv, float pullupOhms, float adcTopMv, float &tempC) {
   if (!(supplyMv > 0.0f) || pinMv < 0.0f) return false;
+  if (pinMv >= adcTopMv - kAdcTopMarginMv) return false;
   const float count = pinMv * 1023.0f / supplyMv;
   if (count >= 1023.0f) return false;
   return meth_tune::thermistorC(static_cast<uint16_t>(count + 0.5f), pullupOhms, tempC);

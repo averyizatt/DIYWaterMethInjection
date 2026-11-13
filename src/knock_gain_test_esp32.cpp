@@ -20,6 +20,15 @@
 //   - "knock" and "second" are the loudest levels heard in the two knock filters (about
 //     6 and 9.9 kHz); a tone swept through those frequencies should peak there.
 //   - "rate" is the knock samples a second the ADC really delivers.
+//
+// Test tone (KNOCK_GAIN_TEST_TONE_PIN, GPIO38 in platformio.ini; -1 turns it off): a
+// steady square wave at the knock frequency on that pin, in place of the sensor, to prove
+// the amplifier without trusting the sensor. Unplug the sensor, then
+//   GPIO38 - 10k - sensor's signal wire (the 1.5 nF side), and 1k from there to ground,
+// with the sensor's other wire to ground as usual. That is about 300 mV peak to peak,
+// like a real knock. "swing" should then grow by about 70-115 mV per 1x of gain (the
+// square wave's edges come through the 1.5 nF input a little taller than a sine would),
+// CLIPPED from about 7x up, and "knock" far above its quiet level of about 0.4.
 #include <Arduino.h>
 
 #include "adc_sampler.h"
@@ -29,7 +38,13 @@
 #include "pins_esp32.h"
 #include "x9c.h"
 
+#ifndef KNOCK_GAIN_TEST_TONE_PIN
+#define KNOCK_GAIN_TEST_TONE_PIN -1
+#endif
+
 namespace {
+constexpr int kTonePin = KNOCK_GAIN_TEST_TONE_PIN;
+constexpr uint8_t kToneBits = 8;
 constexpr uint32_t kStopMs = 3000;
 constexpr uint8_t kStopCount = 11;   // Bottom, top and nine in between
 
@@ -100,6 +115,16 @@ void setup() {
                                 pins::PRE_INJECTION_TEMP_ADC, pins::POST_INJECTION_TEMP_ADC);
   if (!adcReady) Serial.println("The ADC did not start: the potentiometer is still stepped, but nothing is measured.");
   adc_sampler::setKnockBand(knock_band::knockHzForBore(96), 1500.0f);
+  if (kTonePin >= 0) {
+    const uint32_t toneHz = knock_band::knockHzForBore(96);
+    if (ledcAttach(kTonePin, toneHz, kToneBits)) {
+      ledcWrite(kTonePin, 1U << (kToneBits - 1));   // Half on: a square wave
+      Serial.printf("Test tone on GPIO%d: %lu Hz square wave. Through 10k, with 1k to ground, into the sensor input.\n",
+                    kTonePin, static_cast<unsigned long>(toneHz));
+    } else {
+      Serial.printf("Test tone: GPIO%d could not be set up.\n", kTonePin);
+    }
+  }
   Serial.println("Walking the wiper to the bottom...");
   pot.home(potPins);
   goTo(0);

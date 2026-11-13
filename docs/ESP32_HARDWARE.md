@@ -73,6 +73,18 @@ Ignition-switched 12 V through a fuse to the 5 V converter; its output to the De
 module, the sensors and the MOSFET's source. The pump's ground current must not flow
 through the sensor grounds: run the MOSFET source to the chassis with its own wire.
 
+A car's 12 V is not clean: it sags to 6-8 V while cranking, spikes when loads switch
+off, and can go far higher for a moment if the battery connection is lost while the
+alternator charges. The firmware cannot protect against that; the supply has to:
+
+- A 5 V converter rated for automotive input (at least 36 V), not a bare hobby module.
+- A TVS diode for 12 V systems across the converter's input, after the fuse.
+- A series diode (or a reverse-polarity MOSFET) ahead of the converter, so the board
+  survives the battery being connected backwards.
+- Enough capacitance after the converter to ride through the cranking sag. If the
+  supply still dips too far, the brownout detector resets the board cleanly instead of
+  letting it run on bad power, and it comes back on its own.
+
 ## Pump
 
 ```
@@ -105,8 +117,46 @@ the spray ends. It clicks once per spray, never with the PWM. Drive the relay co
 way the Nano's output drove it (transistor or relay module), with a 10 k from the
 driver's input to ground. If you do not fit it, leave GPIO17 unconnected.
 
-The firmware also switches the pump and the relay off by itself, within a quarter of
-a second, if its main loop ever stops running, and the gate pull-down covers a reset.
+### When something fails
+
+Every way the controller can fail ends with the pump off, and each layer covers the
+one before it failing too:
+
+| What fails | What happens | How fast |
+|---|---|---|
+| The main loop stalls but the board runs | The CAN task, on the other processor core, switches the pump and the relay off | 250 ms |
+| The main loop or the CAN task hangs | The task watchdog restarts the board | 2 s |
+| A processor sticks with interrupts off | The interrupt watchdog restarts the board | 300 ms |
+| A crash (exception, either watchdog) | The pump and relay outputs go low at once, before the crash report and core dump are written to flash; then the reset | at once |
+| Any restart, asked for or not | The same, before the restart | at once |
+| The supply dips (cranking) | The brownout detector resets the board instead of letting it run on bad power | at once |
+| During and after any reset | The pins float: the 10 k pull-downs hold the MOSFET and the relay off | always |
+| The MOSFET fails switched on | The master relay opens 3 s after the spray ends | 3 s |
+| The ECU's broadcast stops or goes bad | No injection without fresh manifold pressure and RPM | 0.5 s |
+| A broken float-switch wire | Reads as an empty tank: no injection | 2 s |
+| Spraying runs on (a stuck reading) | The longest continuous spray setting (12 s by default), then a rest | setting |
+| The ADC stops delivering | Restart, twice at most per ignition cycle; after that the board carries on without it: knock (when built in) reports a sensor fault, the pressures read as missing, and injection uses the ECU's intake temperature | 3 s |
+| A firmware crashes over and over | After **3 crashes in one ignition cycle** injection is held off and the dash shows a fault, until the dash clears faults or the ignition is cycled: a pump that starts and stops with every crash is worse than one that stays off and says so | 3rd crash |
+| A new firmware from the dash misbehaves | Not confirmed by the dash within 90 s, or hangs: back to the previous firmware | 90 s |
+
+After a restart the controller comes back disarmed, and the dash arms it again with its
+regular configuration message. One crash is a restart and nothing more.
+
+Settings are written to flash only away from boost (from the dash: "unsaved" until
+then). While flash is written both processors stop running from it, which is not a
+moment to take from the pump control. The serial monitor prints a line whenever the
+CAN task has had to switch the pump off, and at start-up the reason for the last reset
+and, after a crash, whether the crash handler switched the pump off first.
+
+**Trying each failure on the bench:** the environment `esp32s3_safety_test` is the real
+firmware plus serial commands that make it fail on purpose, one way at a time: `s` the
+main loop stalls for 600 ms, `h` it hangs, `c` the CAN task hangs, `x` a crash, `i` a
+core stuck with interrupts off, `f` clear faults. Each starts with the pump output at
+30 %, so have nothing on it, or no fluid in the line. Measured on the first board: the
+CAN task switched the pump off 252 ms into the stall; both hangs were caught by the
+watchdog at 2.0 s; every crash ran the crash handler first and the board was running
+again 0.1-0.3 s after the reset; the third crash held injection off and `f` released
+it. Flash `esp32s3_water_meth` again afterwards: the test commands are not in it.
 
 ### Testing the driver by itself
 
@@ -153,6 +203,12 @@ The amplifier's gain is set by the firmware: see the next section.
 an open switch or a broken wire reads as an empty tank.
 
 ## Knock amplifier with automatic gain
+
+> **Off in the firmware for now** (November 2026), until the amplifier's input works on
+> the bench: `ESP32_KNOCK` in `src/main_esp32.cpp`, 0 by default. The dash shows knock
+> as unavailable, and the gain potentiometer is left alone. Add `-DESP32_KNOCK=1` to the
+> `esp32s3_water_meth` build flags to bring it back. The bench tests below
+> (`esp32s3_knock_gain_test`, `esp32s3_knock_test`) still work: they have their own code.
 
 Engine noise at the knock sensor is many times larger at high RPM than at idle. With a
 fixed gain the signal is either a few ADC counts at idle or clipping at speed. The
@@ -501,7 +557,7 @@ The dash's knock page shows most of this without a cable. For the first start, o
 the serial monitor (USB, 115200). Once a second the controller prints a line:
 
 ```
-HB t=12000 map=98.4 boostPsi=-0.3 baro=100.5 rpm=850 duty=0% hold=1 mode=0 tankLow=0 can=1 oilPsi=42.0 fuelPsi=39.5 pre=24.1 knock=0 krest=825mV knockHz=38460 klvl=14.2 kbase=13.1 k2=6.0 kshare=0.17 kfreq=6250 kfound=6262 ktone=0 kgain=6.3 kpeak=150mV rxOvf=0
+HB t=12000 map=98.4 boostPsi=-0.3 baro=100.5 rpm=850 duty=0% hold=1 mode=0 tankLow=0 can=1 oilPsi=42.0 fuelPsi=39.5 pre=24.1 knock=0 krest=825mV knockHz=38460 klvl=14.2 kbase=13.1 k2=6.0 kshare=0.17 kfreq=6250 kfound=6262 ktone=0 kgain=6.3 kpeak=150mV rxOvf=0 loopMax=21ms keeper=0 crashes=0
 KSPEC kHz:dB 3.2:21 3.8:19 4.4:18 5.0:20 5.6:24 6.2:29 6.8:23 7.4:18 8.0:16 8.6:15 9.2:15 9.8:19 10.4:16 11.0:13 11.6:12
 ```
 
@@ -530,8 +586,19 @@ KSPEC kHz:dB 3.2:21 3.8:19 4.4:18 5.0:20 5.6:24 6.2:29 6.8:23 7.4:18 8.0:16 8.6:
 - `knockHz` is the knock samples a second the ADC really delivers, about 38460. The
   filters follow it by themselves; if it reads far from that, say so, because it also
   tells how fine the listening is.
+- `loopMax` is the longest gap between control passes in the last second: about 20 ms.
+  Anything near 250 ms means something is holding the main loop up. `keeper` counts the
+  times the CAN task had to switch the pump off for it: it should stay 0. `crashes` is
+  the crashes since the ignition came on; `(HOLD)` after it means injection is held off
+  for them (see "When something fails" under Pump).
+- At start-up, `BOOT: last reset:` says why the board last restarted: power on, a
+  restart asked for, a supply dip, or a crash.
 
 Then, engine off, run a pump test from the dash and check the pump runs and stops.
+
+Before moving the board to the car, `esp32s3_inputs_test` shows the float switch
+(GPIO7) and the air temperature sensors (GPIO5, GPIO6) as the firmware reads them,
+once a second, with nothing else running.
 
 ## Firmware updates over CAN
 
