@@ -55,7 +55,6 @@
 #include <math.h>
 
 #include "adc_sampler.h"
-#include "knock_band.h"
 #include "knock_dsp.h"
 #include "knock_spectrum.h"
 #include "pins_esp32.h"
@@ -128,7 +127,7 @@ uint32_t lastPassMs = 0, lastReportMs = 0, lastSpectrumMs = 0;
 char typed[32];
 size_t typedLength = 0;
 
-float boreHz() { return knock_band::knockHzForBore(KNOCK_TEST_BORE_MM); }
+float boreHz() { return knock_dsp::knockHzForBore(KNOCK_TEST_BORE_MM); }
 float centreHz() { return handHz > 0.0f ? handHz : foundHz > 0.0f ? foundHz : boreHz(); }
 const char *centreWhy() { return handHz > 0.0f ? "set by hand" : foundHz > 0.0f ? "found from the bursts heard" : "from the bore"; }
 

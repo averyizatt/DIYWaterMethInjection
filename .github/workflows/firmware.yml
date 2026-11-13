@@ -1,8 +1,6 @@
-# Builds both boards' firmware on every change, so neither is broken by work on the
-# other: the Arduino Nano (relay pump) and the ESP32-S3 (PWM pump). The ESP32 image is
-# published as the "watermeth-latest" release: the dash downloads it during Update now
-# and installs it over the CAN bus (docs/ESP32_HARDWARE.md). The Nano image is kept
-# with the run; that board is flashed by USB.
+# Runs the host tests and builds the ESP32-S3 firmware and its bench tests on every
+# change. The firmware image is published as the "watermeth-latest" release: the dash
+# downloads it during Update now and installs it over the CAN bus (docs/ESP32_HARDWARE.md).
 name: Firmware
 
 on:
@@ -14,6 +12,7 @@ on:
       - 'test/**'
       - 'tools/**'
       - 'platformio.ini'
+      - 'platformio-tests.ini'
       - '.github/workflows/firmware.yml'
   workflow_dispatch:
 
@@ -54,22 +53,17 @@ jobs:
         run: |
           # Two commands, not "g++ ... && test": under bash -e a test that no longer compiled
           # would then be skipped without failing the run.
-          for name in test_meth_tune test_meth_pwm test_esp32_inputs test_reset_guard test_black_box test_knock_band test_knock_agc test_knock_dsp test_knock_spectrum; do
+          for name in test_meth_tune test_meth_pulse test_esp32_inputs test_reset_guard test_black_box test_status_light test_knock_agc test_knock_dsp test_knock_spectrum; do
             g++ -std=c++11 -O2 -Wall -I include test/$name/test_main.cpp -o /tmp/$name
             /tmp/$name
           done
           # The LTspice replay tool uses the firmware's own headers: it must keep building.
+          g++ -std=c++11 -O2 -Wall -I include test/test_injection_controller/test_main.cpp src/injection_controller.cpp src/app_config.cpp -o /tmp/test_injection_controller
+          /tmp/test_injection_controller
           g++ -std=c++17 -O2 -Wall -I include tools/ltspice/ltreplay.cpp -o /tmp/ltreplay
 
       # The image is copied out at once: the next build runs with other flags, and
       # PlatformIO then clears the build folder.
-      - name: Build the Nano firmware
-        working-directory: DIYWaterMethInjection
-        run: |
-          pio run -e arduino_nano
-          mkdir -p out
-          cp .pio/build/arduino_nano/firmware.hex out/nano-firmware.hex
-
       - name: Build the bench tests
         working-directory: DIYWaterMethInjection
         run: pio run -e esp32s3_pump_test -e esp32s3_knock_gain_test -e esp32s3_knock_test -e esp32s3_inputs_test -e esp32s3_safety_test
@@ -92,6 +86,7 @@ jobs:
       - name: Package
         working-directory: DIYWaterMethInjection
         run: |
+          mkdir -p out
           cp .pio/build/esp32s3_water_meth/firmware.bin out/watermeth-firmware.bin
           python3 - <<'EOF'
           import hashlib, json, os, pathlib

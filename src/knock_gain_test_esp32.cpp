@@ -33,7 +33,6 @@
 
 #include "adc_sampler.h"
 #include "knock_agc.h"
-#include "knock_band.h"
 #include "knock_dsp.h"
 #include "pins_esp32.h"
 #include "x9c.h"
@@ -114,9 +113,9 @@ void setup() {
   adcReady = adc_sampler::begin(pins::KNOCK_SENSOR_ADC, pins::OIL_PRESSURE_ADC, pins::FUEL_PRESSURE_ADC,
                                 pins::PRE_INJECTION_TEMP_ADC, pins::POST_INJECTION_TEMP_ADC);
   if (!adcReady) Serial.println("The ADC did not start: the potentiometer is still stepped, but nothing is measured.");
-  adc_sampler::setKnockBand(knock_band::knockHzForBore(96), 1500.0f);
+  adc_sampler::setKnockBand(knock_dsp::knockHzForBore(96), 1500.0f);
   if (kTonePin >= 0) {
-    const uint32_t toneHz = knock_band::knockHzForBore(96);
+    const uint32_t toneHz = knock_dsp::knockHzForBore(96);
     if (ledcAttach(kTonePin, toneHz, kToneBits)) {
       ledcWrite(kTonePin, 1U << (kToneBits - 1));   // Half on: a square wave
       Serial.printf("Test tone on GPIO%d: %lu Hz square wave. Through 10k, with 1k to ground, into the sensor input.\n",

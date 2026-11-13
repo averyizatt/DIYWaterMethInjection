@@ -34,16 +34,16 @@ Inputs idle(uint8_t reason = kHoldBelowBoost) {
 }
 
 struct Run {
-  uint32_t onMs = 0;       // Total time the relay was on
+  uint32_t onMs = 0;       // Total time the pump was on
   uint32_t risingEdges = 0;
   uint32_t shortestOn = 0xFFFFFFFFUL;   // Shortest completed pump run
   uint32_t shortestOff = 0xFFFFFFFFUL;  // Shortest gap between two runs
   uint32_t shortestCycle = 0xFFFFFFFFUL;  // Between two pump starts
 };
 
-// Runs the governor in 20 ms loop steps like the firmware and measures the relay.
+// Runs the governor in 20 ms loop steps like the firmware and measures the pump.
 template <typename InputAt>
-Run simulate(Governor &g, const Settings &s, uint32_t fromMs, uint32_t toMs, InputAt inputAt) {
+Run simulate(PulseTiming &g, const Settings &s, uint32_t fromMs, uint32_t toMs, InputAt inputAt) {
   Run run;
   bool previous = false, anyRise = false, anyFall = false;
   uint32_t riseAt = 0, fallAt = 0;
@@ -138,15 +138,15 @@ void onTimeRisesWithBoost() {
   check(targetOnMs(s, NAN) == 1000, "a bad boost reading gives the minimum");
 }
 
-void relayRules() {
-  check(relaySafeOnMs(300, 4000) == 0, "shorter than half a second is not worth a relay cycle");
-  check(relaySafeOnMs(500, 4000) == 500 && relaySafeOnMs(2000, 4000) == 2000, "normal pulses pass");
-  check(relaySafeOnMs(3800, 4000) == 3500, "an off gap under half a second is widened by shortening the pulse");
-  check(relaySafeOnMs(4000, 4000) == 4000 && relaySafeOnMs(9000, 4000) == 4000, "full cycle is continuous");
-  check(relaySafeOnMs(700, 1000) == 500 && relaySafeOnMs(900, 1000) == 500, "1 s cycle: half on, half off at most");
+void pulseRules() {
+  check(safeOnMs(300, 4000) == 0, "shorter than half a second is not worth a pump start");
+  check(safeOnMs(500, 4000) == 500 && safeOnMs(2000, 4000) == 2000, "normal pulses pass");
+  check(safeOnMs(3800, 4000) == 3500, "an off gap under half a second is widened by shortening the pulse");
+  check(safeOnMs(4000, 4000) == 4000 && safeOnMs(9000, 4000) == 4000, "full cycle is continuous");
+  check(safeOnMs(700, 1000) == 500 && safeOnMs(900, 1000) == 500, "1 s cycle: half on, half off at most");
 }
 
-void relayIsNeverAbused() {
+void pumpIsNeverStartedTooOften() {
   // Fastest allowed settings, boost fluttering across the whole range, RPM dropping
   // out and coming back at awkward moments, for ten minutes.
   Settings s = defaults();
@@ -156,7 +156,7 @@ void relayIsNeverAbused() {
   change(s, kRampMs, 0);
   change(s, kRestS, 0);
   change(s, kMaxDosePct, 0);
-  Governor g;
+  PulseTiming g;
   const Run rough = simulate(g, s, 1000, 601000, [](uint32_t now) {
     Inputs in = spraying(5.0f + static_cast<float>((now / 20) % 13) * 0.5f);
     // Long RPM dropouts, plus 60 ms glitches that cut a pulse just before the next cycle.
@@ -168,14 +168,14 @@ void relayIsNeverAbused() {
   check(rough.shortestOff >= 500, "the pump always rests at least half a second before restarting");
   check(rough.risingEdges <= 600, "no more than 600 starts in 600 s");
   // With nothing cutting pulses short, every pump run is at least half a second.
-  Governor g2;
+  PulseTiming g2;
   const Run steady = simulate(g2, s, 1000, 601000, [](uint32_t now) {
     return spraying(5.0f + static_cast<float>((now / 20) % 13) * 0.5f);
   });
   check(steady.shortestOn >= 500 && steady.shortestOff >= 500 && steady.shortestCycle >= 1000, "steady running: no short blips");
   // The default 4 s cycle switches four times less often.
   const Settings d = defaults();
-  Governor g3;
+  PulseTiming g3;
   const Run slow = simulate(g3, d, 0, 60000, [](uint32_t) { return spraying(8.0f); });
   check(slow.shortestCycle >= 4000 && slow.risingEdges <= 15, "default: one pump start every 4 s at most");
 }
@@ -184,24 +184,24 @@ void steadyInjectionMatchesTheSettings() {
   Settings s = defaults();
   change(s, kRampMs, 0);
   change(s, kRestS, 0);
-  Governor g;
+  PulseTiming g;
   const Run low = simulate(g, s, 0, 40000, [](uint32_t) { return spraying(5.0f); });
   check(low.risingEdges == 10 && low.onMs == 10 * 1000, "1 s in every 4 s at start boost");
-  Governor g2;
+  PulseTiming g2;
   const Run high = simulate(g2, s, 0, 40000, [](uint32_t) { return spraying(12.0f); });
   check(high.risingEdges == 10 && high.onMs == 10 * 2000, "2 s in every 4 s at full boost");
   // Max on-time equal to the cycle means the pump stays on without clicking.
   change(s, kMaxOnMs, 4000);
-  Governor g3;
+  PulseTiming g3;
   const Run full = simulate(g3, s, 0, 40000, [](uint32_t) { return spraying(12.0f); });
-  check(full.risingEdges == 1 && full.onMs == 40000, "100% is continuous: one start, no relay cycling");
+  check(full.risingEdges == 1 && full.onMs == 40000, "100% is continuous: one start, no stopping and starting");
 }
 
 void rampStartsAtMinimumAndGrowsPerCycle() {
   Settings s = defaults();  // ramp 500 ms per cycle, 1000..2000 ms
   change(s, kMaxOnMs, 3500);
   change(s, kRestS, 0);
-  Governor g;
+  PulseTiming g;
   uint32_t ons[7] = {0};
   for (int cycle = 0; cycle < 7; ++cycle) {
     ons[cycle] = simulate(g, s, cycle * 4000UL, cycle * 4000UL + 4000UL, [](uint32_t) { return spraying(20.0f); }).onMs;
@@ -216,7 +216,7 @@ void rampStartsAtMinimumAndGrowsPerCycle() {
 
 void rpmGateBlocksAndNamesTheReason() {
   const Settings s = defaults();
-  Governor g;
+  PulseTiming g;
   Inputs in = spraying(12.0f, 1800);
   check(!g.update(0, s, in) && g.hold() == kHoldRpmLow, "below minimum RPM: no injection");
   in.rpmValid = false;
@@ -235,11 +235,11 @@ void rpmGateBlocksAndNamesTheReason() {
 
 void temperatureGate() {
   Settings s = defaults();
-  Governor g;
+  PulseTiming g;
   Inputs in = spraying(12.0f);
   check(g.update(0, s, in), "gate off by default: no sensor needed");
   change(s, kMinPreTempC, 40);
-  Governor g2;
+  PulseTiming g2;
   check(!g2.update(0, s, in) && g2.hold() == kHoldTempSensor, "gate on with no sensor: blocked");
   in.preValid = true;
   in.preC = 25.0f;
@@ -250,7 +250,7 @@ void temperatureGate() {
 
 void sprayTimeLimitForcesARest() {
   Settings s = defaults();  // 12 s injecting, then 6 s rest
-  Governor g;
+  PulseTiming g;
   const Run first = simulate(g, s, 0, 12000, [](uint32_t) { return spraying(12.0f); });
   check(first.risingEdges == 3, "injects for the allowed 12 s");
   const Run rest = simulate(g, s, 12000, 17900, [](uint32_t) { return spraying(12.0f); });
@@ -258,7 +258,7 @@ void sprayTimeLimitForcesARest() {
   const Run after = simulate(g, s, 17900, 30000, [](uint32_t) { return spraying(12.0f); });
   check(after.risingEdges >= 2, "and resumes after the rest");
   // Brief lifts do not reset the limit: 10 s on boost, 0.5 s off, repeated.
-  Governor g2;
+  PulseTiming g2;
   uint32_t total = 0;
   for (int i = 0; i < 6; ++i) {
     total += simulate(g2, s, i * 10500UL, i * 10500UL + 10000UL, [](uint32_t) { return spraying(12.0f); }).onMs;
@@ -266,7 +266,7 @@ void sprayTimeLimitForcesARest() {
   }
   check(total < 6 * 3 * 2000 * 8 / 10, "short lifts do not defeat the time limit");
   change(s, kRestS, 0);
-  Governor g3;
+  PulseTiming g3;
   const Run endless = simulate(g3, s, 0, 120000, [](uint32_t) { return spraying(12.0f); });
   check(endless.risingEdges == 30, "rest 0 turns the time limit off");
 }
@@ -289,14 +289,14 @@ void aRunningPulseGrowsWithTheDoseLimitButNotPastItsRampStep() {
     }
     return in;
   };
-  Governor g;
+  PulseTiming g;
   g.update(0, s, pull(0));
   check(g.onMs() >= 1450 && g.onMs() <= 1560, "the run starts at what the dose limit allows then");
   const Run run = simulate(g, s, 20, 4000, pull);
-  check(run.risingEdges == 1, "growing is not a new switch: one run, the relay stays on");
+  check(run.risingEdges == 1, "growing is not a new switch: one run, the pump stays on");
   check(run.onMs >= 2460 && run.onMs <= 2500, "it grows to the ramp step, no further");
   // Low airflow the whole way: the dose limit still holds it.
-  Governor g2;
+  PulseTiming g2;
   const Run held = simulate(g2, s, 0, 4000, [](uint32_t) {
     Inputs in = spraying(1.0f, 2800);
     in.mapKpa = 92.0f;
@@ -312,21 +312,21 @@ void doseLimitFollowsFuelFlow() {
   change(s, kRampMs, 0);
   // Plenty of airflow: 10% of 744 g/min is more than the 60 ml/min nozzle can deliver.
   check(doseLimitOnMs(s, 5500, 154.0f) == 4000, "at full load the nozzle is below the dose limit");
-  Governor g;
+  PulseTiming g;
   g.update(0, s, spraying(12.0f, 5500));
   check(g.onMs() == 4000 && g.hold() == kHoldNone, "full load: continuous");
   // Low airflow: 2500 RPM at 120 kPa burns about 264 g/min; 10% is 26 ml/min = 44% of the nozzle.
   Inputs low = spraying(12.0f, 2500);
   low.mapKpa = 120.0f;
-  Governor g2;
+  PulseTiming g2;
   g2.update(0, s, low);
   check(g2.onMs() >= 1700 && g2.onMs() <= 1780, "low airflow: on-time held to 10% of fuel");
   change(s, kMaxDosePct, 20);
-  Governor g3;
+  PulseTiming g3;
   g3.update(0, s, low);
-  check(g3.onMs() == 3500, "a gap too short for the relay is widened, never closed");
+  check(g3.onMs() == 3500, "a gap too short to be worth a stop is widened, never closed");
   change(s, kMaxDosePct, 0);
-  Governor g4;
+  PulseTiming g4;
   g4.update(0, s, low);
   check(g4.onMs() == 4000, "dose limit off: on-time settings alone");
   // Barely any airflow: the allowed dose is less than the shortest pulse, so nothing.
@@ -334,7 +334,7 @@ void doseLimitFollowsFuelFlow() {
   change(s, kMinRpm, 0);
   Inputs tiny = spraying(12.0f, 700);
   tiny.mapKpa = 45.0f;
-  Governor g5;
+  PulseTiming g5;
   check(!g5.update(0, s, tiny) && g5.hold() == kHoldDoseLimit && g5.onMs() == 0, "too little airflow for even a short pulse: held");
   // A bigger nozzle is limited sooner.
   change(s, kNozzleMlMin, 225);
@@ -346,29 +346,29 @@ void overboostAssistOnlyWhenEnabledAndCapsApply() {
   Inputs in = spraying(16.0f);
   in.assistActive = true;
   in.assistDutyPercent = 100.0f;
-  Governor g;
+  PulseTiming g;
   g.update(0, s, in);
   check(g.onMs() == 1000, "assist off: overboost still follows the ramp and limits");
   change(s, kOverboostAssist, 1);
-  Governor g2;
+  PulseTiming g2;
   g2.update(0, s, in);
   check(g2.onMs() == 4000, "assist on: overboost forces full flow at once");
   in.capDutyPercent = 40.0f;
-  Governor g3;
+  PulseTiming g3;
   g3.update(0, s, in);
   check(g3.onMs() == 1600, "the master duty cap still wins");
   in.capDutyPercent = 100.0f;
   in.rpm = 2500;
   in.mapKpa = 120.0f;
-  Governor g4;
+  PulseTiming g4;
   g4.update(0, s, in);
   check(g4.onMs() < 1800, "and so does the dose limit");
 }
 
-void pumpTestUsesTheSameRelayRules() {
+void pumpTestUsesTheSamePulseRules() {
   const Settings s = defaults();
   auto run = [&](uint8_t duty, uint32_t &on, uint32_t &edges) {
-    Governor g;
+    PulseTiming g;
     bool previous = false;
     on = edges = 0;
     for (uint32_t now = 0; now < 8000; now += 20) {
@@ -410,23 +410,23 @@ Inputs waiting(float boostPsi, uint16_t rpm) {
 void earlyStartAtHighRpmBeforeBoost() {
   Settings s = defaults();  // Early start from 3500 RPM
   check(s.value[kEarlyRpm] == 3500, "default: early start from 3500 RPM");
-  Governor g;
+  PulseTiming g;
   check(!g.update(0, s, waiting(-0.5f, 3000)) && g.hold() == kHoldBelowBoost, "below the early RPM: still waiting for boost");
   check(g.update(20, s, waiting(-0.5f, 3600)) && g.hold() == kHoldNone && g.earlyStart(), "3600 RPM, throttle open, no boost: injects");
   check(g.onMs() == 1000, "early start uses the minimum run time");
   // Throttle shut at high RPM is deep vacuum: never an early start.
-  Governor g2;
+  PulseTiming g2;
   check(!g2.update(0, s, waiting(-9.0f, 5500)) && !g2.earlyStart(), "coasting at 5500 RPM with the throttle shut: nothing");
   check(!g2.update(20, s, waiting(-2.0f, 5500)), "part throttle: nothing");
   // Hysteresis: a small RPM or pressure wobble does not drop it, a real lift does.
-  Governor g3;
+  PulseTiming g3;
   g3.update(0, s, waiting(-1.0f, 3600));
   g3.update(20, s, waiting(-2.0f, 3400));
   check(g3.earlyStart(), "small wobble keeps the early start");
   g3.update(40, s, waiting(-6.0f, 3600));
   check(!g3.earlyStart() && g3.hold() == kHoldBelowBoost, "lifting off ends it");
   // Disarmed, tank low or a fault are never overridden.
-  Governor g4;
+  PulseTiming g4;
   Inputs disarmed = waiting(-0.5f, 5000);
   disarmed.idleHold = kHoldDisarmed;
   check(!g4.update(0, s, disarmed) && g4.hold() == kHoldDisarmed, "disarmed: no early start");
@@ -437,16 +437,16 @@ void earlyStartAtHighRpmBeforeBoost() {
   // No RPM message: nothing, as always.
   Inputs noRpm = waiting(-0.5f, 5000);
   noRpm.rpmValid = false;
-  Governor g5;
+  PulseTiming g5;
   check(!g5.update(0, s, noRpm) && !g5.earlyStart(), "no RPM message: no early start");
   // Off when set to 0, and it hands over to boost without a break.
   change(s, kEarlyRpm, 0);
-  Governor g6;
+  PulseTiming g6;
   check(!g6.update(0, s, waiting(-0.5f, 6000)), "early start off: waits for boost");
   s = defaults();
   change(s, kRampMs, 0);
   change(s, kRestS, 0);
-  Governor g7;
+  PulseTiming g7;
   uint32_t on = 0;
   for (uint32_t now = 0; now < 16000; now += 20) {
     const bool state = now < 8000 ? g7.update(now, s, waiting(-0.5f, 4500)) : g7.update(now, s, spraying(12.0f, 4500));
@@ -457,7 +457,7 @@ void earlyStartAtHighRpmBeforeBoost() {
   s = defaults();
   change(s, kMinOnMs, 2000);
   change(s, kMaxOnMs, 3000);
-  Governor g8;
+  PulseTiming g8;
   g8.update(0, s, waiting(0.0f, 3500));
   check(g8.onMs() > 1600 && g8.onMs() < 1800, "early start is held to the dose limit");
 }
@@ -475,18 +475,18 @@ void hotIntakeAirAddsRunTime() {
   Inputs in = spraying(5.0f);
   in.preValid = true;
   in.preC = 25.0f;
-  Governor g;
+  PulseTiming g;
   g.update(0, s, in);
   check(g.onMs() == 1000 && !g.hotAir(), "cool air: boost alone decides");
   in.preC = 80.0f;
-  Governor g2;
+  PulseTiming g2;
   g2.update(0, s, in);
   check(g2.onMs() == 2000 && g2.hotAir(), "hot air at low boost: full run time");
   // Whichever asks for more wins; hot air never reduces what boost asks for.
   Inputs boost = spraying(12.0f);
   boost.preValid = true;
   boost.preC = 45.0f;
-  Governor g3;
+  PulseTiming g3;
   g3.update(0, s, boost);
   check(g3.onMs() == 2000 && !g3.hotAir(), "boost asks for more than the air temperature");
   // Hot air alone never starts injection.
@@ -497,18 +497,18 @@ void hotIntakeAirAddsRunTime() {
   hotIdle.rpm = 2000;
   hotIdle.boostPsi = -8.0f;
   hotIdle.mapKpa = 30.0f;
-  Governor g4;
+  PulseTiming g4;
   check(!g4.update(0, s, hotIdle) && g4.hold() == kHoldBelowBoost && !g4.hotAir(), "heat-soaked air at light load: nothing");
   // It adds to an early start too, and the dose limit still has the last word.
   Inputs early = waiting(-0.5f, 5500);
   early.preValid = true;
   early.preC = 80.0f;
-  Governor g5;
+  PulseTiming g5;
   g5.update(0, s, early);
   check(g5.earlyStart() && g5.hotAir() && g5.onMs() == 2000, "early start with hot air: full run time");
   early.rpm = 3500;
   change(s, kMaxOnMs, 4000);
-  Governor g6;
+  PulseTiming g6;
   g6.update(0, s, early);
   check(g6.onMs() < 1800, "the dose limit still caps it");
   // The pair stays ordered, and off stays off.
@@ -528,8 +528,8 @@ int main() {
   defaultsAreConservativeAndValid();
   settingsClampAndNeverRaiseOtherValues();
   onTimeRisesWithBoost();
-  relayRules();
-  relayIsNeverAbused();
+  pulseRules();
+  pumpIsNeverStartedTooOften();
   steadyInjectionMatchesTheSettings();
   rampStartsAtMinimumAndGrowsPerCycle();
   aRunningPulseGrowsWithTheDoseLimitButNotPastItsRampStep();
@@ -538,7 +538,7 @@ int main() {
   sprayTimeLimitForcesARest();
   doseLimitFollowsFuelFlow();
   overboostAssistOnlyWhenEnabledAndCapsApply();
-  pumpTestUsesTheSameRelayRules();
+  pumpTestUsesTheSamePulseRules();
   thermistorCurve();
   earlyStartAtHighRpmBeforeBoost();
   hotIntakeAirAddsRunTime();

@@ -1,8 +1,13 @@
 #pragma once
 
-#include "actuators.h"
 #include "app_config.h"
 #include "sensor_readings.h"
+
+// Whether injection is wanted, and at what duty (the overboost assist reads the duty).
+struct PumpCommand {
+  bool enabled{false};
+  float dutyPercent{0.0f};
+};
 
 enum class FailsafeReason : uint8_t {
   None = 0,

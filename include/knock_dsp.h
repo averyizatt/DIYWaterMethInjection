@@ -2,8 +2,8 @@
 
 // Knock listening for the ESP32 board: every sample, all the time.
 //
-// The Nano can only look at one 3.3 ms burst in every 20 ms (knock_band.h) and so
-// misses most single knock events. The ESP32 has the speed to do it properly:
+// Looking at one 3.3 ms burst in every 20 ms misses most single knock
+// events. The ESP32 has the speed to do it properly:
 //
 //   FrontEnd      runs on every ADC sample (38 kHz). It removes the resting level and
 //                 passes the signal through three filters:
@@ -21,7 +21,7 @@
 //                 loudest position: the level there, its share of the wide band, the
 //                 second resonance there, and the typical level of the rest of the
 //                 pass (the median, which one knock does not move).
-//   Detector      decides. The rules are the Nano detector's, in floating point:
+//   Detector      decides. The rules use floating point:
 //                 louder than the level learned for this RPM (times a multiplier,
 //                 plus an offset), and narrow-band. Two things are new:
 //                   - it must also stand out from the rest of its own 20 ms. Knock is
@@ -35,7 +35,7 @@
 //
 // Pure logic, no Arduino calls; tested on a PC (test/test_knock_dsp). Signal sizes are
 // in 10-bit ADC counts (fractions kept); the detector's level, learned level and
-// threshold are in half counts, 255 = full scale, as the Nano's are and as the CAN
+// threshold are in half counts, 255 = full scale, as the CAN
 // messages carry them.
 //
 // On the ESP32-S3 the filters and the frame energies run a whole ADC chunk at a time
@@ -61,6 +61,12 @@
 #endif
 
 namespace knock_dsp {
+
+// First resonance for a cylinder bore: f = 1800 / (pi * bore_mm) kHz.
+inline uint16_t knockHzForBore(uint8_t boreMm) {
+  return boreMm ? static_cast<uint16_t>(572958UL / boreMm) : 0;
+}
+
 
 // Whether ESP-DSP is in use: built in, and not turned off by the start-up check.
 inline bool &espDspOn() {

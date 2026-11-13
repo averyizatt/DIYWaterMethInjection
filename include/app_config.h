@@ -2,28 +2,11 @@
 
 #include "modes.h"
 
-enum class MapSensorType : uint8_t {
-  GM2Bar = 0,
-  GM3Bar
-};
-
+// Manifold pressure comes from the MicroSquirt over CAN (ecu_broadcast.h); only the
+// barometer is kept here, for turning it into boost.
 struct MapCalibration {
-  // Typical GM linear MAP output region.
-  float vMin{0.50f};
-  float vMax{4.50f};
-
-  // Optional divider between a 5 V sensor and the ADC input.
-  // sensorV = adcV * (top + bottom) / bottom. Set top=0, bottom=1 for no divider.
-  // The car: a GM MAP sensor through a 15k/20k divider, so a 5 V sensor output is
-  // about 2.86 V at the Nano ADC.
-  float dividerTopOhms{15000.0f};
-  float dividerBottomOhms{20000.0f};
-
-  // By sensor type: GM 3-bar 20-312 kPa (the car's); GM 2-bar 10-200 kPa.
-  float kpaMin{20.0f};
-  float kpaMax{312.0f};
-
-  // Local atmospheric pressure estimate used for boost conversion (about 5,000 ft).
+  // Atmospheric pressure for boost: the ECU's barometer when it sends one, else the
+  // manifold with the engine stopped. Until then an estimate for about 5,000 ft.
   float baroKpa{90.0f};
 };
 
@@ -73,7 +56,7 @@ struct KnockConfig {
   float minLoadPercentToArm{35.0f};
 
   // Front-end ADC sampling and analysis block sizing.
-  uint16_t sampleRateHz{19231};  // What the Nano's ADC actually delivers (knock_band.h).
+  uint16_t sampleRateHz{19231};  // Reported on 0x30D only; the ADC's real rate is adc_sampler::knockSamplesPerSecond().
   uint8_t samplesPerUpdate{64};
 
   // Knock band targeting. Sensor operating frequency range is 3-25 kHz.
@@ -171,7 +154,6 @@ struct TankBlend {
 struct AppConfig {
   InjectionMode mode{InjectionMode::BoostOnly};
 
-  MapSensorType mapType{MapSensorType::GM3Bar};
   MapCalibration map{};
   BoostThresholdsPsi boost{};
 
@@ -184,10 +166,6 @@ struct AppConfig {
   float dutyMaxPercent{100.0f};
   // High duty commanded while OVERBOOST_WARN_PSI is active.
   float overboostWarnDutyPercent{85.0f};
-
-  // Relay time-slice period in ms. 1000 = 1 Hz switching (safe for any relay).
-  // Lower = more responsive flow control but more wear. 500ms (2 Hz) is a reasonable max.
-  uint16_t relayPeriodMs{1000};
 
   // Installed float switch closes to GND while the tank has fluid and opens when low,
   // so HIGH at the pin means low-fluid (false here). With INPUT_PULLUP a disconnected
@@ -202,16 +180,10 @@ struct AppConfig {
   uint32_t debugPeriodMs{250};
   uint32_t loopPeriodMs{20};
 
-  // Duty applied when the bench-test button is held down.
-  // Keep this at 100% by default so non-serial bench checks are easy to verify with a meter.
-  uint8_t benchTestDutyPercent{100};
-
   KnockConfig knock{};
 };
 
-// The defaults are the field initializers above, so `AppConfig config{};` is built
-// when compiling: on the Nano that puts the settings straight into RAM from flash at
-// start, instead of also keeping a second copy of them in RAM to build them from.
+// The defaults are the field initializers above.
 AppConfig defaultConfig();
 
 TankBlend computeTankBlend(float waterLiters, float methLiters);

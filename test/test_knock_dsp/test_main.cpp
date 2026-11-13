@@ -180,7 +180,7 @@ void ordinaryNoiseIsNotNarrow() {
   check(rig.warnings == 0, "no alarm from noise");
 }
 
-// A single knock anywhere in time must be heard: this is what the Nano cannot do.
+// A single knock anywhere in time must be heard: this is what a burst-sampling board cannot do.
 void aKnockIsHeardWhereverItFalls() {
   Rig rig;
   rig.engine.clickAmp = 120.0f;
@@ -410,6 +410,8 @@ void aChunkAtATimeHearsTheSameAsSampleBySample() {
 }
 
 int main() {
+  check(knock_dsp::knockHzForBore(96) == 5968, "96 mm bore frequency");
+  check(knock_dsp::knockHzForBore(0) == 0, "no bore has no frequency");
   aChunkAtATimeHearsTheSameAsSampleBySample();
   aToneIsMeasuredAtItsTrueSize();
   theFiltersFollowTheRealSampleRate();

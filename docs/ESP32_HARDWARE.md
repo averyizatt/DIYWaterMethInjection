@@ -1,25 +1,20 @@
 # ESP32-S3 water/meth and knock controller: hardware
 
-This board replaces the Arduino Nano. Firmware: `src/main_esp32.cpp`, PlatformIO
-environment `esp32s3_water_meth`.
+The car's water/meth and knock controller. Firmware: `src/main_esp32.cpp`, PlatformIO
+environment `esp32s3_water_meth` (the default).
 
-## What changed from the Nano board
+- **Pump:** on a MOSFET, full on or full off in timed pulses, each started with a short
+  soft ramp (see [Pump](#pump)).
+- **Manifold pressure, RPM and intake air temperature:** from the MicroSquirt over CAN;
+  no MAP sensor on the board. The dash's RPM (`0x309`) is the backup for RPM.
+- **Knock, oil pressure, fuel pressure, tank float, intake air before the nozzle:**
+  read here.
+- **New firmware:** from the dash over CAN, or USB.
 
-| | Nano board | ESP32-S3 board |
-|---|---|---|
-| Pump | mechanical relay, long pulses | MOSFET with PWM: the pump runs slower or faster |
-| Manifold pressure | MAP sensor on the board | from the MicroSquirt over CAN; no sensor here |
-| Engine speed | forwarded by the dash | from the MicroSquirt over CAN (the dash's value is the backup) |
-| Air temperature for the temperature features | sensor before the nozzle, else the dash's value | sensor before the nozzle, else the MicroSquirt's own |
-| Knock, oil pressure, fuel pressure, tank float | here | here, unchanged |
-| New firmware | USB cable | from the dash over CAN, or USB |
-
-Every CAN message, command and setting the Nano has is the same as before. The dash
-does not need to be told which board is fitted: it reads the two new settings (lowest
-and highest pump duty) if the controller reports them, and its knock page shows the
+Every CAN message, command and setting is in the shared contract
+(DIYComfortControlModule `shared/can_contract`). The dash's knock page shows the
 spectrum, the knock frequency and the amplifier gain when the controller sends them
-(one new message, `0x30E`, and three new commands: see
-[On the dash](#on-the-dash)).
+(`0x30E` and three commands: see [On the dash](#on-the-dash)).
 
 **No fresh data from the MicroSquirt means no injection.** The controller needs the
 ECU's manifold pressure and RPM, each less than half a second old. A pump test still
@@ -51,20 +46,21 @@ works without the ECU.
 | Knock amplifier | 1 | 0-3.1 V, resting near 1.65 V |
 | Oil pressure | 2 | 0.5-4.5 V sensor through 10 k / 20 k |
 | Fuel pressure | 4 | 0.5-4.5 V sensor through 10 k / 20 k |
-| Air temperature before the nozzle | 5 | 3.3 V - 2.49 k - pin - sensor - ground |
-| Air temperature after the nozzle (spare) | 6 | same; leave unconnected if not fitted |
+| Intake air temperature | 5 | 3.3 V - 2.49 k - pin - sensor - ground; the sensor may be on this input or the next |
+| Intake air temperature | 6 | the same; with sensors on both, this one is after the nozzle |
 | Tank float switch | 7 | switch to ground; closed while there is fluid |
 | Pump MOSFET gate | 15 | 100 ohm in series, 10 k from gate to ground |
 | Warning LED | 16 | high = warning; LED and resistor to ground |
-| Master pump relay (optional) | 17 | high = pump allowed; 10 k to ground at the driver |
+| The board's own RGB LED | 48 and 38 | on the board itself (48 on v1.0 and most copies, 38 on v1.1); both are driven, so wire nothing else to either |
 | Knock gain potentiometer CS | 14 | to the X9C104 module's CS |
 | Knock gain potentiometer INC | 18 | to its INC |
 | Knock gain potentiometer U/D | 21 | to its U/D |
 
-Not used on purpose: GPIO 0, 3, 45, 46 (start-up pins), 19 and 20 (USB), 26-37 (flash).
+Not used on purpose: GPIO 0, 3, 45, 46 (start-up pins), 19 and 20 (USB), 26-37 (flash),
+38 and 48 (the board's own LED).
 
-**Nothing above 3.3 V may reach an ESP32 pin.** That is the main difference from the
-Nano when moving the sensors over.
+**Nothing above 3.3 V may reach an ESP32 pin.** Sensors made for 5 V boards need the
+dividers and pull-ups given here.
 
 ## Power
 
@@ -88,50 +84,45 @@ alternator charges. The firmware cannot protect against that; the supply has to:
 ## Pump
 
 ```
-+12 V -- fuse -- [master relay contact, optional] --+-- pump (+)
-                                                    |
-                                   diode: stripe ---+
-                                   diode: other end -+-- pump (-)
-                                                     |
-                                              MOSFET drain
++12 V -- fuse --+-- pump (+)
+               |
+diode: stripe -+
+diode: other --+-- pump (-)
+               |
+            MOSFET drain
 GPIO15 -- 100 ohm --+-- MOSFET gate
-                    |
+                   |
                   10 k
-                    |
-ground -------------+-- MOSFET source
+                   |
+ground ------------+-- MOSFET source
 ```
 
 - The 10 k from gate to ground is not optional. While the ESP32 is starting, being
   flashed or has reset, its pins float, and this resistor is what keeps the pump off.
 - The diode goes across the pump with its stripe to the +12 V side. Without it the
   MOSFET will be damaged by the motor's voltage spike at every switch-off.
-- PWM is 200 Hz. The firmware sets the pump no lower than the "lowest pump duty"
-  setting, so it never sits stalled.
-
-### Master relay (recommended)
-
-A MOSFET that fails usually fails **switched on**, and the pump would then run for as
-long as the ignition is on. Putting the relay you already have in the pump's 12 V feed
-removes that: GPIO17 closes it when a spray starts and opens it three seconds after
-the spray ends. It clicks once per spray, never with the PWM. Drive the relay coil the
-way the Nano's output drove it (transistor or relay module), with a 10 k from the
-driver's input to ground. If you do not fit it, leave GPIO17 unconnected.
+- The pump runs **full on or full off**, in pulses timed by the dash's water/meth
+  settings (cycle length, run time at start and at full boost): flow is set by how long
+  it runs in each cycle, and every spray is at the pump's full pressure. Only the first
+  0.4 s of each run uses PWM (200 Hz), a soft start from 5% to full. See "The pump runs
+  full on, in pulses" below.
 
 ### When something fails
 
-Every way the controller can fail ends with the pump off, and each layer covers the
-one before it failing too:
+The firmware shuts the pump output off for the failures below. GPIO17 is unused;
+there is no master relay. A MOSFET that fails switched on cannot be shut off by
+software: removing pump power is then necessary.
 
 | What fails | What happens | How fast |
 |---|---|---|
-| The main loop stalls but the board runs | The CAN task, on the other processor core, switches the pump and the relay off | 250 ms |
+| The main loop stalls but the board runs | The CAN task, on the other processor core, switches the pump off | 250 ms |
 | The main loop or the CAN task hangs | The task watchdog restarts the board | 2 s |
 | A processor sticks with interrupts off | The interrupt watchdog restarts the board | 300 ms |
-| A crash (exception, either watchdog) | The pump and relay outputs go low at once, before the crash report and core dump are written to flash; then the reset | at once |
+| A crash (exception, either watchdog) | The pump output goes low at once, before the crash report and core dump are written to flash; then the reset | at once |
 | Any restart, asked for or not | The same, before the restart | at once |
 | The supply dips (cranking, or the pump starting) | The brownout detector resets the board instead of letting it run on bad power | at once |
-| During and after any reset | The pins float: the 10 k pull-downs hold the MOSFET and the relay off | always |
-| The MOSFET fails switched on | The master relay opens 3 s after the spray ends | 3 s |
+| During and after any reset | The pins float: the 10 k gate pull-down holds the MOSFET off | always |
+| The MOSFET fails switched on | Software cannot stop the pump; remove its power | Hardware failure |
 | The ECU's broadcast stops or goes bad | No injection without fresh manifold pressure and RPM | 0.5 s |
 | The CAN controller loses its settings or goes bus-off | Set up again | 1 s |
 | The CAN bus goes silent (the controller, its wiring or its SPI line stops working, however right its registers look) | Set up again every 2 s while nothing at all is heard; still nothing after 15 s, the whole board restarts (three times at most per ignition cycle). Only once the bus has worked since the ignition came on: on the bench with nothing connected it is left alone | 1.5 s, then 15 s |
@@ -168,16 +159,34 @@ most, until the dash answers `0x301 0x13`; the dash writes it to its event log w
 summary in words. After power on the memory holds noise and its checks reject it; a
 firmware update or the dash's Restart starts a new record without sending one.
 
-**The pump is started gently.** From rest the duty climbs from 5% to full over 0.4 s (a
-motor starting draws its largest current, and slamming it on dips the 12 V supply), runs
-at least 0.5 s apart from the run before, and the dose limit must allow a little above
-the minimum duty to start a run (only below the minimum stops one), so it never chatters
-on and off at that edge. A reset that comes while the pump is running doubles the soft
-start for the rest of the ignition cycle, up to 1.6 s. The pump test starts softly too.
+**The pump runs full on, in pulses** (`meth_tune::PulseGovernor`, November 2026). It is
+an ordinary diaphragm pump, 4-6 L/min against a 60 ml/min nozzle, so it is all but
+dead-headed and the pressure it holds follows its motor voltage: at part duty the nozzle
+gets part pressure and sprays coarsely, and the motor sits near stall. So the pump is
+either full on, at its full pressure with its own pressure switch regulating, or off.
+Flow is set by how long it runs in each cycle, exactly by the cycle settings on the
+dash: at least half a second on and half a second off, or on continuously, and at most
+one start per cycle. With the run times at start and full boost set to the whole cycle,
+it runs continuously whenever it sprays, and only the dose limit (when 60 ml/min would
+be more than that share of the engine's fuel, at low RPM) breaks it into long pulses.
+The flow estimate is then simply the nozzle's rating for the share of the cycle it runs.
 
-**One intake sensor.** `pins::POST_INJECTION_TEMP_FITTED` is false: GPIO6 (after the
-nozzle) is not read, because without its sensor and pull-up it floats and could read back
-as a believable temperature. The MicroSquirt's MAT, after the throttle, is the air after
+**Every run starts gently.** From rest the duty climbs from 5% to full over 0.4 s (a
+motor starting draws its largest current, and slamming it on dips the 12 V supply); a
+run that carries straight on into the next cycle is not restarted. A reset that comes
+while the pump is running doubles the soft start for the rest of the ignition cycle, up
+to 1.6 s. The pump test starts softly too: its "duty" is the share of the cycle the pump
+runs, at full pressure (100 = continuously).
+
+**One intake sensor, on either input.** Both intake inputs (GPIO5 and GPIO6) are read.
+One with nothing on it reads at the top of the ADC and is thrown out; the one with the
+sensor is the air before the nozzle (`analog_inputs::IntakeInputs`). The firmware turns
+on each pin's own pull-up as well, so a spare input without its 2.49 k fitted also reads
+as empty instead of floating to a believable temperature. A change of input is taken
+only after 2 s of steady readings, so a loose plug does not swap them back and forth.
+The serial monitor says which input it found (`INTAKE: sensor on GPIO6 ...`, and
+`pre=22.4@6` on the heartbeat line). With a sensor on each input, GPIO5 is before the
+nozzle and GPIO6 after it. The MicroSquirt's MAT, after the throttle, is the air after
 the nozzle; the dash shows it as such and works out the cooling from the two.
 
 Settings are written to flash only away from boost (from the dash: "unsaved" until
@@ -223,17 +232,17 @@ dash already needs one of them. The controller understands both.
 **Oil and fuel pressure** (0.5-4.5 V, 0-100 psi, 5 V supply): sensor signal - 6.8 k -
 pin, 10 k from the pin to ground, and 100 nF from the pin to ground. The pin sees 0.595
 of the sensor voltage: 0.30 V at 0 psi, 2.68 V at 100 psi, and 2.98 V for a sensor stuck
-at 5 V, so even that fault reads inside the ADC's range (about 3.1 V). The Nano board's
-10 k / 20 k would put full scale at 3.0 V with no room above it; do not move those over.
+at 5 V, so even that fault reads inside the ADC's range (about 3.1 V). A 10 k / 20 k
+divider would put full scale at 3.0 V with no room above it.
 A sensor that is unplugged or shorted reads as a fault, not as zero pressure. Other
 dividers: change `kTopOhms` and `kBottomOhms` in `include/analog_inputs.h`.
 
-**Air temperature** (GM-style thermistor): 3.3 V - 2.49 k - pin - sensor - ground.
-On the Nano the 2.49 k went to 5 V; here it must go to the DevKit's `3V3` pin.
+**Air temperature** (GM-style thermistor): 3.3 V - 2.49 k - pin - sensor - ground, on
+GPIO5 or GPIO6 (the firmware finds which). The 2.49 k goes to the DevKit's `3V3` pin,
+never 5 V.
 
 **Knock**: the amplifier's output must rest near 1.65 V (two equal resistors from
-3.3 V to ground give that) and swing between 0 and 3.1 V. On the Nano it rested at
-2.5 V on a 5 V supply. The dash's knock page shows the resting level and the largest
+3.3 V to ground give that) and swing between 0 and 3.1 V. The dash's knock page shows the resting level and the largest
 swing, and the controller reports a sensor fault when the resting level is far off.
 The amplifier's gain is set by the firmware: see the next section.
 
@@ -377,9 +386,9 @@ speed to pretend, `f 6500` to listen at a frequency by hand (`f 0` back to the b
 
 ## How knock is listened for
 
-The Nano looks at one 3.3 ms burst of the knock signal in every 20 ms, so a single
-knock is caught about one time in six. The ESP32 filters **every sample**, 38 thousand
-a second, all the time ([include/knock_dsp.h](../include/knock_dsp.h)):
+The board filters **every sample** of the knock signal, 38 thousand a second, all the
+time (a board that looks at one short burst in every 20 ms catches a single knock about
+one time in six) ([include/knock_dsp.h](../include/knock_dsp.h)):
 
 - Three filters run on each sample: a band-pass on the cylinder's knock frequency
   (about 6 kHz for the 96 mm bore), a band-pass on its next resonance 1.66 times
@@ -449,8 +458,8 @@ knocks at random moments heard, 30 of 30 episodes of sustained knock caught in a
 normal running at three engine speeds. That is a simulation, not the engine: the
 multiplier and offset still have to be set on the car.
 
-What the Nano sent reaches the dash unchanged in meaning: level, learned level and
-threshold in the same units, and the share of the sound that is in the knock band.
+The knock state reaches the dash as the contract has it: level, learned level and
+threshold, and the share of the sound that is in the knock band.
 
 ## On the dash
 
@@ -491,9 +500,7 @@ swing that uses all of the room.
 
 **Knock settings are saved.** Three seconds after the last change the controller writes
 the knock settings to flash (the enable switch, thresholds, arming limits, frequency
-mode, band width, bore and held gain), and loads them at start-up. The Nano board does
-not: its EEPROM holds the pump tuning only, so it starts with its built-in knock
-defaults at every power-up, and a change from the dash lasts until the ignition is off.
+mode, band width, bore and held gain), and loads them at start-up.
 
 The built-in arming level is **100 kPa absolute**. It was 120: at about 5,000 ft the
 barometer reads 85 to 87 kPa, so 120 was 5 psi of boost, and the car's logs spend only
@@ -502,8 +509,8 @@ seconds a drive above it. 100 is about 2 psi there.
 ### CAN: the knock detail message
 
 One new message, `0x30E`, eight bytes, the first naming what the rest is
-(`can_protocol.h`, extension 6, `knock_detail`). Nothing existing changed. The Nano
-does not send it, and the dash then shows those parts as not available.
+(`can_protocol.h`, extension 6, `knock_detail`). Nothing existing changed. While knock
+is built out it is not sent, and the dash then shows those parts as not available.
 
 | Byte 0 | Sent | Contents |
 |---|---|---|
@@ -566,7 +573,7 @@ What follows from it:
   `kgain` and `kpeak` on the serial line at idle and at high RPM. If `kgain` sits at
   11, use a smaller RG (4.7 k gives 1 to 22). If it sits at 1 and still clips, the
   signal needs attenuating before the amplifier.
-- **The detector's threshold offset mattered more than the gain.** With the Nano's
+- **The detector's threshold offset mattered more than the gain.** With the old
   offset of 8 no knock was caught at x0.25 and one of three at x0.5; with 2 all are.
   The ESP32 firmware now starts at 2.
 - The weakest of the three knocks is only 1.1 to 1.2 times the threshold with the
@@ -589,20 +596,43 @@ g++ -std=c++17 -O2 -I include tools/ltspice/ltreplay.cpp -o ltreplay
 ./ltreplay waves 0.82 2 22  # 3.3k/15k divider, offset 2, gain 1 to 22
 ```
 
+## The LED on the board
+
+The DevKitC-1's own RGB LED shows what the controller is doing, for when you are looking
+at the board and not the dash (`include/status_light.h`). Red is bad, green is good:
+
+| LED | Meaning |
+|---|---|
+| Red, green, blue in turn, under a second | Starting: checks the LED shows its colours the right way round |
+| Green | Armed and ready: it sprays when boost comes |
+| Blue | Spraying; brighter as the pump duty rises |
+| Purple | Pump test |
+| Dim white | Not armed |
+| Yellow | Cannot spray just now, though nothing is broken: nothing heard on CAN yet, no fresh data from the MicroSquirt, resting after its longest spray, or waiting for an air temperature it was set to need |
+| Red, flashing | Something needs fixing: tank low, CAN not working, held off after repeated crashes, the overboost latch, a setting it refuses, or the analog inputs dead. The dash says which |
+| Cyan, flashing | New firmware arriving from the dash |
+
+A spray shows blue even with a fault waiting; the fault shows as soon as it stops. If the
+start-up check does not show red, then green, then blue, the LED takes its colours in
+another order and the table above does not apply: say so. If the LED stays dark, look
+for a solder bridge marked RGB next to it: some copies of the board connect the LED only
+once it is closed. The separate warning LED on GPIO16 works as before.
+
 ## First start-up checks
 
 The dash's knock page shows most of this without a cable. For the first start, open
 the serial monitor (USB, 115200). Once a second the controller prints a line:
 
 ```
-HB t=12000 map=98.4 boostPsi=-0.3 baro=100.5 rpm=850 duty=0% hold=1 mode=0 tankLow=0 can=1 oilPsi=42.0 fuelPsi=39.5 pre=24.1 knock=0 krest=825mV knockHz=38460 klvl=14.2 kbase=13.1 k2=6.0 kshare=0.17 kfreq=6250 kfound=6262 ktone=0 kgain=6.3 kpeak=150mV rxOvf=0 loopMax=21ms keeper=0 crashes=0 rxAge=3ms canResets=0 soft=400ms
+HB t=12000 map=98.4 boostPsi=-0.3 baro=100.5 rpm=850 duty=0% hold=1 mode=0 tankLow=0 can=1 oilPsi=42.0 fuelPsi=39.5 pre=24.1@6 knock=0 krest=825mV knockHz=38460 klvl=14.2 kbase=13.1 k2=6.0 kshare=0.17 kfreq=6250 kfound=6262 ktone=0 kgain=6.3 kpeak=150mV rxOvf=0 loopMax=21ms keeper=0 crashes=0 rxAge=3ms canResets=0 soft=400ms
 KSPEC kHz:dB 3.2:21 3.8:19 4.4:18 5.0:20 5.6:24 6.2:29 6.8:23 7.4:18 8.0:16 8.6:15 9.2:15 9.8:19 10.4:16 11.0:13 11.6:12
 ```
 
 - `can=1`: the CAN module answered.
 - `map` and `rpm` without a `!` after them: the MicroSquirt's broadcast is arriving.
   A `!` means stale or missing, and the controller will not inject.
-- `oilPsi`, `fuelPsi`, `pre` without `!`: those sensors are reading.
+- `oilPsi`, `fuelPsi`, `pre` without `!`: those sensors are reading. `@6` after `pre` is
+  the input the intake sensor was found on (GPIO5 or GPIO6; `@-1` for none).
 - `krest` is where the knock amplifier rests at the pin: 825 mV for the simulated
   circuit.
 - `klvl` is the knock-band level of the last 20 ms and `kbase` the level learned as
@@ -657,14 +687,3 @@ dash downloads it during **Update now**, and **Dash management > Support** offer
 "Install water/meth firmware" when the build on the Pi differs from the one the
 controller reports. A build flashed from VS Code reports build 0, so the dash will
 offer the published build over it.
-
-While the Nano board is fitted the dash shows "Water/meth firmware: no answer (normal
-with the Nano board)". The Nano cannot take firmware over CAN.
-
-## The Nano board in the meantime
-
-Nothing was taken away from the Nano. Its firmware (`src/main_nano.cpp`, environment
-`arduino_nano`, still the default) builds as before and behaves as before; the dash
-works with either board and tells them apart by itself. The Nano firmware now also
-stores the two pump-duty settings, which it does not use, and a tune saved by the
-earlier Nano firmware is kept when the new one is flashed.

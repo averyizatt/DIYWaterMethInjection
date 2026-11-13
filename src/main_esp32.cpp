@@ -1,21 +1,22 @@
-// ESP32-S3 water/meth and knock controller (replaces the Arduino Nano board).
+// ESP32-S3 water/meth and knock controller: the car's only water/meth board.
 //
-// What changed with the hardware, and nothing else:
-//   - The pump runs through a MOSFET with PWM (meth_tune::PwmGovernor), not a relay.
+//   - The pump runs through a MOSFET, full on or full off in timed pulses, each started
+//     with a short soft ramp of the duty (meth_tune::PulseGovernor).
 //   - Manifold pressure, engine speed and intake air temperature come straight from
 //     the MicroSquirt's CAN broadcast (ecu_broadcast.h). There is no MAP sensor here,
 //     and no fresh ECU data means no injection.
 //   - Knock, oil pressure, fuel pressure and the air temperature before the nozzle are
 //     read by the ADC's own timer (adc_sampler).
 //   - Knock is listened for on every sample, 38 thousand a second, with band-pass
-//     filters on the cylinder's two resonances (knock_dsp.h); the Nano could look at one
-//     short burst in six. The amplifier's gain is set automatically (knock_agc.h).
+//     filters on the cylinder's two resonances (knock_dsp.h). The amplifier's gain is
+//     set automatically (knock_agc.h).
 //   - New firmware arrives from the dash over CAN (can_contract/firmware_update.h).
-// Every CAN message, command and setting is the same as the Nano firmware's: the
-// functions that speak them are that firmware's own code. Wiring: docs/ESP32_HARDWARE.md.
+// Every CAN message, command and setting is in the shared CAN contract
+// (DIYComfortControlModule shared/can_contract). Wiring: docs/ESP32_HARDWARE.md.
 #include <Arduino.h>
 #include <Preferences.h>
 #include <SPI.h>
+#include <driver/gpio.h>
 #include <esp_ota_ops.h>
 #include <esp_rom_gpio.h>
 #include <esp_system.h>
@@ -37,13 +38,13 @@
 #include "ecu_broadcast.h"
 #include "injection_controller.h"
 #include "knock_agc.h"
-#include "knock_band.h"
 #include "knock_dsp.h"
 #include "knock_spectrum.h"
 #include "meth_tune.h"
 #include "pins_esp32.h"
 #include "reset_guard.h"
 #include "black_box.h"
+#include "status_light.h"
 #include "x9c.h"
 
 // The knock amplifier's gain is set by an X9C104 potentiometer and controlled
@@ -55,7 +56,7 @@
 
 // Knock listening: the filters' verdicts, the amplifier's automatic gain and the knock
 // frequency finder. Off for now at the owner's request (November 2026), until the knock
-// amplifier's input works on the bench, as on the Nano (NANO_KNOCK). The knock state
+// amplifier's input works on the bench. The knock state
 // frame (0x307) still goes out, reporting knock not enabled, so the dash shows it
 // unavailable; knock commands are refused as unsupported; the knock detail (0x30B,
 // 0x30C/0x30D, 0x30E) is not sent; the gain potentiometer is left alone. Injection never
@@ -95,6 +96,9 @@ static_assert(CCM_CAN_PROTOCOL_VERSION == can_protocol::CAN_PROTOCOL_SCHEMA_VERS
 #ifndef CAN_PROTOCOL_HAS_METH_START_REPORT
 #error "Update DIYComfortControlModule: the shared CAN contract needs the water/meth start report (extension 8)."
 #endif
+#ifndef CAN_PROTOCOL_HAS_METH_PULSE_DRIVE
+#error "Update DIYComfortControlModule: the shared CAN contract needs the pulse pump drive (extension 10)."
+#endif
 #ifndef CAN_PROTOCOL_HAS_METH_BLACK_BOX
 #error "Update DIYComfortControlModule: the shared CAN contract needs the water/meth black box (extension 9)."
 #endif
@@ -127,7 +131,7 @@ bool adcReady = false;
 
 // Tuning (meth_tune.h): adjustable over CAN, saved in flash on request.
 meth_tune::Settings tune;
-meth_tune::PwmGovernor governor;
+meth_tune::PulseGovernor governor;
 uint8_t tuneRevision = 0;     // Bumped whenever a setting changes.
 bool tuneUnsaved = false;
 bool tuneSavePending = false; // SAVE is written from loop().
@@ -264,7 +268,7 @@ float clampFloatValue(float value, float minValue, float maxValue) {
 
 // What the bore suggests the knock frequency is.
 uint16_t knockBoreHz() {
-  return knock_band::knockHzForBore(static_cast<uint8_t>(clampFloatValue(config.knock.boreMm, 40.0f, 200.0f) + 0.5f));
+  return knock_dsp::knockHzForBore(static_cast<uint8_t>(clampFloatValue(config.knock.boreMm, 40.0f, 200.0f) + 0.5f));
 }
 
 // Where the knock filter sits: on automatic, where the spectrum has shown this engine
@@ -325,7 +329,7 @@ knock_dsp::Settings knockSettings() {
   return s;
 }
 
-// Two band widths, as on the Nano: the bandwidth setting chooses the narrow one below 1 kHz.
+// Two band widths: the bandwidth setting chooses the narrow one below 1 kHz.
 float knockBandwidthHz() { return config.knock.bandwidthHz < 1000.0f ? 900.0f : 1500.0f; }
 
 // ---------------------------------------------------------------------------
@@ -422,20 +426,14 @@ void saveKnockSettings() {
 }
 
 // ---------------------------------------------------------------------------
-// Pump: a logic-level MOSFET on a PWM output. Off is the state of a reset or
-// unpowered ESP32 too, through the gate pull-down on the board.
+// Pump: a logic-level MOSFET on a PWM output, full on or off except in a soft start.
+// Off is the state of a reset or unpowered ESP32 too, through the gate pull-down on the
+// board.
 // ---------------------------------------------------------------------------
 //
-// A MOSFET that fails usually fails switched on. The optional master relay
-// (pins::PUMP_RELAY_OUT) feeds the pump its 12 V: it closes when spraying starts and
-// opens a few seconds after it ends, so a failed MOSFET cannot keep the pump running.
-// It never follows the PWM, so it clicks once per spray, not many times a second.
 volatile uint32_t pumpSetMs = 0;
 volatile bool pumpRunning = false;
-volatile bool relayClosed = false;
-uint32_t lastSprayMs = 0;
 constexpr int32_t kPumpKeeperMs = 250;
-constexpr uint32_t kRelayHoldMs = 3000;
 
 // What a reset leaves behind (reset_guard.h), in memory a reset does not clear: the crash
 // count, and whether the board was armed and the pump running when it came.
@@ -450,28 +448,19 @@ void setPump(float dutyPercent) {
   pumpSetMs = now;
   pumpRunning = dutyPercent > 0.0f;
   reset_guard::notePump(resetRecord, pumpRunning);
-  if (pumpRunning) {
-    lastSprayMs = now;
-    relayClosed = true;
-  } else if (relayClosed && static_cast<uint32_t>(now - lastSprayMs) >= kRelayHoldMs) {
-    relayClosed = false;
-  }
-  digitalWrite(pins::PUMP_RELAY_OUT, relayClosed ? HIGH : LOW);
   ledcWrite(pins::PUMP_OUT, static_cast<uint32_t>(dutyPercent * top / 100.0f + 0.5f));
 }
 
 // The PWM hardware keeps running whatever the program does, so the main loop has to
 // keep asking for it: it sets the pump every 20 ms, and if that stops, the CAN task
-// (another task, on the other processor core) switches the pump and the relay off
+// (another task, on the other processor core) switches the pump off
 // through here - seconds before the watchdog restarts the board.
 volatile uint32_t pumpKeeperTrips = 0;   // Times the keeper had to step in (shown on the serial heartbeat)
 
 void keepPumpSafe() {
-  if ((pumpRunning || relayClosed) && static_cast<int32_t>(millis() - pumpSetMs) > kPumpKeeperMs) {
+  if (pumpRunning && static_cast<int32_t>(millis() - pumpSetMs) > kPumpKeeperMs) {
     pumpRunning = false;
-    relayClosed = false;
     ledcWrite(pins::PUMP_OUT, 0);
-    digitalWrite(pins::PUMP_RELAY_OUT, LOW);
     pumpKeeperTrips = pumpKeeperTrips + 1;
   }
 }
@@ -482,10 +471,9 @@ void keepPumpSafe() {
 // matter, and the PWM hardware would go on driving the pump through all of it. Any
 // restart runs it too. Registers only: nothing here may need a lock, the flash or
 // another task. After the reset the pins float and the board's pull-downs hold the
-// MOSFET and the relay off.
+// MOSFET off.
 void IRAM_ATTR pumpOffNow() {
   gpio_ll_set_level(&GPIO, pins::PUMP_OUT, 0);
-  gpio_ll_set_level(&GPIO, pins::PUMP_RELAY_OUT, 0);
   // The pump pin belongs to the PWM peripheral: give it back to the plain output, now low.
   esp_rom_gpio_connect_out_signal(pins::PUMP_OUT, SIG_GPIO_OUT_IDX, false, false);
 }
@@ -569,7 +557,7 @@ volatile uint32_t canRxOverflows = 0;
 // Hearing nothing. With the ignition on the ECU broadcasts many times a second and the
 // dash sends engine data, so a bus with nothing on it means the CAN controller or its
 // wiring has stopped working, even when its registers look right (a stuck SPI line reads
-// back as "normal mode"). The Nano went that way on its tenth spray in November 2026 and
+// back as "normal mode"). The previous board went that way on its tenth spray in November 2026 and
 // stayed silent until the ignition was cycled. So: silent for kCanSilentMs, set the
 // controller up again (every kCanSilentRetryMs while it lasts); still silent after
 // kCanRestartAfterMs, restart the whole board (reset_guard::kCanRestartsAllowed per
@@ -825,7 +813,6 @@ bool sendKnockConfigPages() {
 void syncTuneToConfig() {
   config.boost.startPsi = tune.value[meth_tune::kStartPsiX10] / 10.0f;
   config.boost.fullPsi = tune.value[meth_tune::kFullPsiX10] / 10.0f;
-  config.relayPeriodMs = tune.value[meth_tune::kPeriodMs];
   // The tank blend is reported in the config acknowledgement and checked by the controller.
   const float meth = static_cast<float>(tune.value[meth_tune::kMethPercent]);
   blend = computeTankBlend(100.0f - meth, meth);
@@ -1087,7 +1074,7 @@ void handleCanFrame(unsigned long id, byte len, const byte *data) {
                             data[0] <= can_protocol::knock_detail_command::RELEARN_FREQUENCY;
 
   if (!kKnockOn && knockCommand) {
-    // Knock is not built in (ESP32_KNOCK): refused, as the Nano refuses them.
+    // Knock is not built in (ESP32_KNOCK): refused.
     ackStatus = can_protocol::config_ack_status::UNSUPPORTED_COMMAND;
     commandAccepted = false;
   } else switch (data[0]) {
@@ -1419,7 +1406,7 @@ uint8_t methFaultFlagsFor(const ControlResult &result, const SensorReadings &rea
   }
   if (canCommandTimedOut) flags |= (1U << 5);
   // Held off after repeated crashes (reset_guard.h), so the dash can say why and that
-  // clearing faults releases it (contract extension 8). The Nano never sets it.
+  // clearing faults releases it (contract extension 8).
   if (crashHold) flags |= can_protocol::meth_fault_flag::CRASH_HOLD;
   return flags;
 }
@@ -1487,7 +1474,7 @@ void recordBlackBox(uint32_t now, uint32_t passGapMs, const SensorReadings &read
   p.mapKpa = readings.mapKpa;
   p.rpmValid = engineRpmValid;
   p.rpm = rpm;
-  p.hold = manualTestActive ? meth_tune::kHoldNone : governor.hold();
+  p.hold = manualTestActive ? static_cast<uint8_t>(meth_tune::kHoldNone) : governor.hold();
   p.armed = config.mode != InjectionMode::Off;
   p.softStarting = governor.softStarting(now);
   p.manualTest = manualTestActive;
@@ -1642,14 +1629,13 @@ void serviceCanBus(uint32_t now,
     hook.adaptive_threshold = knock_dsp::toByte(knockDetector.threshold());
     hook.adaptive_baseline = knock_dsp::toByte(knockDetector.baseline());
     hook.event_count = knockEventCount;
-    // The dash turns these two into volts as the Nano's ADC counts them (5 V over 1024
-    // counts). They are sent in that scale, from the calibrated voltage at the pin, so
-    // "amplifier rests at" reads the true voltage on this board too.
-    const float nanoCountsPerMv = 1024.0f / 5000.0f;
-    hook.bias_adc_div16 = can_protocol::clampU8(static_cast<int>(knockStats.restMv * nanoCountsPerMv) / 16);
+    // The contract's scale for these two is counts of a 10-bit ADC on 5 V (5 V over 1024
+    // counts). They are sent in that scale, from the calibrated voltage at the pin.
+    const float countsPerMv = 1024.0f / 5000.0f;
+    hook.bias_adc_div16 = can_protocol::clampU8(static_cast<int>(knockStats.restMv * countsPerMv) / 16);
     hook.raw_adc_div16 = can_protocol::clampU8(knockRaw / 16);
     // Largest swing in the burst, in half counts: for setting the amplifier gain.
-    hook.envelope_level = can_protocol::clampU8(static_cast<int>((knockStats.highMv - knockStats.lowMv) * nanoCountsPerMv) / 4);
+    hook.envelope_level = can_protocol::clampU8(static_cast<int>((knockStats.highMv - knockStats.lowMv) * countsPerMv) / 4);
 
     if (!transmitCanFrame(can_protocol::packKnockLiveHook(hook), "0x30B")) {
       return;
@@ -1675,9 +1661,10 @@ void serviceCanBus(uint32_t now,
     if (governor.earlyStart()) flags |= flag::EARLY_START;
     if (governor.hotAir()) flags |= flag::HOT_AIR;
     if (usingEcuTemp) flags |= flag::ECU_TEMP;
-    // PWM drive: the duty is reported as on-time out of a period of 1000 (per mille).
-    if (!transmitCanFrame(can_protocol::packMethTuneStatus(tuneRevision, flags, governor.hold(),
-                                                           static_cast<uint16_t>(pumpDutyPercent * 10.0f + 0.5f), 1000),
+    // Pulse drive: the on-time of the cycle now running and the cycle length (0 on-time
+    // while not injecting), as the contract has it for meth_drive::PULSE.
+    if (!transmitCanFrame(can_protocol::packMethTuneStatus(tuneRevision, flags, governor.hold(), governor.onMs(),
+                                                           tune.value[meth_tune::kPeriodMs]),
                           "0x30F-status")) {
       return;
     }
@@ -1693,13 +1680,13 @@ void serviceCanBus(uint32_t now,
     }
   }
 
-  // One setting per pass. Each report says this controller drives the pump with PWM,
-  // which is how the dash knows to show duty settings.
+  // One setting per pass. Each report says this controller runs the pump in full-on
+  // pulses (meth_drive::PULSE), which is how the dash knows which settings to show.
   if (tuneReportNext != 0) {
     const uint8_t key = tuneReportNext;
     if (transmitCanFrame(can_protocol::packMethTuneSettingReport(
             key, tune.value[key], tuneRevision,
-            tuneUnsaved ? can_protocol::meth_tune_flag::UNSAVED : 0, can_protocol::meth_drive::PWM), "0x30F-setting")) {
+            tuneUnsaved ? can_protocol::meth_tune_flag::UNSAVED : 0, can_protocol::meth_drive::PULSE), "0x30F-setting")) {
       tuneReportNext = key < meth_tune::kCount ? key + 1 : 0;
     }
   }
@@ -1796,34 +1783,45 @@ void updatePressureReadings(SensorReadings &readings) {
   readings.fuelPressurePsi = readings.fuelPressureValid ? fuelPressure.psi : 0.0f;
   if (!readings.oilPressureValid) readings.analogFaultFlags |= kAnalogFaultOilPressure;
   if (!readings.fuelPressureValid) readings.analogFaultFlags |= kAnalogFaultFuelPressure;
-  // Not fitted on this board; reported as the Nano firmware reports an unfitted sensor.
+  // Not fitted on this board; reported as not fitted.
   readings.analogFaultFlags |= kAnalogFaultMethPressure | kAnalogFaultBoostRefPressure;
 }
+
+// Both intake inputs are read, and the one with a sensor on it is the air before the
+// nozzle (analog_inputs::IntakeInputs); one with nothing on it reads at the ADC's top and
+// counts as missing. Without a sensor the temperature features use the ECU's intake
+// temperature instead, and the dash shows the MicroSquirt's MAT as the air after the nozzle.
+analog_inputs::IntakeInputs intakeInputs;
+int8_t intakeShownInput = -2;   // Which input the serial monitor was last told about
+
+bool readIntakeInput(adc_sampler::Slow which, float &tempC) {
+  float millivolts = 0.0f;
+  return adc_sampler::averageMv(which, millivolts) &&
+         analog_inputs::thermistorC(millivolts, pins::INTAKE_TEMP_SUPPLY_MV, pins::INTAKE_TEMP_EFFECTIVE_PULLUP_OHMS,
+                                    adc_sampler::topMv(which), tempC);
+}
+
+int intakeGpio(int8_t input) { return input == 0 ? pins::PRE_INJECTION_TEMP_ADC : input == 1 ? pins::POST_INJECTION_TEMP_ADC : -1; }
 
 void updateIntakeTemps(uint32_t now) {
   if (!elapsed(now, lastIntakeTempMs, kIntakeTempSampleMs)) return;
   lastIntakeTempMs = now;
-  float millivolts = 0.0f, sample = 0.0f;
-  // Light smoothing only: these sensors are there to show the spray cooling the air.
-  // An unplugged sensor reads at the ADC's top and counts as missing (analog_inputs.h):
-  // the temperature features then use the ECU's intake temperature instead.
-  if (adc_sampler::averageMv(adc_sampler::kPre, millivolts) &&
-      analog_inputs::thermistorC(millivolts, pins::INTAKE_TEMP_SUPPLY_MV, pins::INTAKE_TEMP_PULLUP_OHMS,
-                                 adc_sampler::topMv(adc_sampler::kPre), sample)) {
-    preTempC = preTempValid ? preTempC + (sample - preTempC) * 0.3f : sample;
-    preTempValid = true;
-  } else {
-    preTempValid = false;
-  }
-  // After the nozzle: not fitted on this board (pins::POST_INJECTION_TEMP_FITTED); the
-  // MicroSquirt's MAT stands for it on the dash.
-  if (pins::POST_INJECTION_TEMP_FITTED && adc_sampler::averageMv(adc_sampler::kPost, millivolts) &&
-      analog_inputs::thermistorC(millivolts, pins::INTAKE_TEMP_SUPPLY_MV, pins::INTAKE_TEMP_PULLUP_OHMS,
-                                 adc_sampler::topMv(adc_sampler::kPost), sample)) {
-    postTempC = postTempValid ? postTempC + (sample - postTempC) * 0.3f : sample;
-    postTempValid = true;
-  } else {
-    postTempValid = false;
+  float first = 0.0f, second = 0.0f;
+  const bool firstOk = readIntakeInput(adc_sampler::kPre, first);
+  const bool secondOk = readIntakeInput(adc_sampler::kPost, second);
+  intakeInputs.update(firstOk, first, secondOk, second);
+  preTempValid = intakeInputs.preValid();
+  preTempC = intakeInputs.preC();
+  postTempValid = intakeInputs.postValid();
+  postTempC = intakeInputs.postC();
+  if (intakeInputs.preInput() != intakeShownInput) {
+    intakeShownInput = intakeInputs.preInput();
+    if (intakeShownInput < 0) {
+      Serial.println(F("INTAKE: no sensor on GPIO5 or GPIO6; using the ECU's intake temperature"));
+    } else {
+      Serial.printf("INTAKE: sensor on GPIO%d: the air before the nozzle%s\n", intakeGpio(intakeShownInput),
+                    intakeInputs.postInput() >= 0 ? "; GPIO6 is the air after it" : "");
+    }
   }
 }
 
@@ -1986,6 +1984,37 @@ void serviceKnock(uint32_t now, const SensorReadings &readings, uint16_t rpm) {
   lastKnockClippingDetected = knockClippingDetected;
 }
 
+// ---------------------------------------------------------------------------
+// The board's own RGB LED (status_light.h): the state at a glance on the board itself.
+// ---------------------------------------------------------------------------
+status_light::Light statusLight;
+uint32_t statusLightStartMs = 0;
+
+void showStatus(uint32_t now, const status_light::Facts &facts) {
+  const uint32_t since = now - statusLightStartMs;
+  const status_light::Color c = status_light::colorOf(status_light::classify(since, facts), since, facts.dutyPct);
+  if (!statusLight.due(now, c)) return;
+  for (const int pin : pins::STATUS_LED_PINS) rgbLedWrite(static_cast<uint8_t>(pin), c.r, c.g, c.b);
+}
+
+// What this control pass found, in the LED's terms.
+status_light::Facts statusFacts(uint32_t now, const SensorReadings &readings, const ControlResult &result, float duty) {
+  status_light::Facts facts;
+  facts.dutyPct = duty;
+  facts.pumpTest = manualTestActive;
+  facts.armed = config.mode != InjectionMode::Off;
+  const bool canSilent = canHeardOnce() && elapsed(now, lastCanRxMs, kCanSilentMs);
+  const bool badSetup = result.failsafe == FailsafeReason::BoostInvalid || result.failsafe == FailsafeReason::InvalidBlend ||
+                        result.failsafe == FailsafeReason::InvalidBoostConfig;
+  facts.fault = (config.tankProtectionEnabled && readings.tankLow) || !canOnline || canSilent || crashHold ||
+                result.overboostAssistFaultLatched || badSetup || !adcReady;
+  const uint8_t hold = governor.hold();
+  facts.waiting = !canHeardOnce() ||
+                  (facts.armed && (result.failsafe == FailsafeReason::MapInvalid || hold == meth_tune::kHoldRpmMissing ||
+                                   hold == meth_tune::kHoldTempSensor || hold == meth_tune::kHoldResting));
+  return facts;
+}
+
 #if METH_SAFETY_TEST
 // One letter on the serial monitor, then Enter. Each failure starts with the pump on at
 // 30 % (have nothing connected to it, or no fluid in the line), so the layer that
@@ -2002,9 +2031,8 @@ void serviceSafetyTest() {
         if (!offAfterMs && !pumpRunning) offAfterMs = millis() - start;
         delay(1);
       }
-      Serial.printf("TEST s: the CAN task switched the pump off after %lu ms; PWM duty now %lu, relay %s\n",
-                    static_cast<unsigned long>(offAfterMs), static_cast<unsigned long>(ledcRead(pins::PUMP_OUT)),
-                    digitalRead(pins::PUMP_RELAY_OUT) ? "CLOSED" : "open");
+      Serial.printf("TEST s: the CAN task switched the pump off after %lu ms; PWM duty now %lu\n",
+                    static_cast<unsigned long>(offAfterMs), static_cast<unsigned long>(ledcRead(pins::PUMP_OUT)));
     } else if (c == 'h') {
       Serial.println(F("TEST h: pump on, then the main loop hangs: the keeper at 250 ms, the watchdog at 2 s"));
       setPump(30.0f);
@@ -2040,8 +2068,6 @@ void serviceSafetyTest() {
 
 void setup() {
   // The pump is off before anything else happens.
-  pinMode(pins::PUMP_RELAY_OUT, OUTPUT);
-  digitalWrite(pins::PUMP_RELAY_OUT, LOW);
   pinMode(pins::PUMP_OUT, OUTPUT);
   digitalWrite(pins::PUMP_OUT, LOW);
   const bool pumpReady = ledcAttach(pins::PUMP_OUT, PUMP_PWM_HZ, PUMP_PWM_BITS);
@@ -2145,7 +2171,7 @@ void setup() {
   }
 
   if (kKnockOn) {
-    // On the Nano the threshold offset covers its coarse measurement (8 half counts).
+    // The default threshold offset (8 half counts) was sized for a coarse measurement.
     // This board measures finely, and an offset that size hides knock when the signal is
     // small: replaying the owner's LTspice simulation, 8 missed every knock at low
     // amplitudes that 2 catches. The dash can still set it.
@@ -2174,12 +2200,18 @@ void setup() {
   adcReady = adc_sampler::begin(pins::KNOCK_SENSOR_ADC, pins::OIL_PRESSURE_ADC, pins::FUEL_PRESSURE_ADC,
                                 pins::PRE_INJECTION_TEMP_ADC, pins::POST_INJECTION_TEMP_ADC);
   if (!adcReady) Serial.println(F("BOOT: analog inputs did not start; knock and pressures unavailable"));
+  // Each intake input's own pull-up, after the ADC has set the pins up (it turns pulls off):
+  // an input with nothing on it then reads as no sensor, never floats (pins_esp32.h).
+  gpio_pullup_en(static_cast<gpio_num_t>(pins::PRE_INJECTION_TEMP_ADC));
+  gpio_pullup_en(static_cast<gpio_num_t>(pins::POST_INJECTION_TEMP_ADC));
 
   canLock = xSemaphoreCreateMutex();
   canRxQueue = xQueueCreate(128, sizeof(RxFrame));
   canOnline = initCanBus();
   lastCanRetryMs = millis();
   xTaskCreatePinnedToCore(canReceiveTask, "can-rx", 4096, nullptr, 6, nullptr, 0);
+  // The LED's start-up colour check runs from here, in the first control passes.
+  statusLightStartMs = millis();
 }
 
 void loop() {
@@ -2203,6 +2235,9 @@ void loop() {
       Serial.println(F("UPDATE: boost is near; transfer dropped, running firmware kept"));
     } else {
       if (updater.expired(now)) Serial.println(F("UPDATE: transfer abandoned: the dash went quiet"));
+      status_light::Facts updating;
+      updating.updating = true;
+      showStatus(now, updating);
       delay(1);
       return;
     }
@@ -2314,6 +2349,7 @@ void loop() {
   }
   digitalWrite(pins::WARNING_LED, (crashHold || result.failsafe != FailsafeReason::None ||
                                    result.overboostAssistFaultLatched || knockDetected) ? HIGH : LOW);
+  showStatus(now, statusFacts(now, readings, result, duty));
 
   serviceCanBus(now, readings, result, knockDetected, knockRaw);
   recordBlackBox(now, passGapMs, readings, rpm, duty);
@@ -2349,13 +2385,13 @@ void loop() {
   if (elapsed(now, lastDebugMs, kSerialHeartbeatMs)) {
     lastDebugMs = now;
     Serial.printf("HB t=%lu map=%.1f%s boostPsi=%.2f baro=%.1f rpm=%u%s duty=%.0f%% hold=%u mode=%u tankLow=%d can=%d "
-                  "oilPsi=%.1f%s fuelPsi=%.1f%s pre=%.1f%s knock=%d krest=%umV knockHz=%lu klvl=%.1f kbase=%.1f k2=%.1f kshare=%.2f kfreq=%u kfound=%.0f ktone=%.0f kgain=%.1f%s kpeak=%umV rxOvf=%lu "
+                  "oilPsi=%.1f%s fuelPsi=%.1f%s pre=%.1f%s@%d knock=%d krest=%umV knockHz=%lu klvl=%.1f kbase=%.1f k2=%.1f kshare=%.2f kfreq=%u kfound=%.0f ktone=%.0f kgain=%.1f%s kpeak=%umV rxOvf=%lu "
                   "loopMax=%lums keeper=%lu crashes=%u%s rxAge=%lums canResets=%lu soft=%lums\n",
                   static_cast<unsigned long>(now), readings.mapKpa, readings.mapValid ? "" : "!", readings.boostPsi,
                   config.map.baroKpa, rpm, engineRpmValid ? "" : "!", pumpDutyPercent, governor.hold(),
                   static_cast<unsigned>(config.mode), readings.tankLow ? 1 : 0, canOnline ? 1 : 0,
                   readings.oilPressurePsi, readings.oilPressureValid ? "" : "!", readings.fuelPressurePsi,
-                  readings.fuelPressureValid ? "" : "!", preTempC, preTempValid ? "" : "!", knockDetected ? 1 : 0,
+                  readings.fuelPressureValid ? "" : "!", preTempC, preTempValid ? "" : "!", intakeGpio(intakeInputs.preInput()), knockDetected ? 1 : 0,
                   static_cast<unsigned>(knockStats.restMv), static_cast<unsigned long>(adc_sampler::knockSamplesPerSecond()),
                   knockDetector.level(), knockDetector.baseline(), knockDetector.second(), knockDetector.share(),
                   knockCenterHz(), knockFinder.estimateHz(), knockToneHz,

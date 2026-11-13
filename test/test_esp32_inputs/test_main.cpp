@@ -111,6 +111,52 @@ void intakeThermistor() {
   check(analog_inputs::thermistorC(1562.0f, 3300.0f, 2490.0f, 3100.0f, c), "an ADC with a lower top still reads 30 C");
 }
 
+void oneIntakeSensorOnEitherInput() {
+  using analog_inputs::IntakeInputs;
+  using analog_inputs::kIntakeSettleReads;
+  // The sensor on the second input (GPIO6), nothing on the first: it is the air before the nozzle.
+  IntakeInputs onSecond;
+  onSecond.update(false, 0.0f, true, 21.0f);
+  check(onSecond.preInput() == 1 && onSecond.preValid() && near(onSecond.preC(), 21.0f, 0.01f), "sensor on GPIO6: before the nozzle");
+  check(onSecond.postInput() == -1 && !onSecond.postValid(), "and nothing after the nozzle");
+  // On the first input instead.
+  IntakeInputs onFirst;
+  onFirst.update(true, 30.0f, false, 0.0f);
+  check(onFirst.preInput() == 0 && onFirst.preValid() && onFirst.postInput() == -1, "sensor on GPIO5: before the nozzle");
+  // Neither: no sensor (the ECU's intake temperature stands in).
+  IntakeInputs none;
+  none.update(false, 0.0f, false, 0.0f);
+  check(none.preInput() == -1 && !none.preValid() && !none.postValid(), "no sensor on either input");
+  // Both: GPIO5 before the nozzle, GPIO6 after, as wired in the documentation.
+  IntakeInputs both;
+  both.update(true, 35.0f, true, 28.0f);
+  check(both.preInput() == 0 && both.postInput() == 1 && near(both.preC(), 35.0f, 0.01f) && near(both.postC(), 28.0f, 0.01f),
+        "two sensors: GPIO5 before, GPIO6 after");
+  // Smoothed lightly.
+  onSecond.update(false, 0.0f, true, 31.0f);
+  check(near(onSecond.preC(), 24.0f, 0.01f), "smoothed: 30% of the step each read");
+  // A bad read or two from a loose plug: that read is invalid, the choice stays.
+  onSecond.update(false, 0.0f, false, 0.0f);
+  check(onSecond.preInput() == 1 && !onSecond.preValid(), "one bad read: invalid for that read only");
+  onSecond.update(false, 0.0f, true, 24.0f);
+  check(onSecond.preInput() == 1 && onSecond.preValid(), "and back");
+  // Unplugged for good: the input is dropped after the settle time, not at once.
+  for (uint8_t i = 1; i < kIntakeSettleReads; ++i) onSecond.update(false, 0.0f, false, 0.0f);
+  check(onSecond.preInput() == 1, "unplugged: still the chosen input just short of 2 s");
+  onSecond.update(false, 0.0f, false, 0.0f);
+  check(onSecond.preInput() == -1, "dropped after 2 s");
+  // Plugged into the other input later: taken after 2 s of good reads.
+  for (uint8_t i = 1; i < kIntakeSettleReads; ++i) onSecond.update(true, 22.0f, false, 0.0f);
+  check(onSecond.preInput() == -1, "a new sensor is not taken at once");
+  onSecond.update(true, 22.0f, false, 0.0f);
+  check(onSecond.preInput() == 0 && onSecond.preValid(), "taken after 2 s of good reads");
+  // A spare input whose reads flicker valid now and then never takes over.
+  IntakeInputs flicker;
+  flicker.update(false, 0.0f, true, 20.0f);
+  for (int i = 0; i < 400; ++i) flicker.update(i % 5 == 0, 50.0f, true, 20.0f);
+  check(flicker.preInput() == 1 && flicker.postInput() == -1, "a flickering spare input is never taken");
+}
+
 void tankFloatSwitch() {
   analog_inputs::FloatSwitch tank;
   tank.begin(true, 0, 100, 2000);
@@ -130,6 +176,7 @@ int main() {
   ecuFramesThatAreNotBelieved();
   pressureTransducer();
   intakeThermistor();
+  oneIntakeSensorOnEitherInput();
   tankFloatSwitch();
   if (failures) {
     printf("%d ESP32 input test(s) failed\n", failures);

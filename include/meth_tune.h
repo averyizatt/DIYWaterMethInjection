@@ -1,22 +1,23 @@
 #pragma once
 
-// Water/meth pulse tuning: the adjustable settings with their hard limits, and the
-// governor that decides on every loop whether the pump relay is on.
+// Water/meth pulse tuning: the adjustable settings with their hard limits, the timing
+// that decides on every loop whether the pump runs (PulseTiming), and the drive that
+// turns that into the MOSFET's duty, full on or off with a soft start (PulseGovernor).
 //
-// The pump is switched directly by a mechanical relay, so flow is set by how long the
-// pump runs in each cycle, not by PWM, and the cycles are slow: the pump runs for at
-// least half a second, rests for at least half a second (or not at all: continuous),
-// and starts at most once per cycle. Short blips would wear the contacts and never
-// build nozzle pressure anyway. Everything here is pure logic with no Arduino calls,
-// so it is tested on a PC (test/test_meth_tune).
+// The pump runs at full pressure or not at all, so flow is set by how long it runs in
+// each cycle, and the cycles are slow: the pump runs for at least half a second, rests
+// for at least half a second (or not at all: continuous), and starts at most once per
+// cycle. Shorter would be mostly soft start, never build nozzle pressure, and start the
+// motor more often than it likes. Everything here is pure logic with no Arduino calls,
+// so it is tested on a PC (test/test_meth_tune, test/test_meth_pulse).
 #include <math.h>
 #include <stdint.h>
 
 namespace meth_tune {
 
-// Same numbers as can_protocol::meth_tune_setting (checked in main_nano.cpp).
+// Same numbers as can_protocol::meth_tune_setting (checked in main_esp32.cpp).
 enum Key : uint8_t {
-  kPeriodMs = 1,     // Relay cycle length
+  kPeriodMs = 1,     // Pulse cycle length
   kMinOnMs = 2,      // Pump on-time per cycle at start boost
   kMaxOnMs = 3,      // Pump on-time per cycle at full boost
   kStartPsiX10 = 4,  // Boost where injection starts
@@ -33,10 +34,11 @@ enum Key : uint8_t {
   kEarlyRpm = 15,    // Inject from this RPM with the throttle open, before boost; 0 = off
   kHotStartC = 16,   // Air before the nozzle hotter than this adds on-time; 0 = off
   kHotFullC = 17,    // Air temperature where on-time reaches kMaxOnMs
-  // For a pump driven through a MOSFET with PWM (PwmGovernor below). These two take
-  // the place of kPeriodMs, kMinOnMs and kMaxOnMs; a relay controller ignores them.
-  kMinDutyPct = 18,  // Pump duty at start boost: the least that still atomises
-  kMaxDutyPct = 19,  // Pump duty at full boost
+  // From the earlier drive that ran the pump at part duty (contract extension 5). Kept,
+  // stored and reported because the CAN contract has them, but nothing uses them: the
+  // pump runs full on or off (contract extension 10).
+  kMinDutyPct = 18,
+  kMaxDutyPct = 19,
 };
 constexpr uint8_t kCount = 19;
 
@@ -47,7 +49,7 @@ constexpr float kEarlyStartPsi = -1.5f;
 constexpr float kEarlyStopPsi = -2.5f;
 constexpr uint16_t kEarlyRpmHysteresis = 200;
 
-// The relay's hard limits, whatever the settings say.
+// The pulse timing's hard limits, whatever the settings say.
 constexpr uint16_t kShortestPulseMs = 500; // Pump runs at least this long, or not at all.
 constexpr uint16_t kShortestGapMs = 500;   // Off at least this long, or stays on.
 
@@ -201,9 +203,9 @@ inline uint16_t doseLimitOnMs(const Settings &s, uint16_t rpm, float mapKpa) {
   return duty >= 1.0f ? period : static_cast<uint16_t>(period * duty);
 }
 
-// The relay's rules applied to a wanted on-time: too short is nothing, and an off gap
-// too short to be worth a switch is widened by shortening the pulse (never lengthened).
-inline uint16_t relaySafeOnMs(uint16_t onMs, uint16_t period) {
+// The pulse rules applied to a wanted on-time: too short is nothing, and an off gap
+// too short to be worth a stop is widened by shortening the pulse (never lengthened).
+inline uint16_t safeOnMs(uint16_t onMs, uint16_t period) {
   if (onMs >= period) return period;
   if (period - onMs < kShortestGapMs) onMs = period > kShortestGapMs ? period - kShortestGapMs : 0;
   return onMs < kShortestPulseMs ? 0 : onMs;
@@ -234,9 +236,9 @@ struct Inputs {
   float capDutyPercent{100.0f}; // Master duty cap; 100 = none.
 };
 
-class Governor {
+class PulseTiming {
 public:
-  // Normal injection. Returns the pump relay state for this instant.
+  // Normal injection. Returns whether the pump runs at this instant.
   bool update(uint32_t now, const Settings &s, const Inputs &in) {
     const uint32_t dt = started_ ? (now - lastMs_ > 1000UL ? 1000UL : now - lastMs_) : 0;
     lastMs_ = now;
@@ -301,12 +303,12 @@ public:
       const uint16_t cap = onFromDuty(in.capDutyPercent, period);
       if (target > cap) target = cap;
     }
-    if (hold == kHoldNone && relaySafeOnMs(target, period) == 0) hold = kHoldDoseLimit;
+    if (hold == kHoldNone && safeOnMs(target, period) == 0) hold = kHoldDoseLimit;
     hold_ = hold;
     return pulse(now, hold == kHoldNone, target, period, ramp, s.value[kMinOnMs]);
   }
 
-  // Pump test: no RPM, temperature, dose or time gates, but the same relay rules.
+  // Pump test: no RPM, temperature, dose or time gates, but the same pulse rules.
   // Any test above 0% runs the pump for at least the shortest pulse.
   bool manual(uint32_t now, const Settings &s, uint8_t dutyPercent) {
     lastMs_ = now;
@@ -334,7 +336,7 @@ private:
   }
 
   // One pump run per cycle at most. A cycle that is blocked part-way stays off until
-  // the next one, so the relay can never be asked to switch faster than the period.
+  // the next one, so the pump can never be started more often than once a period.
   bool pulse(uint32_t now, bool want, uint16_t targetOn, uint16_t period, uint16_t rampMs, uint16_t minOn) {
     const bool out = decide(now, want, targetOn, period, rampMs, minOn);
     if (out_ && !out) offAt_ = now;
@@ -358,7 +360,7 @@ private:
         if (limit < cycleLimit_) cycleLimit_ = static_cast<uint16_t>(limit);
       }
       if (on > cycleLimit_) on = cycleLimit_;
-      on = relaySafeOnMs(on, period);
+      on = safeOnMs(on, period);
       if (on == 0) return false;
       cycleActive_ = true;
       everCycled_ = true;
@@ -370,11 +372,11 @@ private:
     }
     if (!want) cut_ = true;
     // A run still going may grow as boost and airflow rise (more wanted, a higher dose
-    // limit), up to this cycle's ramp step. The relay just stays on: no extra switch.
+    // limit), up to this cycle's ramp step. The pump just stays on: no extra start.
     // Before, the length was fixed at the start of the pull (0.5 psi, low airflow), so
     // short pulls only ever got the minimum.
     if (!cut_ && now - cycleStart_ < cycleOn_ && targetOn > cycleOn_) {
-      const uint16_t grown = relaySafeOnMs(targetOn < cycleLimit_ ? targetOn : cycleLimit_, cyclePeriod_);
+      const uint16_t grown = safeOnMs(targetOn < cycleLimit_ ? targetOn : cycleLimit_, cyclePeriod_);
       if (grown > cycleOn_) cycleOn_ = lastOn_ = grown;
     }
     return !cut_ && now - cycleStart_ < cycleOn_;
@@ -400,229 +402,78 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// PWM drive: the pump runs through a MOSFET at a duty that rises with boost, as
-// commercial progressive kits do. Everything that decides WHETHER to inject is the
-// same as the relay governor above (RPM, air temperature, spray time, early start,
-// hot air, dose limit); only how the answer reaches the pump differs.
-//
-// Flow is not proportional to duty. A diaphragm pump far larger than the nozzle is
-// limited by the pressure it can hold, which follows motor torque and so duty; a
-// nozzle passes fluid as the square root of pressure. So flow is taken as
-//   nozzle rating x sqrt(duty)
-// which overestimates rather than underestimates at part duty: the safe direction
-// for the dose limit. Measure the real flow with the pump test before trusting it.
-// ---------------------------------------------------------------------------
-inline float flowFraction(float dutyPercent) {
-  if (!(dutyPercent > 0.0f)) return 0.0f;
-  return dutyPercent >= 100.0f ? 1.0f : static_cast<float>(sqrt(dutyPercent / 100.0f));
-}
-
-// Duty for this boost: kMinDutyPct at start boost, a straight line to kMaxDutyPct at
-// full boost, flat above it.
-inline float targetDuty(const Settings &s, float boostPsi) {
-  const float start = s.value[kStartPsiX10] / 10.0f;
-  const float full = s.value[kFullPsiX10] / 10.0f;
-  float fraction = full > start ? (boostPsi - start) / (full - start) : 1.0f;
-  if (!(fraction > 0.0f)) fraction = 0.0f;  // Also catches NaN.
-  if (fraction > 1.0f) fraction = 1.0f;
-  const float low = s.value[kMinDutyPct];
-  return low + (s.value[kMaxDutyPct] - low) * fraction;
-}
-
-// Duty asked for by hot intake air; 0 when the feature is off or the air is cooler.
-inline float hotAirDuty(const Settings &s, bool preValid, float preC) {
-  const float start = s.value[kHotStartC];
-  if (s.value[kHotStartC] == 0 || !preValid || !(preC > start)) return 0.0f;
-  const float full = s.value[kHotFullC];
-  float fraction = full > start ? (preC - start) / (full - start) : 1.0f;
-  if (fraction > 1.0f) fraction = 1.0f;
-  const float low = s.value[kMinDutyPct];
-  return low + (s.value[kMaxDutyPct] - low) * fraction;
-}
-
-// Highest duty the dose limit allows; 100 when the limit is off or not reached.
-inline float doseLimitDuty(const Settings &s, uint16_t rpm, float mapKpa) {
-  if (s.value[kMaxDosePct] == 0) return 100.0f;
-  const float allowedMlMin = fuelGPerMin(rpm, mapKpa) * s.value[kMaxDosePct] / 100.0f;
-  const float fraction = allowedMlMin / s.value[kNozzleMlMin];
-  return fraction >= 1.0f ? 100.0f : fraction * fraction * 100.0f;
-}
-
-// The pump is a motor, not a valve: an ordinary diaphragm water pump that takes PWM but
-// does not like being chopped about (owner, November 2026). So the drive is gentle with it:
-//   - Soft start: from rest the duty climbs from kSoftStartFloorPct to full over the soft
-//     start time, whatever is asked, until it reaches what is asked. A motor starting
-//     draws its largest current, and slamming it on dips the 12 V supply: the likely
-//     reason the Nano went silent at the start of its tenth spray (November 2026). During
-//     the soft start the duty may be under the minimum: the pump is spinning up and the
-//     line filling, not metering. The firmware lengthens it after a reset that came while
-//     the pump ran (reset_guard::softStartMs).
-//   - A rest of at least kPwmRestMs between runs: never more than two starts a second.
-//   - To start a run the dose limit must allow kDoseStartMarginPct above the minimum
-//     duty; only falling under the minimum stops one. No on-off at the edge.
+// Soft start, for every run of the pump (PulseGovernor below): from rest the duty climbs
+// from kSoftStartFloorPct to full over the soft start time. A motor starting draws its
+// largest current, and slamming it on dips the 12 V supply: the likely reason the first
+// board went silent at the start of its tenth spray (November 2026). The firmware
+// lengthens it after a reset that came while the pump ran (reset_guard::softStartMs).
 constexpr uint32_t kSoftStartMs = 400;
 constexpr float kSoftStartFloorPct = 5.0f;
-constexpr uint32_t kPwmRestMs = 500;
-constexpr float kDoseStartMarginPct = 3.0f;
 
-class PwmGovernor {
+// ---------------------------------------------------------------------------
+// Pulse drive (owner, November 2026): the pump on its MOSFET, but full on or full off,
+// in pulses timed by PulseTiming above (PERIOD_MS, MIN_ON_MS,
+// MAX_ON_MS, RAMP_MS, at least half a second on and half a second off, or on
+// continuously). Only the start of each run uses PWM: a soft start, from
+// kSoftStartFloorPct to full over the soft start time. Why, rather than running the
+// pump continuously at a duty that follows boost, as the board did until then:
+//   - The pump is an ordinary diaphragm pump, 4-6 L/min against a 60 ml/min nozzle, so it
+//     is all but dead-headed and the pressure it holds follows its motor voltage. At part
+//     duty the line sits at part pressure, and the nozzle atomises by pressure: a coarse
+//     spray. Full on, every spray is at the pump's full pressure, as the first board's
+//     pulse timing gave it.
+//   - At part duty the motor sits near stall, drawing current without turning: what the
+//     owner meant by the pump not liking PWM. Full on, its own pressure switch does the
+//     regulating it was made for.
+//   - Flow is then simply the nozzle's rating for the share of the cycle the pump runs,
+//     with no square-root guess in it, so the dose limit and the dash's estimate are right.
+// The soft start makes the first moments of each pulse weaker than full: the estimates
+// count them as full, which is the safe direction.
+class PulseGovernor {
 public:
-  // 0 turns the soft start off (the bench tests of the ramp do).
+  // 0 turns the soft start off (the bench tests of the timing do).
   void setSoftStartMs(uint32_t ms) { softStartMs_ = ms; }
   uint32_t softStartMs() const { return softStartMs_; }
 
-  // Normal injection. Returns the pump duty in percent for this instant; 0 = off.
-  float update(uint32_t now, const Settings &s, const Inputs &in) {
-    const uint32_t dt = started_ ? (now - lastMs_ > 1000UL ? 1000UL : now - lastMs_) : 0;
-    lastMs_ = now;
-    started_ = true;
+  // Normal injection. Returns the pump duty in percent for this instant: 0, 100, or on
+  // the way up in a soft start.
+  float update(uint32_t now, const Settings &s, const Inputs &in) { return shape(now, timing_.update(now, s, in)); }
 
-    const bool waitingForBoost = !in.wantSpray && in.idleHold == kHoldBelowBoost;
-    const uint16_t earlyRpm = s.value[kEarlyRpm];
-    if (!waitingForBoost || earlyRpm == 0 || !in.rpmValid) {
-      early_ = false;
-    } else if (early_) {
-      early_ = in.rpm + kEarlyRpmHysteresis >= earlyRpm && in.boostPsi > kEarlyStopPsi;
-    } else {
-      early_ = in.rpm >= earlyRpm && in.boostPsi >= kEarlyStartPsi;
-    }
-    const bool wanted = in.wantSpray || early_;
+  // Pump test: the duty asked for is the share of the cycle the pump runs (100 =
+  // continuously), at full pressure, with the pulse rules; no RPM, temperature, dose
+  // or time gates.
+  float manual(uint32_t now, const Settings &s, uint8_t dutyPercent) { return shape(now, timing_.manual(now, s, dutyPercent)); }
 
-    uint8_t hold = kHoldNone;
-    if (!wanted) hold = in.idleHold == kHoldNone ? static_cast<uint8_t>(kHoldBelowBoost) : in.idleHold;
-    else if (!in.rpmValid) hold = kHoldRpmMissing;
-    else if (in.rpm < s.value[kMinRpm]) hold = kHoldRpmLow;
-    else if (s.value[kMinPreTempC] > 0 && !in.preValid) hold = kHoldTempSensor;
-    else if (s.value[kMinPreTempC] > 0 && in.preC < static_cast<float>(s.value[kMinPreTempC])) hold = kHoldAirCold;
-
-    // Spray time budget: fills while injecting, drains while not. A full rest refills it.
-    const uint32_t maxMs = static_cast<uint32_t>(s.value[kMaxSprayS]) * 1000UL;
-    const uint16_t restS = s.value[kRestS];
-    const bool injecting = hold == kHoldNone && !resting_;
-    if (restS == 0) {
-      usedMs_ = 0;
-      resting_ = false;
-    } else if (injecting) {
-      usedMs_ += dt;
-      if (usedMs_ >= maxMs) {
-        usedMs_ = maxMs;
-        resting_ = true;
-      }
-    } else {
-      const uint32_t drain = dt * s.value[kMaxSprayS] / restS;
-      usedMs_ = usedMs_ > drain ? usedMs_ - drain : 0;
-      if (usedMs_ == 0) resting_ = false;
-    }
-    if (hold == kHoldNone && resting_) hold = kHoldResting;
-
-    const float low = s.value[kMinDutyPct];
-    float target = targetDuty(s, in.boostPsi);
-    const float hot = hotAirDuty(s, in.preValid, in.preC);
-    hotAir_ = hot > target;
-    if (hotAir_) target = hot;
-    bool ramped = s.value[kRampMs] > 0;
-    if (in.assistActive && s.value[kOverboostAssist]) {
-      if (in.assistDutyPercent > target) target = in.assistDutyPercent;
-      ramped = false;
-    }
-    // Limits come last, so nothing above can exceed them.
-    const float dose = doseLimitDuty(s, in.rpm, in.mapKpa);
-    if (target > dose) target = dose;
-    if (in.capDutyPercent < 100.0f && target > in.capDutyPercent) target = in.capDutyPercent;
-    if (target > 100.0f) target = 100.0f;
-    // Below the minimum duty the nozzle dribbles instead of atomising: nothing, not a
-    // little. A run starts only with some room above it (kDoseStartMarginPct).
-    const float doseToStart = low + kDoseStartMarginPct < 100.0f ? low + kDoseStartMarginPct : 100.0f;
-    if (hold == kHoldNone && (target < low || (!running_ && dose < doseToStart))) hold = kHoldDoseLimit;
-    // Rests between runs; the reason the last run stopped is still the reason.
-    if (hold == kHoldNone && !running_ && everRan_ && now - stoppedMs_ < kPwmRestMs) hold = stopHold_;
-    hold_ = hold;
-
-    if (hold != kHoldNone) {
-      stop(now, hold);
-      return 0.0f;
-    }
-    // Each run's duty starts at the minimum and climbs: kRampMs is the time the climb
-    // from minimum to maximum duty may take. The soft start then shapes the first moments.
-    const float span = static_cast<float>(s.value[kMaxDutyPct]) - low;
-    const float step = span > 0.0f && s.value[kRampMs] > 0 ? span * dt / s.value[kRampMs] : 100.0f;
-    float allowed = 100.0f;
-    if (!running_) {
-      begin(now);
-      allowed = low;
-    } else {
-      allowed = rampDuty_ + step;
-    }
-    if (ramped && target > allowed) target = allowed;
-    rampDuty_ = target;
-    duty_ = softStarted(now, target);
-    return duty_;
-  }
-
-  // Pump test: no RPM, temperature, dose or time gates. Any test above 0% runs the
-  // pump at no less than the lowest duty that can be set, so it always turns. It starts
-  // softly too: it is the same pump on the same supply.
-  float manual(uint32_t now, const Settings &, uint8_t dutyPercent) {
-    lastMs_ = now;
-    started_ = true;
-    hold_ = kHoldNone;
-    const float floor = rangeOf(kMinDutyPct).min;
-    const float wanted = dutyPercent == 0 ? 0.0f : dutyPercent > 100 ? 100.0f : dutyPercent < floor ? floor : static_cast<float>(dutyPercent);
-    if (!(wanted > 0.0f)) {
-      stop(now, kHoldDisarmed);
-      return 0.0f;
-    }
-    if (!running_) begin(now);
-    rampDuty_ = wanted;
-    duty_ = softStarted(now, wanted);
-    return duty_;
-  }
-
-  uint8_t hold() const { return hold_; }
-  bool resting() const { return resting_; }
-  bool earlyStart() const { return early_ && hold_ == kHoldNone; }
-  bool hotAir() const { return hotAir_ && hold_ == kHoldNone; }
+  uint8_t hold() const { return timing_.hold(); }
+  bool resting() const { return timing_.resting(); }
+  bool earlyStart() const { return timing_.earlyStart(); }
+  bool hotAir() const { return timing_.hotAir(); }
+  // On-time of the cycle now running; 0 while not injecting.
+  uint16_t onMs() const { return timing_.onMs(); }
   float duty() const { return duty_; }
   // The pump is running and still in its soft start.
-  bool softStarting(uint32_t now) const { return running_ && softStartMs_ > 0 && now - runStartMs_ < softStartMs_; }
+  bool softStarting(uint32_t now) const { return on_ && softStartMs_ > 0 && now - runStartMs_ < softStartMs_; }
 
 private:
-  void begin(uint32_t now) {
-    running_ = true;
-    runStartMs_ = now;
-  }
-
-  void stop(uint32_t now, uint8_t why) {
-    if (running_) {
-      running_ = false;
-      everRan_ = true;
-      stoppedMs_ = now;
-      stopHold_ = why;
+  float shape(uint32_t now, bool on) {
+    // A run rolling straight on into the next cycle is not a new start.
+    if (on && !on_) runStartMs_ = now;
+    on_ = on;
+    if (!on) {
+      duty_ = 0.0f;
+    } else if (softStarting(now)) {
+      duty_ = kSoftStartFloorPct + (100.0f - kSoftStartFloorPct) * static_cast<float>(now - runStartMs_) / softStartMs_;
+    } else {
+      duty_ = 100.0f;
     }
-    duty_ = 0.0f;
+    return duty_;
   }
 
-  float softStarted(uint32_t now, float duty) const {
-    if (!softStarting(now)) return duty;
-    const float cap = kSoftStartFloorPct + (100.0f - kSoftStartFloorPct) * static_cast<float>(now - runStartMs_) / softStartMs_;
-    return duty > cap ? cap : duty;
-  }
-
-  uint32_t lastMs_{0};
-  uint32_t usedMs_{0};
+  PulseTiming timing_;
   uint32_t runStartMs_{0};
-  uint32_t stoppedMs_{0};
   uint32_t softStartMs_{kSoftStartMs};
   float duty_{0.0f};
-  float rampDuty_{0.0f};   // This run's ramp: where the duty may climb on from
-  uint8_t hold_{kHoldDisarmed};
-  uint8_t stopHold_{kHoldBelowBoost};
-  bool started_{false};
-  bool running_{false};
-  bool everRan_{false};
-  bool early_{false};
-  bool hotAir_{false};
-  bool resting_{false};
+  bool on_{false};
 };
 
 } // namespace meth_tune

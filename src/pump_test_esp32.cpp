@@ -21,17 +21,12 @@ bool pwmReady = false;
 
 void setPump(uint8_t percent) {
   const uint32_t top = (1UL << PUMP_PWM_BITS) - 1;
-  // The optional master relay feeds the pump its 12 V: closed while the pump is driven.
-  // With nothing wired to that pin this does nothing.
-  digitalWrite(pins::PUMP_RELAY_OUT, percent > 0 ? HIGH : LOW);
   ledcWrite(pins::PUMP_OUT, (top * percent + 50) / 100);
 }
 } // namespace
 
 void setup() {
   // Off before anything else.
-  pinMode(pins::PUMP_RELAY_OUT, OUTPUT);
-  digitalWrite(pins::PUMP_RELAY_OUT, LOW);
   pinMode(pins::PUMP_OUT, OUTPUT);
   digitalWrite(pins::PUMP_OUT, LOW);
   pwmReady = ledcAttach(pins::PUMP_OUT, PUMP_PWM_HZ, PUMP_PWM_BITS);

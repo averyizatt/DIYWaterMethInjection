@@ -185,5 +185,10 @@ int main() {
   check("pumpStopsAfterBoostDrops_butLatchRemains", pumpStopsAfterBoostDrops_butLatchRemains());
   check("sensorFault_forcesPumpOff_evenDuringOverboost", sensorFault_forcesPumpOff_evenDuringOverboost());
 
-  return failed == 0 ? 0 : 1;
+  if (failed) {
+    printf("%d injection controller test(s) failed\n", failed);
+    return 1;
+  }
+  printf("injection controller tests passed\n");
+  return 0;
 }

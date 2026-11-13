@@ -3,7 +3,8 @@
 // ESP32-S3 DevKitC-1 wiring for the water/meth and knock controller.
 // Full wiring, parts and the reasons are in docs/ESP32_HARDWARE.md.
 //
-// Not used on purpose: GPIO0, 3, 45, 46 (boot straps), 19, 20 (USB), 26-37 (flash/PSRAM).
+// Not used on purpose: GPIO0, 3, 45, 46 (boot straps), 19, 20 (USB), 26-37 (flash/PSRAM),
+// 38 and 48 (the board's own RGB LED, below).
 namespace pins {
 // MCP2515 CAN module on the default SPI pins. INT is not connected: the bus is polled.
 constexpr int CAN_SPI_CS = 10;
@@ -15,26 +16,32 @@ constexpr int CAN_SPI_MISO = 13;
 constexpr int KNOCK_SENSOR_ADC = 1;        // ADC1 channel 0: knock amplifier, resting near 1.65 V
 constexpr int OIL_PRESSURE_ADC = 2;        // ADC1 channel 1: 0.5-4.5 V sensor through 6.8k/10k
 constexpr int FUEL_PRESSURE_ADC = 4;       // ADC1 channel 3: 0.5-4.5 V sensor through 6.8k/10k
-constexpr int PRE_INJECTION_TEMP_ADC = 5;  // ADC1 channel 4: intake air before the nozzle
-constexpr int POST_INJECTION_TEMP_ADC = 6; // ADC1 channel 5: spare; intake air after the nozzle if fitted
+// Two intake air inputs, one sensor (owner, November 2026): the sensor, before the nozzle,
+// may be on either; the firmware reads both and uses the one with a sensor on it
+// (analog_inputs::IntakeInputs). With a sensor on each, GPIO5 is before the nozzle and
+// GPIO6 after it. The MicroSquirt's MAT, after the throttle, is the air after the nozzle.
+constexpr int PRE_INJECTION_TEMP_ADC = 5;  // ADC1 channel 4: intake air (before the nozzle with two sensors)
+constexpr int POST_INJECTION_TEMP_ADC = 6; // ADC1 channel 5: intake air (after the nozzle with two sensors)
 constexpr float INTAKE_TEMP_PULLUP_OHMS = 2490.0f;  // Each thermistor: 3.3 V -> 2.49k -> pin -> sensor -> GND
+// The firmware also turns on each of these pins' own pull-up, so an input with nothing on
+// it reads at the top of the ADC (no sensor) even without its 2.49k fitted, instead of
+// floating to something that could pass for a temperature. About 45k in the ESP32-S3's
+// datasheet; in parallel with the 2.49k it is what each sensor works against.
+constexpr float INTAKE_TEMP_PIN_PULLUP_OHMS = 45000.0f;
+constexpr float INTAKE_TEMP_EFFECTIVE_PULLUP_OHMS =
+    1.0f / (1.0f / INTAKE_TEMP_PULLUP_OHMS + 1.0f / INTAKE_TEMP_PIN_PULLUP_OHMS);
 constexpr float INTAKE_TEMP_SUPPLY_MV = 3300.0f;
-// One intake sensor on this board, before the nozzle; the MicroSquirt's MAT, after the
-// throttle, is the one after the nozzle (owner, November 2026). The input above is then
-// not read at all: without its sensor and pull-up it floats, and a floating pin can read
-// back as a believable temperature. The dash shows the MicroSquirt's MAT as the air after
-// the nozzle. Set true if a second sensor and its 2.49k pull-up are fitted on GPIO6.
-constexpr bool POST_INJECTION_TEMP_FITTED = false;
 
 constexpr int FLOAT_SENSOR_DIGITAL = 7;    // Tank float switch to GND, internal pull-up
 // Pump MOSFET gate (logic-level, low side). A 10k resistor from gate to ground on the
 // board keeps the pump off while the ESP32 is booting, being flashed or reset.
 constexpr int PUMP_OUT = 15;
 constexpr int WARNING_LED = 16;            // High = warning
-// Optional master relay in the pump's 12 V feed: high from the start of a spray until a
-// few seconds after it, so a MOSFET that has failed "on" cannot run the pump. Also
-// needs a 10k pull-down at the relay driver's input.
-constexpr int PUMP_RELAY_OUT = 17;
+// The board's own RGB LED (an addressable WS2812), showing the controller's state
+// (status_light.h). The DevKitC-1 v1.0 and most copies have it on GPIO48, v1.1 on GPIO38:
+// both are driven, so whichever is fitted lights, and neither may be wired to anything
+// else. Some copies connect the LED only once the solder bridge marked RGB is closed.
+constexpr int STATUS_LED_PINS[] = {48, 38};
 
 // Knock amplifier gain: X9C104 digital potentiometer module (5 V supply; these three
 // are 3.3 V outputs to its inputs, nothing comes back). See x9c.h.

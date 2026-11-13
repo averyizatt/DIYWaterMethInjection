@@ -1,52 +1,55 @@
 # DIY Water/Meth Injection Controller
 
-Two boards run this controller, with the same CAN messages:
+Firmware for the car's water/meth and knock controller: an ESP32-S3 DevKitC-1 with an
+MCP2515 CAN module (`src/main_esp32.cpp`, PlatformIO environment `esp32s3_water_meth`).
+Wiring, parts, bench tests and first start-up checks:
+[docs/ESP32_HARDWARE.md](docs/ESP32_HARDWARE.md).
 
-- **Arduino Nano** (`src/main_nano.cpp`): pump on a mechanical relay; manifold pressure,
-  barometer and RPM from the MicroSquirt's CAN broadcast, as on the ESP32 board (its own
-  MAP sensor is no longer read: October 2026, the owner's choice).
-- **ESP32-S3** (`src/main_esp32.cpp`, the replacement): pump on a MOSFET with PWM,
-  manifold pressure and RPM from the MicroSquirt over CAN, firmware updates from the
-  dash over CAN. See [ESP32-S3 board](#esp32-s3-board-pump-on-a-mosfet-with-pwm) and
-  [docs/ESP32_HARDWARE.md](docs/ESP32_HARDWARE.md). **Knock listening is off on this
-  board for now too** (November 2026, the owner's choice, until the knock amplifier's
-  input works on the bench): `ESP32_KNOCK` in `src/main_esp32.cpp`, 0 by default; add
-  `-DESP32_KNOCK=1` to the `esp32s3_water_meth` build flags to bring it back. As on the
-  Nano, the knock state (`0x307`) goes out marked not enabled and knock commands are
-  refused; injection never depended on knock.
+- **Pump on a MOSFET, full on or full off** in timed pulses, each run started with a
+  short soft ramp of the duty ([include/meth_tune.h](include/meth_tune.h)).
+- **Manifold pressure, RPM, barometer and intake temperature from the MicroSquirt's CAN
+  broadcast** ([include/ecu_broadcast.h](include/ecu_broadcast.h): 0x5E8/0x5E9, or
+  0x5F0/0x5F2). A value older than half a second is not used, and without fresh
+  manifold pressure and RPM the controller does not inject. The dash's `0x309` RPM is the
+  backup for RPM only.
+- **Its own sensors:** intake air before the nozzle (on either of two inputs; the firmware
+  finds which), oil and fuel pressure, tank float, knock.
+- **Firmware updates over CAN** from the dash (`0x680`/`0x681`, module 3), refused while
+  the pump runs or boost is near, with the pump held off during the transfer. The
+  workflow publishes each build as the `watermeth-latest` release, which the dash
+  downloads.
+- **Knock listening is off for now** (November 2026, the owner's choice, until the knock
+  amplifier's input works on the bench): `ESP32_KNOCK` in `src/main_esp32.cpp`, 0 by
+  default; add `-DESP32_KNOCK=1` to the build flags to bring it back. The knock state
+  (`0x307`) goes out marked not enabled and knock commands are refused; injection never
+  depended on knock.
 
-Standalone Arduino Nano firmware for a water/meth controller with:
+Every CAN message, command and setting is in the shared contract, read from
+DIYComfortControlModule (`shared/can_contract`) checked out next to this repository.
 
-- MCP2515 (SPI) CAN bus only
-- Float/temperature/pressure analog sensing; boost from the ECU over CAN (`include/ecu_broadcast.h`)
-- Pump control and failsafe handling
-- Knock DSP detection with CAN telemetry hooks for a remote UI/main controller. **Off
-  on the Nano for now** (November 2026, the owner's choice, to free flash and RAM):
-  `NANO_KNOCK` in `src/main_nano.cpp`, 0 by default; add `-DNANO_KNOCK=1` to the
-  `arduino_nano` build flags to bring it back. The Nano still sends the knock state
-  (`0x307`) marked not enabled, and refuses knock commands.
+## How the pump is run
 
-## Hardware and firmware model
-
-This device does not require a local display. Knock and system observability are exposed over CAN so a separate main controller can render UI and issue tuning commands.
-
-## Pulse tuning (pump switched by a mechanical relay)
-
-The pump is switched directly by a mechanical relay, so flow is set by how long the
-pump runs in each slow cycle, not by PWM. The logic is in
-[include/meth_tune.h](include/meth_tune.h) and is adjustable over CAN (shared contract
-extension 4): commands `0x10` (set one setting) and `0x11` (save / revert / defaults /
-report) on `0x301`, with acknowledgements, settings, status and the two intake
-temperatures reported on `0x30F`.
+The pump is an ordinary diaphragm pump far bigger than the nozzle, so the pressure it
+holds follows its motor voltage: at part duty the nozzle gets part pressure and sprays
+coarsely. So it runs **full on or full off**, and flow is set by how long it runs in each
+cycle (`PulseTiming` and `PulseGovernor` in [include/meth_tune.h](include/meth_tune.h)).
+The settings are changed from the dash (shared contract extension 4: commands `0x10`
+and `0x11` on `0x301`, with acknowledgements, settings, status and the intake
+temperatures reported on `0x30F`; every setting report says the drive is
+`meth_drive::PULSE`, extension 10).
 
 Fixed rules, not adjustable:
 
 - The pump runs for at least 500 ms or not at all, rests for at least 500 ms or stays
   on continuously, and starts at most once per cycle. The cycle cannot be set below
   1000 ms. A pulse that is blocked part-way stays off until the next cycle.
-- No injection without a fresh engine RPM message (`0x309`) at or above the minimum.
+- Every run starts with a soft start: the duty climbs from 5% to full over 0.4 s
+  (longer after a reset that came while the pump ran). A run that carries straight on
+  into the next cycle is not restarted.
+- No injection without fresh engine RPM at or above the minimum.
 - Dose limit: fluid is held to a set percentage of estimated fuel flow, from RPM and
-  manifold pressure (`kFuelGPerMinPerRpmKpa` in meth_tune.h is for a 2.3 L engine).
+  manifold pressure (`kFuelGPerMinPerRpmKpa` in meth_tune.h is for a 2.3 L engine). The
+  flow is the nozzle's rating for the share of the cycle the pump runs.
 - Changing one setting never raises another; values outside the limits are clamped
   and the applied value is acknowledged.
 
@@ -58,9 +61,8 @@ Two optional triggers for cooling, both inside every rule above:
   reaching the full on-time at a second temperature. It only adds to injection that
   is already active.
 
-Until the thermistor before the nozzle is fitted, the temperature features use the
-ECU's intake air temperature, which the dash forwards about four times a second
-(`0x301` command `0x12`, not acknowledged, stale after 1.5 s).
+Without a reading from the sensor before the nozzle, the temperature features use the
+MicroSquirt's intake temperature.
 
 | Setting | Range | Default |
 | --- | --- | --- |
@@ -81,161 +83,52 @@ ECU's intake air temperature, which the dash forwards about four times a second
 | Early start RPM (0 = off) | 0-8000 | 3500 |
 | Hot air adds on-time from (0 = off) | 0-145 C | 0 |
 | Hot air reaches full on-time at | 20-150 C | 70 |
+| Lowest / highest pump duty (settings 18, 19) | 10-100 % | 25 / 50 |
 
-Settings apply at once and are kept in RAM until a SAVE action writes them to EEPROM.
-Injection starts at the start boost and stops 0.6 psi below it.
+Settings 18 and 19 belong to the drive the board had until November 2026 (the pump
+running continuously at a duty that followed boost). They are kept because the CAN
+contract has them, and ignored.
 
-Boost is the ECU's manifold pressure minus its barometer, both from its CAN broadcast
-(0x5E8, or the real-time groups at 0x5F0/0x700). Without a barometer frame the
-manifold pressure with the engine stopped stands in, and the last value is kept in
-EEPROM (addresses 64-66) for a start with the engine already running. No fresh
-manifold pressure (500 ms) means no injection: fault bit 1, 'no manifold pressure'.
-
-A blank or corrupt EEPROM loads the defaults above. The older boost-start command
+Settings apply at once and are kept in RAM until a SAVE action writes them to flash
+(only away from boost). A blank or damaged store loads the defaults above. Injection
+starts at the start boost and stops 0.6 psi below it. The older boost-start command
 (`0x301/0x04`) and the `0x304` configuration frame set the same start-boost value.
 
-Two intake air thermistors (GM-style open-element IAT) report the air temperature
-before (`A1`) and after (`A2`) the nozzle. Wire each as 5 V -> 2.49 kohm -> pin ->
-sensor -> GND.
+## Safety
 
-## ESP32-S3 board: pump on a MOSFET with PWM
-
-Wiring, parts and first start-up checks: [docs/ESP32_HARDWARE.md](docs/ESP32_HARDWARE.md).
-
-What the board does differently, and only this:
-
-- **Pump speed instead of pulses.** The pump runs continuously while injecting, at a
-  duty that follows boost: the lowest duty at start boost, a straight line up to the
-  highest duty at full boost (`PwmGovernor` in [include/meth_tune.h](include/meth_tune.h)).
-  Two settings were added for it (shared contract extension 5); the Nano stores them
-  and ignores them, and the ESP32 ignores the three pulse settings.
-
-  | Setting | Range | Default |
-  | --- | --- | --- |
-  | Lowest pump duty (18) | 10-100 % | 25 |
-  | Highest pump duty (19) | 10-100 % | 50 |
-
-- **Flow is not proportional to duty.** Pressure at the nozzle rises roughly with
-  duty and flow with the square root of pressure, so flow is taken as
-  `nozzle flow x sqrt(duty)`: 25 % duty is about half the nozzle's rating. The dose
-  limit uses the same rule, and when it would need less than the lowest duty the
-  pump stays off (`hold` = dose limit) rather than dribbling.
-- Every other rule is the same: minimum RPM, air-temperature gate, longest spray and
-  rest, early start and hot air (they ask for duty, not on-time), overboost assist,
-  dose limit and the cap from the dash. "On-time growth" becomes the time the duty may
-  take to climb from lowest to highest.
-- The status frame on `0x30F` reports the pump as on-time out of a period of 1000:
-  the duty in tenths of a percent.
-- **Manifold pressure, RPM, barometric pressure and intake temperature come straight
-  from the MicroSquirt's CAN broadcast** ([include/ecu_broadcast.h](include/ecu_broadcast.h):
-  0x5E8/0x5E9, or 0x5F0/0x5F2). A value older than half a second is not used, and
-  without fresh manifold pressure and RPM the controller does not inject. The dash's
-  `0x309` RPM is the backup for RPM only.
-- Knock, pressures and temperatures are sampled by the ADC's own timer
-  ([src/adc_sampler.cpp](src/adc_sampler.cpp)), the knock input 38 thousand times a
-  second.
-- **Knock is listened for on every sample**, not one burst in six
-  ([include/knock_dsp.h](include/knock_dsp.h)): band-pass filters on the cylinder's two
-  resonances, a window the length of one knock slid over every 20 ms, and a hit that
-  has to be loud for this RPM, narrow-band and a burst. The settings (multiplier,
-  offset, frequency, band width) and what the dash is sent mean the same as on the Nano.
-  The filters and spectra run through ESP-DSP (the S3's vector instructions), checked
-  against the portable code at every start.
-- **The real knock frequency is found from the spectrum** ([include/knock_spectrum.h](include/knock_spectrum.h)):
-  600 spectra a second; the filter starts on the bore's figure and is moved to where
-  the engine actually rings, learned only from bursts under boost that rise above
-  normal, so not from valve noise, block resonances or steady tones. Kept in flash.
-- **The dash's knock page shows what the controller hears** (`0x30E`): the spectrum,
-  where the filter is and where the engine rings, the amplifier gain and the size of
-  the signal. Every knock setting can be changed from there and is saved in flash.
-- **The knock amplifier's gain is set automatically** through an X9C104 digital
-  potentiometer ([include/knock_agc.h](include/knock_agc.h), [include/x9c.h](include/x9c.h)):
-  normal engine noise is kept in the lower part of the ADC's range at every RPM, with
-  room above it for knock, and the detector's learned levels follow each gain change.
-  It measures against the amplifier's real limits at the ADC pin, so an amplifier that
-  rests off-centre or comes through a divider needs only those two numbers.
-  Circuit, bench test, and what the LTspice simulation of it shows when replayed
-  through this code ([tools/ltspice](tools/ltspice)): [docs/ESP32_HARDWARE.md](docs/ESP32_HARDWARE.md).
-- Settings are saved in the ESP32's flash instead of EEPROM.
-- **Firmware updates over CAN** from the dash (`0x680`/`0x681`, module 3), refused
-  while the pump runs or boost is near, with the pump held off during the transfer.
-- If the main loop stops, the pump is switched off within 0.25 s; a watchdog then
-  restarts the board. An optional master relay output opens the pump's 12 V feed
-  whenever no spray is under way, against a MOSFET that has failed switched on.
-
-## Sensors and control
-
-### Controller UI pump test and tank protection
-
-Update both the ESP32 controller and Nano firmware for these controls. On the
-METH page, disarm injection and hold **HOLD: TEST 5s** to run the relay-driven
-pump at 100% for at most five seconds. **STOP PUMP** cancels the test and disarms
-normal injection. A three-second cooldown prevents immediate repeated tests.
-The Nano also enforces its own timeout if the UI or CAN connection fails.
-Route the nozzle into a suitable container before testing: this operates the
-real pump and sprays fluid.
-
-Hold **TANK GUARD** while stopped/disarmed to bypass only the float protection;
-the button then reads **BYPASS!**. Hold again to restore protection. The choice
-is not saved and defaults to protection enabled after restart. With bypass on,
-the pump can run with an empty tank; verify fluid yourself. MAP and other
-reported faults still block operation. Wait for fresh Nano status after changing
-the guard before arming/testing. Older Nano firmware ignores the bypass flag.
-
-The two-wire float is on **D3 to GND**, with an internal pull-up. The documented
-active-low setting means **closed/LOW = low fluid**, **open/HIGH = fluid OK**.
-This is a binary switch, not a percentage-level sender; the UI now displays
-**LOW / OK**, or **--** while offline. CAN still carries 0/100 for compatibility.
-If LOW never changes, inspect D3 and the switch continuity in both float positions.
-The Nano serial heartbeat at 115200 baud now prints `floatD3` and `lowWhen` beside
-`tankLow` to distinguish the electrical input from the debounced result. A switch
-that closes when full has the opposite polarity to this configuration; do not
-reverse the firmware setting without verifying both float positions.
-
-The previous controller Arm gate required IAT and meth-pressure validity even
-though both channels are disabled in the supplied Nano pin map. Arm now follows
-the Nano's boost-mode MAP/fault status and tank protection instead. Rejections
-are displayed as offline, low tank, or module fault.
-
-Periodic disarmed configuration broadcasts previously cancelled manual tests.
-They now preserve an active test; explicit ARM/DISARM/STOP and the local timeout
-still cancel it, and repeated test commands cannot restart its timer.
-
-Implemented analog channels:
-
-- MAP/boost sensor
-- IAT, engine bay, cabin, ambient thermistors
-- Oil/fuel/meth/boost-ref pressure transducers
-- Optional spare pressure channels
-
-The firmware performs conversion, smoothing, and fault detection on all supported channels.
+- If the main loop stops setting the pump, the CAN task switches it off within 0.25 s;
+  a watchdog then restarts the board. A crash switches the pump off before anything
+  else. Repeated crashes hold injection off for a while, longer each time.
+- Silence on CAN: the controller is set up again after 1.5 s, the board restarted after
+  15 s (three times per ignition at most).
+- After a crash, a supply dip or its own recovery restart the board comes back armed if
+  it was, sends a start report (`0x302` code `0x0A`) and its black box of the last 10 s
+  (`0x310`).
+- Tank float protection, the pump test's own timeout, and the dash's arm and test gates.
+- The board's own RGB LED shows the state: green ready, blue spraying, red flashing for
+  something to fix ([docs/ESP32_HARDWARE.md](docs/ESP32_HARDWARE.md#the-led-on-the-board)).
 
 ## CAN bus interface
 
-Schema 2 uses the canonical shared header. Command/knock ACKs are now on
-`0x30A`; `0x306` is reserved for configuration broadcast ACKs. Update the main
-controller and Nano together. See [CAN audit](../../docs/CAN_COMPATIBILITY_AUDIT.md).
+Classical CAN, 500 kbit/s, standard IDs, schema 2 of the shared header. Command and
+knock acknowledgements are on `0x30A`; `0x306` is for configuration broadcast
+acknowledgements.
 
-Existing controller frames:
+Sent by this controller:
 
-- `0x300` `ID_ENGINE_METH_STATE`
-- `0x303` `ID_ENGINE_SENSOR_EXT`
-- `0x307` `ID_ENGINE_KNOCK_STATE`
-- `0x308` `ID_ENGINE_KNOCK_FAULT`
+- `0x300` meth state, `0x303` extended sensors, `0x307` knock state, `0x308` knock
+  faults, `0x30B` knock live hook, `0x30C`/`0x30D` knock configuration pages, `0x30E`
+  knock detail, `0x30F` pulse tuning, `0x302` start report, `0x310` black box, `0x681`
+  firmware update replies.
 
-Engine context input:
+Received:
 
-- `0x309` `ID_ENGINE_RUNTIME`, received by this module for knock arming context
+- MicroSquirt broadcast (above), `0x309` engine runtime from the dash (RPM backup),
+  `0x301` commands, `0x304` configuration, `0x305` configuration requests, `0x680`
+  firmware update.
 
-`0x309` engine runtime payload:
-
-- `B0` RPM low byte
-- `B1` RPM high byte
-- `B2` optional absolute MAP kPa from the sender
-- `B3` optional validity flags: bit0 RPM valid, bit1 MAP valid
-- Remaining bytes reserved
-
-For `0x300` and knock event payloads, boost fields are gauge boost in kPa, clamped to `0` below local barometric pressure. Absolute MAP is used internally for sensor validation and knock arming, but is not sent as the CAN boost byte.
+For `0x300` and knock event payloads, boost fields are gauge boost in kPa, clamped to
+`0` below the barometer.
 
 `0x307` knock state payload, sent every 50 ms:
 
@@ -246,293 +139,77 @@ For `0x300` and knock event payloads, boost fields are gauge boost in kPa, clamp
 - `B4` event count, wraps 0-255
 - `B5` last event RPM / 100
 - `B6` last event boost kPa
-- `B7` reserved, sent as 0
+- `B7` the share of the sound in the knock band
 
-`0x308` knock fault payload:
+`0x308` knock fault payload: `B0` fault code, `B1` severity, `B2` data0, `B3` data1.
 
-- `B0` fault code
-- `B1` severity
-- `B2` data0
-- `B3` data1
+`0x30B` payload: `B0` flags (bit0 enabled, bit1 armed, bit2 detected, bit3 sensorFault,
+bit4 clipping, bit5 warning, bit6 critical, bit7 baselineLearned), `B1` live knock
+level, `B2` adaptive threshold, `B3` adaptive baseline, `B4` event count, `B5` resting
+level (counts of a 10-bit ADC on 5 V, /16), `B6` raw sample /16, `B7` largest swing.
 
-On the Nano firmware, knock processing is local: raw ADC bias removal, tunable gain, rectified envelope tracking, learned noise baseline, and adaptive thresholding. CAN tuning commands update the live processor for enable, threshold offset, adaptive multiplier, debounce, gain, and related config broadcasts. RPM is received over CAN on `0x309`; local MAP plus CAN RPM are used as knock arming gates, and `0x307` byte 5 reports last-event RPM / 100.
+`0x30C` payload: `B0` flags (bit0 enabled, bit1 autoCenterFromBore), `B1` threshold
+offset, `B2` adaptive multiplier x10, `B3` min RPM /100, `B4` min MAP kPa, `B5` debounce
+ms /10, `B6` gain x10, `B7` centre frequency /100 Hz.
 
-Added knock UI hook frames for remote display/debug:
+`0x30D` payload: `B0` bandwidth /100 Hz, `B1` sample rate /100 Hz, `B2` samples per
+update, `B3` bias alpha x1000, `B4` RMS alpha x100, `B5` envelope alpha x100, `B6` bore
+mm, `B7` reserved.
 
-- `0x30B` knock live hook frame
-- `0x30C` knock config page 1
-- `0x30D` knock config page 2
+Knock tuning commands on `0x301`: `0x40` enable, `0x41` threshold offset, `0x42`
+adaptive multiplier x10, `0x43` minimum RPM /100, `0x44` minimum MAP kPa, `0x45`
+debounce ms /10, `0x46` gain x10, `0x47` centre frequency /100 Hz, `0x48` bandwidth
+/100 Hz, `0x49` frequency from the bore or found from the engine, `0x4A` clear knock
+events; `0x4B`-`0x4D` amplifier gain, bore and frequency search (extension 6).
+Replies on `0x30A`: `B0` command, `B1` status (`0` OK, `1` unsupported, `2` invalid
+length, `3` value clamped), `B2` applied value, `B3` schema version.
 
-`0x30B` payload:
+## Knock listening (when built in)
 
-- `B0` flags: bit0 enabled, bit1 armed, bit2 detected, bit3 sensorFault, bit4 clipping, bit5 warning, bit6 critical, bit7 baselineLearned
-- `B1` live knock RMS
-- `B2` adaptive threshold
-- `B3` adaptive baseline
-- `B4` event count
-- `B5` bias ADC (scaled /16)
-- `B6` raw ADC (scaled /16)
-- `B7` envelope level
+Every sample, 38 thousand a second, goes through band-pass filters on the cylinder's
+two resonances ([include/knock_dsp.h](include/knock_dsp.h)); the real knock frequency is
+found from the spectrum ([include/knock_spectrum.h](include/knock_spectrum.h)) and the
+amplifier's gain is set automatically through an X9C104 digital potentiometer
+([include/knock_agc.h](include/knock_agc.h), [include/x9c.h](include/x9c.h)). The
+circuit, its bench tests and what the owner's LTspice simulation shows when replayed
+through this code ([tools/ltspice](tools/ltspice)) are in
+[docs/ESP32_HARDWARE.md](docs/ESP32_HARDWARE.md).
 
-`0x30C` payload:
+## Tests
 
-- `B0` config flags: bit0 enabled, bit1 autoCenterFromBore
-- `B1` threshold offset
-- `B2` adaptive multiplier x10
-- `B3` min RPM /100
-- `B4` min MAP kPa
-- `B5` debounce ms /10
-- `B6` gain x10
-- `B7` center frequency /100 Hz
-
-`0x30D` payload:
-
-- `B0` bandwidth /100 Hz
-- `B1` sample rate /100 Hz
-- `B2` samples per update
-- `B3` bias alpha x1000
-- `B4` RMS alpha x100
-- `B5` envelope alpha x100
-- `B6` bore mm
-- `B7` reserved
-
-Knock tuning commands are accepted on `ID_ENGINE_METH_COMMAND` (`0x301`) with these command bytes:
-
-- `0x40` set enable (`B1`: 0/1)
-- `0x41` set threshold offset (`B1`)
-- `0x42` set adaptive multiplier x10 (`B1`)
-- `0x43` set minimum RPM /100 (`B1`)
-- `0x44` set minimum MAP/boost kPa (`B1`)
-- `0x45` set debounce ms /10 (`B1`)
-- `0x46` set gain x10 (`B1`)
-- `0x47` set center frequency /100 Hz (`B1`)
-- `0x48` set bandwidth /100 Hz (`B1`)
-- `0x49` set auto frequency from bore (`B1`: 0/1)
-- `0x4A` clear knock events/fault latch
-
-Config requests sent on `0x305` trigger the module to rebroadcast `0x30C` and `0x30D`. Runtime command responses are sent on `0x30A` as:
-
-- `B0` command byte
-- `B1` status (`0` OK, `1` unsupported, `2` invalid length, `3` value clamped)
-- `B2` applied value
-- `B3` schema version
-
-## Knock listening on the Nano
-
-The Nano build uses [include/knock_band.h](include/knock_band.h). (The larger
-`knock_detector_logic` / `knock_monitor` sources in this repo are not part of the Nano
-build; see `build_src_filter` in platformio.ini.)
-
-Each 20 ms loop pass takes one burst from the knock amplifier on `A5`: 64 samples at
-19.2 kHz (ADC free-running, /64 clock), 3.3 ms. The burst is measured with integer
-Goertzel filters:
-
-- **level**: amplitude in the knock band, five 300 Hz bins around the centre frequency
-- **share**: the band's share of the burst's total energy (ringing is narrow, engine
-  noise is broadband)
-- **peak** and **bias**: largest swing and resting level, for checking the amplifier
-
-The centre frequency comes from the bore, `f = 1800 / (pi * bore_mm)` kHz: about
-6.0 kHz for the 96 mm bore of the Ford 2.3 L Lima this build defaults to. It can be set
-over CAN in 300 Hz steps from 2.4 to 7.8 kHz.
-
-The detector learns the normal level per 1000 RPM and calls a hit only when the level
-exceeds `learned * multiplier + offset` and the share is high enough. Two hits within
-0.6 s raise a warning; a strong, clearly narrow hit is critical at once. Knock-like
-bursts are never learned as normal. Readings are judged only while armed (enabled,
-RPM and MAP above their minimums, sensor not clipping and resting near mid-scale).
-
-Limits: the bursts are not timed to combustion (the Nano has no crank or ignition
-signal), so single knock events are caught about one time in four and sustained knock
-within a fraction of a second. Nothing here retards timing.
-
-`0x307` carries level, learned level, threshold and, in its spare byte, the share.
-`0x30B` carries the resting level and the largest swing.
-
-## Serial (optional)
-
-Serial knock commands are still available for bench bring-up, but the intended production path is CAN-based hooks and commands.
-
-## Runtime hardening for automotive conditions
-
-The firmware includes additional resilience measures for noisy and transient environments:
-
-- Boost hysteresis and latch logic to prevent rapid on/off pump chatter near threshold.
-- CAN command timeout fail-safe: if the master controller stops sending updates, the module disarms and exits manual test mode.
-- MCP2515 recovery loop: repeated CAN TX errors mark CAN offline and trigger periodic re-init attempts.
-- Knock config input sanitation for both serial and CAN tuning commands (range-constrained values).
-- Analog critical fault shutdown (IAT, engine bay temp, meth pressure channels): pump output is forced off until faults clear.
-
-## Unit tests
-
-Host-side unit tests were added for knock detector logic in [test/test_knock_detector/test_main.cpp](test/test_knock_detector/test_main.cpp), covering:
-
-- no signal
-- normal vibration below threshold
-- random noise
-- true knock burst at target frequency
-- wrong-frequency burst rejection
-- changing bias
-- knock below RPM/MAP arm threshold
-- knock while armed
-
-Run tests:
+The logic that decides what the pump does is pure C++ with no Arduino calls, tested on
+a PC. The workflow runs every one of these on each change:
 
 ```bash
-platformio test -c platformio-tests.ini -e native_knock_tests
+for name in test_meth_tune test_meth_pulse test_esp32_inputs test_reset_guard test_black_box \
+            test_status_light test_knock_agc test_knock_dsp test_knock_spectrum; do
+  g++ -std=c++11 -O2 -Wall -I include test/$name/test_main.cpp -o /tmp/$name && /tmp/$name
+done
+g++ -std=c++11 -O2 -Wall -I include test/test_injection_controller/test_main.cpp \
+    src/injection_controller.cpp src/app_config.cpp -o /tmp/injection && /tmp/injection
 ```
 
-The ESP32 board's logic has host tests too: the PWM pump rules
-([test/test_meth_pwm/test_main.cpp](test/test_meth_pwm/test_main.cpp)) and the ECU
-broadcast decoding and sensor scaling
-([test/test_esp32_inputs/test_main.cpp](test/test_esp32_inputs/test_main.cpp)), and the
-crash-loop guard that holds injection off after repeated crashes
-([test/test_reset_guard/test_main.cpp](test/test_reset_guard/test_main.cpp)).
+- `test_meth_tune`: the pulse timing, RPM and temperature gates, dose limit, spray time
+  limit, ramp, early start, hot air, setting limits and the thermistor curve.
+- `test_meth_pulse`: full on or off, the soft start at each start and not between
+  cycles of one run, the dose limit by time, the pump test.
+- `test_esp32_inputs`: the ECU broadcast, the pressure and temperature conversions, the
+  intake sensor found on either input, the float switch.
+- `test_reset_guard`, `test_black_box`, `test_status_light`: recovery after resets, the
+  black box, the LED.
+- `test_knock_*`: the knock listening, frequency finder and automatic gain.
+- `test_injection_controller`: arming, tank and sensor failsafes, overboost.
 
-```bash
-g++ -std=c++11 -I include test/test_meth_pwm/test_main.cpp -o meth_pwm_test && ./meth_pwm_test
-g++ -std=c++11 -I include test/test_esp32_inputs/test_main.cpp -o esp32_inputs_test && ./esp32_inputs_test
-g++ -std=c++11 -I include test/test_reset_guard/test_main.cpp -o reset_guard_test && ./reset_guard_test
-```
-
-The knock spectrum and frequency finder ([test/test_knock_spectrum/test_main.cpp](test/test_knock_spectrum/test_main.cpp)):
-the spectrum's accuracy, resonances above and below the bore's figure found and
-followed, and the things that must not move the filter (noise, valve clicks, a block
-resonance on every firing, a steady tone, ringing off boost or out of range, two rival
-ringings).
-
-The ESP32's knock listening ([test/test_knock_dsp/test_main.cpp](test/test_knock_dsp/test_main.cpp)):
-filter accuracy and selectivity at several sample rates, single knocks at random
-moments, sustained knock, false alarms over ten simulated minutes, a noise floor that
-rises without being knock, and knock caught right after a gain change. And the
-automatic knock gain with its potentiometer driver
-([test/test_knock_agc/test_main.cpp](test/test_knock_agc/test_main.cpp)): convergence
-without hunting, clipping, knock not steering the gain, gain remembered per RPM, a dead
-sensor, a potentiometer that does nothing, and a part with fewer steps than its
-datasheet says.
-
-```bash
-g++ -std=c++11 -O2 -I include test/test_knock_spectrum/test_main.cpp -o knock_spectrum_test && ./knock_spectrum_test
-g++ -std=c++11 -O2 -I include test/test_knock_dsp/test_main.cpp -o knock_dsp_test && ./knock_dsp_test
-g++ -std=c++11 -I include test/test_knock_agc/test_main.cpp -o knock_agc_test && ./knock_agc_test
-```
-
-The knock listening logic has a host test
-([test/test_knock_band/test_main.cpp](test/test_knock_band/test_main.cpp)) with
-synthetic engine noise and knock: frequency selectivity, integer overflow, learning
-per RPM, false alarms over twenty simulated minutes and catch rate.
-
-```bash
-platformio test -c platformio-tests.ini -e native_knock_band_tests
-# or directly:
-g++ -std=c++11 -I include test/test_knock_band/test_main.cpp -o knock_band_test && ./knock_band_test
-```
-
-The pulse tuning logic has its own host test
-([test/test_meth_tune/test_main.cpp](test/test_meth_tune/test_main.cpp)): relay rate
-rules, RPM and temperature gates, dose limit, spray time limit, ramp, early start,
-hot-air addition, setting limits and the thermistor curve.
-
-```bash
-platformio test -c platformio-tests.ini -e native_meth_tune_tests
-# or directly:
-g++ -std=c++11 -I include test/test_meth_tune/test_main.cpp -o meth_tune_test && ./meth_tune_test
-```
-
-## Knock tuning workflow
-
-Use this sequence when calibrating a new engine/setup:
-
-1. Log normal engine noise with no knock.
-2. Find the baseline envelope/RMS level in your operating range.
-3. Set threshold above baseline.
-4. Test under different RPM and load ranges.
-5. Adjust center frequency and bandwidth until true knock is captured while false positives are minimized.
-
-The current knock path enforces knock-sensor datasheet constraints in firmware:
-
-- knock frequency window constrained to 3-25 kHz
-- runtime center frequency constrained to sensor range and ADC/Nyquist headroom
-- temperature compensation start points constrained to -40 to 150°C
-- default temperature compensation slope derived from 0.04 mV/g°C @ 26 mV/g sensitivity
+`platformio-tests.ini` has the same as PlatformIO native environments.
 
 ## Build and upload
 
-The default environment is `arduino_nano` (115200 baud). The ESP32-S3 board is the
-environment `esp32s3_water_meth`: pick it in the PlatformIO toolbar, or
-
 ```bash
-platformio run -e esp32s3_water_meth -t upload
+platformio run -t upload            # esp32s3_water_meth, the default
+platformio run -e esp32s3_safety_test -t upload   # bench: make it fail on purpose
 ```
 
-Both need DIYComfortControlModule checked out next to this repository (the shared CAN
-contract is read from it).
-
-```bash
-platformio run
-platformio run -t upload
-```
-
-For a clone with the old bootloader, change `upload_speed` in `platformio.ini`
-to `57600`. Host test environments live separately in `platformio-tests.ini`.
-
-### The Nano is full
-
-With pulse tuning and knock listening the Nano firmware is close to the board's limits
-(30,720 bytes of flash, 2,048 bytes of RAM). Three things keep it inside them:
-
-- Build options in `platformio.ini` (no function inlining, shared entry/exit code,
-  short jumps, small serial buffers). Leave them in place.
-- The long serial diagnostics (CAN register dumps, the loopback self-test, the full
-  once-a-second line) are compiled only with `-DNANO_VERBOSE_SERIAL=1`, which does not
-  fit a Nano. The default prints short lines: `CAN: MCP2515 ready`, a line for each
-  failed transmission, and once a second
-  `HB map=98 boostX10=-3 baro=100 rpm=850 pump=0 hold=1 mode=0 tankLow=0 can=1 oil=42 fuel=40 knock=0`
-  (map and baro in kPa, boost in tenths of a psi, pressures in psi, `!` after a value
-  that is not valid).
-- The two pressure sensors that were never fitted (meth pressure, boost reference) no
-  longer have objects in RAM; they are reported as not fitted, as before.
-
-After a build PlatformIO prints the flash and RAM used. If flash passes about 97% or
-RAM about 82%, something has to go before adding more to this board.
-
-Nano wiring used by the firmware:
-
-| Signal | Nano pin | Wiring notes |
-| --- | --- | --- |
-| MAP analog input | `A0` | GM 3-bar MAP through 10k/20k divider. Avoid `A4` because it is SDA and can be biased by I2C pull-ups. |
-| Knock analog input | `A5` | Knock sensor through an amplifier that rests near 2.5 V and swings both ways (AC signal, not an envelope). |
-| Air temperature before the nozzle | `A1` | GM-style IAT thermistor to GND, 2.49 kohm pull-up to 5 V. |
-| Air temperature after the nozzle | `A2` | GM-style IAT thermistor to GND, 2.49 kohm pull-up to 5 V. |
-| Oil pressure analog input | `A6` | 0.5-4.5 V, 0-100 psi sensor through 10k/20k divider. Analog-input only pin. |
-| Fuel pressure analog input | `A7` | 0.5-4.5 V, 0-100 psi sensor through 10k/20k divider. Analog-input only pin. |
-| Float switch | `D3` | Active low; wire switch to ground, firmware uses internal pull-up. |
-| Pump relay output | `D2` | Drives relay/control input. Use a relay/transistor module appropriate for the pump current. |
-| Warning LED output | `D7` | Active high warning output. |
-| Bench-test button | `D9` | Active low with internal pull-up; currently reserved for bench bring-up. |
-| MCP2515 CAN CS | `D10` | SPI chip select. |
-| MCP2515 CAN INT | `D8` | MCP2515 interrupt pin. Firmware also polls receive status. |
-| MCP2515 CAN MOSI/SI | `D11` | Nano hardware SPI MOSI to MCP2515 SI. |
-| MCP2515 CAN MISO/SO | `D12` | Nano hardware SPI MISO from MCP2515 SO. |
-| MCP2515 CAN SCK | `D13` | Nano hardware SPI clock. |
-| MCP2515 VCC/GND | `5V` / `GND` | Match your MCP2515 module requirements and share ground with the display/comfort module. |
-| CANH/CANL | MCP2515 transceiver | Wire CANH to CANH and CANL to CANL on the other module; use proper bus termination. |
-
-Disabled/unwired in the current Nano firmware:
-
-- Meth pressure input: disabled (`-1`)
-- Boost reference pressure input: disabled (`-1`)
-- Spare pressure inputs: disabled (`-1`)
-- IAT, engine bay, cabin, ambient, and DHT inputs: disabled (`-1`)
-
-The firmware initializes the MCP2515 at `500 kbps` with the common `8 MHz` CAN module crystal setting. It prints received CAN frames to serial and transmits protocol-matched `0x300` meth state, `0x307` knock state, and `0x30B` knock hook frames every 50 ms, `0x303` extended sensor frames every 250 ms, and `0x30C`/`0x30D` knock config pages every 1 s. The `0x303` pressure bytes use psi x2 encoding, so one count is 0.5 psi.
-
-Pressure transducers default to 0.5-4.5 V, 0-100 PSI linear sensors through a 10k/20k divider, so 5 V sensor output becomes about 3.33 V at the Nano ADC.
-
-The GM 3-bar MAP input also defaults to a 10k/20k divider. Firmware reconstructs the sensor-side 0.5-4.5 V signal before converting to absolute kPa.
-
-On a one-node bench setup, MCP2515 transmit can report failure because no other CAN node ACKs the frame. The firmware logs counted TX failures without reinitializing the controller, so it can keep servicing RX and will recover once a terminated, powered second node is present.
-
-For CAN debugging, the Nano firmware logs every RX frame, every TX attempt with result code, init bitrate/clock/mode results, and periodic MCP2515 health (`CANSTAT`, `INTF`, read `STAT`, `EFLG`, `REC`, `TEC`, INT pin level). A received `0x305` should immediately be followed by TX attempts for `0x30C` and `0x30D`.
-
-The Nano profile builds a reduced firmware (`main_nano.cpp` + `sensors_nano.cpp`) so it fits ATmega328P flash/RAM.
+The bench test environments (`esp32s3_pump_test`, `esp32s3_inputs_test`,
+`esp32s3_knock_test`, `esp32s3_knock_gain_test`, `esp32s3_safety_test`) are described
+in [docs/ESP32_HARDWARE.md](docs/ESP32_HARDWARE.md). Flash `esp32s3_water_meth` again
+afterwards. In the car, new builds go in from the dash over CAN.
