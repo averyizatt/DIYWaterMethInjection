@@ -100,6 +100,7 @@ void rampClimbsFromTheMinimumDuty() {
   s.value[kRampMs] = 1000;   // One second from 25% to 50%
   s.value[kRestS] = 0;
   PwmGovernor g;
+  g.setSoftStartMs(0);       // The ramp alone (the soft start is tested below)
   run(g, s, 0, 500, idle());
   const float first = g.update(500, s, spraying(12.0f));
   check(near(first, 25.0f, 1.0f), "starts at the minimum duty, not below it and not at full");
@@ -173,10 +174,65 @@ void earlyStartAndHotAirAddInsideTheLimits() {
 void pumpTestRunsAtTheDutyAsked() {
   const Settings s = defaults();
   PwmGovernor g;
+  g.setSoftStartMs(0);
   check(g.manual(0, s, 0) == 0.0f, "0%: off");
   check(near(g.manual(20, s, 5), 10.0f), "a very low test still turns the pump: 10%");
   check(near(g.manual(40, s, 60), 60.0f) && near(g.manual(60, s, 100), 100.0f), "the duty asked for");
   check(g.hold() == kHoldNone, "a test has no hold reason");
+  PwmGovernor soft;   // The default soft start
+  check(near(soft.manual(1000, s, 100), kSoftStartFloorPct, 0.1f), "a test starts softly too");
+  check(near(soft.manual(1200, s, 100), 52.5f, 0.5f) && near(soft.manual(1400, s, 100), 100.0f), "and is at full after the soft start");
+}
+
+void softStartFromRestAndARestBetweenRuns() {
+  Settings s = defaults();
+  s.value[kRampMs] = 0;
+  s.value[kMaxDutyPct] = 100;
+  s.value[kRestS] = 0;
+  PwmGovernor g;
+  check(g.softStartMs() == kSoftStartMs && kSoftStartMs == 400, "the soft start is 0.4 s unless the firmware lengthens it");
+  run(g, s, 0, 500, idle());
+  const float first = g.update(500, s, spraying(12.0f));
+  check(first > 0.0f && near(first, kSoftStartFloorPct, 0.1f) && g.softStarting(500), "a start begins at the floor, not at full");
+  check(first < s.value[kMinDutyPct], "under the minimum duty while it spins up: that is allowed");
+  check(near(run(g, s, 520, 720, spraying(12.0f)), 52.5f, 1.0f), "half way up after half the soft start");
+  check(near(run(g, s, 720, 1000, spraying(12.0f)), 100.0f) && !g.softStarting(980), "all of it once the soft start is over");
+  check(near(g.update(1000, s, spraying(5.0f)), 25.0f), "falling is immediate, soft start or not");
+  check(g.update(1020, s, idle()) == 0.0f, "and stopping is immediate");
+  check(run(g, s, 1040, 1520, spraying(12.0f)) == 0.0f && g.hold() == kHoldBelowBoost,
+        "no new start within half a second of a stop; the reason it stopped is still given");
+  const float again = run(g, s, 1520, 1560, spraying(12.0f));
+  check(again > 0.0f && again < 15.0f, "then it starts again, softly");
+  // A low duty is reached early in the soft start and not passed.
+  s.value[kMaxDutyPct] = 30;
+  PwmGovernor low;
+  check(near(run(low, s, 0, 200, spraying(12.0f)), 30.0f) && low.hold() == kHoldNone, "a low duty: reached early, never passed");
+  // Lengthened after a reset with the pump running: still climbing at the old end.
+  s.value[kMaxDutyPct] = 100;
+  PwmGovernor gentle;
+  gentle.setSoftStartMs(1600);
+  check(run(gentle, s, 0, 420, spraying(12.0f)) < 35.0f, "a longer soft start climbs more slowly");
+  check(near(run(gentle, s, 420, 1700, spraying(12.0f)), 100.0f), "and gets there in its own time");
+}
+
+void doseLimitEdgeDoesNotChatter() {
+  Settings s = defaults();   // 25% minimum, at most 10% of fuel, 60 ml/min nozzle
+  s.value[kRampMs] = 0;
+  s.value[kMinRpm] = 0;
+  s.value[kRestS] = 0;
+  PwmGovernor g;
+  g.setSoftStartMs(0);
+  // 3481 RPM at 100 kPa: about 306 g/min of fuel, 30.6 ml/min allowed: 26% duty.
+  Inputs edge = spraying(6.0f, 3481);
+  edge.mapKpa = 100.0f;
+  check(near(doseLimitDuty(s, 3481, 100.0f), 26.0f, 0.3f), "the edge: the limit allows just over the minimum");
+  check(run(g, s, 0, 500, edge) == 0.0f && g.hold() == kHoldDoseLimit, "just over the minimum is not enough to start a run");
+  check(run(g, s, 500, 1000, spraying(6.0f, 6000)) > 0.0f, "plenty of airflow: it runs");
+  check(near(run(g, s, 1000, 1500, edge), 26.0f, 0.5f) && g.hold() == kHoldNone, "once running it carries on at the limit");
+  Inputs under = spraying(6.0f, 3300);   // 23%: under the minimum
+  under.mapKpa = 100.0f;
+  check(run(g, s, 1500, 1600, under) == 0.0f && g.hold() == kHoldDoseLimit, "under the minimum it stops");
+  check(run(g, s, 1600, 2600, edge) == 0.0f, "and back at the edge it does not start again");
 }
 } // namespace
 
@@ -189,6 +245,8 @@ int main() {
   doseLimitCapsDutyAndBelowTheMinimumMeansNothing();
   earlyStartAndHotAirAddInsideTheLimits();
   pumpTestRunsAtTheDutyAsked();
+  softStartFromRestAndARestBetweenRuns();
+  doseLimitEdgeDoesNotChatter();
   if (failures) {
     printf("%d meth PWM test(s) failed\n", failures);
     return 1;

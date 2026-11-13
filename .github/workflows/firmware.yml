@@ -52,8 +52,11 @@ jobs:
       - name: Host tests
         working-directory: DIYWaterMethInjection
         run: |
-          for name in test_meth_tune test_meth_pwm test_esp32_inputs test_knock_band test_knock_agc test_knock_dsp test_knock_spectrum; do
-            g++ -std=c++11 -O2 -Wall -I include test/$name/test_main.cpp -o /tmp/$name && /tmp/$name
+          # Two commands, not "g++ ... && test": under bash -e a test that no longer compiled
+          # would then be skipped without failing the run.
+          for name in test_meth_tune test_meth_pwm test_esp32_inputs test_reset_guard test_knock_band test_knock_agc test_knock_dsp test_knock_spectrum; do
+            g++ -std=c++11 -O2 -Wall -I include test/$name/test_main.cpp -o /tmp/$name
+            /tmp/$name
           done
           # The LTspice replay tool uses the firmware's own headers: it must keep building.
           g++ -std=c++17 -O2 -Wall -I include tools/ltspice/ltreplay.cpp -o /tmp/ltreplay
@@ -69,7 +72,14 @@ jobs:
 
       - name: Build the bench tests
         working-directory: DIYWaterMethInjection
-        run: pio run -e esp32s3_pump_test -e esp32s3_knock_gain_test -e esp32s3_knock_test
+        run: pio run -e esp32s3_pump_test -e esp32s3_knock_gain_test -e esp32s3_knock_test -e esp32s3_inputs_test -e esp32s3_safety_test
+
+      # Knock listening is off in the published firmware for now (ESP32_KNOCK, the owner's
+      # choice until the amplifier works on the bench). It is built here with knock on as
+      # well, so the code keeps compiling while it is off. Not published.
+      - name: Build the ESP32-S3 firmware with knock on
+        working-directory: DIYWaterMethInjection
+        run: PLATFORMIO_BUILD_FLAGS="-DESP32_KNOCK=1" pio run -e esp32s3_water_meth
 
       # The build number the controller reports to the dash: the first eight hex digits of the commit.
       - name: Build the ESP32-S3 firmware

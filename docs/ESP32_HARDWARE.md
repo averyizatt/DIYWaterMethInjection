@@ -129,18 +129,42 @@ one before it failing too:
 | A processor sticks with interrupts off | The interrupt watchdog restarts the board | 300 ms |
 | A crash (exception, either watchdog) | The pump and relay outputs go low at once, before the crash report and core dump are written to flash; then the reset | at once |
 | Any restart, asked for or not | The same, before the restart | at once |
-| The supply dips (cranking) | The brownout detector resets the board instead of letting it run on bad power | at once |
+| The supply dips (cranking, or the pump starting) | The brownout detector resets the board instead of letting it run on bad power | at once |
 | During and after any reset | The pins float: the 10 k pull-downs hold the MOSFET and the relay off | always |
 | The MOSFET fails switched on | The master relay opens 3 s after the spray ends | 3 s |
 | The ECU's broadcast stops or goes bad | No injection without fresh manifold pressure and RPM | 0.5 s |
+| The CAN controller loses its settings or goes bus-off | Set up again | 1 s |
+| The CAN bus goes silent (the controller, its wiring or its SPI line stops working, however right its registers look) | Set up again every 2 s while nothing at all is heard; still nothing after 15 s, the whole board restarts (three times at most per ignition cycle). Only once the bus has worked since the ignition came on: on the bench with nothing connected it is left alone | 1.5 s, then 15 s |
 | A broken float-switch wire | Reads as an empty tank: no injection | 2 s |
 | Spraying runs on (a stuck reading) | The longest continuous spray setting (12 s by default), then a rest | setting |
 | The ADC stops delivering | Restart, twice at most per ignition cycle; after that the board carries on without it: knock (when built in) reports a sensor fault, the pressures read as missing, and injection uses the ECU's intake temperature | 3 s |
-| A firmware crashes over and over | After **3 crashes in one ignition cycle** injection is held off and the dash shows a fault, until the dash clears faults or the ignition is cycled: a pump that starts and stops with every crash is worse than one that stays off and says so | 3rd crash |
+| A firmware crashes over and over | After **3 crashes in one ignition cycle** injection is held off for 30 s and the dash says so (fault bit 6 in 0x300), then tried again. Three more and it rests 60 s, then 2, 4, at most 5 minutes. Clear faults on the dash ends a hold at once and starts the next one short again | 3rd crash |
 | A new firmware from the dash misbehaves | Not confirmed by the dash within 90 s, or hangs: back to the previous firmware | 90 s |
 
-After a restart the controller comes back disarmed, and the dash arms it again with its
-regular configuration message. One crash is a restart and nothing more.
+**Back by itself.** After a reset nobody asked for (a crash, a watchdog, a supply dip, a
+restart over a silent CAN bus or a quiet ADC) the board comes back armed if it was armed,
+and sprays again as soon as the ECU's data is fresh: under a second, without waiting for
+the dash. Power on, a firmware update and the dash's Restart start disarmed, and the
+dash arms it again if the driver had it armed. One crash is a restart and nothing more.
+
+**It says why it started.** Once its CAN is up after each start it sends the dash one
+start report (0x302, contract extension 8): the chip's reset reason, and whether the pump
+was running, it armed itself again, it is holding injection after crashes, the firmware is
+on trial, it restarted itself over CAN or the ADC, or the pump's soft start is lengthened.
+The dash writes it to its event log, so a restart in the middle of a drive shows up in the
+drive report with its reason.
+
+**The pump is started gently.** From rest the duty climbs from 5% to full over 0.4 s (a
+motor starting draws its largest current, and slamming it on dips the 12 V supply), runs
+at least 0.5 s apart from the run before, and the dose limit must allow a little above
+the minimum duty to start a run (only below the minimum stops one), so it never chatters
+on and off at that edge. A reset that comes while the pump is running doubles the soft
+start for the rest of the ignition cycle, up to 1.6 s. The pump test starts softly too.
+
+**One intake sensor.** `pins::POST_INJECTION_TEMP_FITTED` is false: GPIO6 (after the
+nozzle) is not read, because without its sensor and pull-up it floats and could read back
+as a believable temperature. The MicroSquirt's MAT, after the throttle, is the air after
+the nozzle; the dash shows it as such and works out the cooling from the two.
 
 Settings are written to flash only away from boost (from the dash: "unsaved" until
 then). While flash is written both processors stop running from it, which is not a
@@ -557,7 +581,7 @@ The dash's knock page shows most of this without a cable. For the first start, o
 the serial monitor (USB, 115200). Once a second the controller prints a line:
 
 ```
-HB t=12000 map=98.4 boostPsi=-0.3 baro=100.5 rpm=850 duty=0% hold=1 mode=0 tankLow=0 can=1 oilPsi=42.0 fuelPsi=39.5 pre=24.1 knock=0 krest=825mV knockHz=38460 klvl=14.2 kbase=13.1 k2=6.0 kshare=0.17 kfreq=6250 kfound=6262 ktone=0 kgain=6.3 kpeak=150mV rxOvf=0 loopMax=21ms keeper=0 crashes=0
+HB t=12000 map=98.4 boostPsi=-0.3 baro=100.5 rpm=850 duty=0% hold=1 mode=0 tankLow=0 can=1 oilPsi=42.0 fuelPsi=39.5 pre=24.1 knock=0 krest=825mV knockHz=38460 klvl=14.2 kbase=13.1 k2=6.0 kshare=0.17 kfreq=6250 kfound=6262 ktone=0 kgain=6.3 kpeak=150mV rxOvf=0 loopMax=21ms keeper=0 crashes=0 rxAge=3ms canResets=0 soft=400ms
 KSPEC kHz:dB 3.2:21 3.8:19 4.4:18 5.0:20 5.6:24 6.2:29 6.8:23 7.4:18 8.0:16 8.6:15 9.2:15 9.8:19 10.4:16 11.0:13 11.6:12
 ```
 
@@ -591,8 +615,13 @@ KSPEC kHz:dB 3.2:21 3.8:19 4.4:18 5.0:20 5.6:24 6.2:29 6.8:23 7.4:18 8.0:16 8.6:
   times the CAN task had to switch the pump off for it: it should stay 0. `crashes` is
   the crashes since the ignition came on; `(HOLD)` after it means injection is held off
   for them (see "When something fails" under Pump).
+- `rxAge` is how long since anything arrived on CAN: a few milliseconds with the
+  ignition on. `canResets` counts the times the CAN controller was set up again because
+  nothing arrived. `soft` is the pump's soft start: 400 ms, longer after a reset that came
+  while the pump ran.
 - At start-up, `BOOT: last reset:` says why the board last restarted: power on, a
-  restart asked for, a supply dip, or a crash.
+  restart asked for, a supply dip, a crash, or a restart over a silent CAN bus, and
+  whether the pump was running at the time; `BOOT: armed again` that it armed itself.
 
 Then, engine off, run a pump test from the dash and check the pump runs and stops.
 

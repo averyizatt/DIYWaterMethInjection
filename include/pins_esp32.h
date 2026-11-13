@@ -19,6 +19,12 @@ constexpr int PRE_INJECTION_TEMP_ADC = 5;  // ADC1 channel 4: intake air before 
 constexpr int POST_INJECTION_TEMP_ADC = 6; // ADC1 channel 5: spare; intake air after the nozzle if fitted
 constexpr float INTAKE_TEMP_PULLUP_OHMS = 2490.0f;  // Each thermistor: 3.3 V -> 2.49k -> pin -> sensor -> GND
 constexpr float INTAKE_TEMP_SUPPLY_MV = 3300.0f;
+// One intake sensor on this board, before the nozzle; the MicroSquirt's MAT, after the
+// throttle, is the one after the nozzle (owner, November 2026). The input above is then
+// not read at all: without its sensor and pull-up it floats, and a floating pin can read
+// back as a believable temperature. The dash shows the MicroSquirt's MAT as the air after
+// the nozzle. Set true if a second sensor and its 2.49k pull-up are fitted on GPIO6.
+constexpr bool POST_INJECTION_TEMP_FITTED = false;
 
 constexpr int FLOAT_SENSOR_DIGITAL = 7;    // Tank float switch to GND, internal pull-up
 // Pump MOSFET gate (logic-level, low side). A 10k resistor from gate to ground on the

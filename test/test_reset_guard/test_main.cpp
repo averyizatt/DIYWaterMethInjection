@@ -94,6 +94,74 @@ void markSurvivesACrashBeforeTheRestart() {
   check(reset_guard::boot(r, Cause::Crash) == Cause::Crash, "a crash is a crash, marked or not");
   check(r.crashes == 1 && r.faultRestarts == 0 && r.restartMarked == 0, "counted as a crash only");
 }
+
+void holdsEndByThemselvesAndGrowLonger() {
+  Record r = garbage();
+  reset_guard::boot(r, Cause::PowerOn);
+  for (int n = 0; n < 3; ++n) reset_guard::boot(r, Cause::Crash);
+  check(reset_guard::injectionHeld(r) && reset_guard::holdMs(r) == 30000, "the first hold: 30 s");
+  reset_guard::endHold(r);
+  check(!reset_guard::injectionHeld(r) && reset_guard::intact(r), "after its rest, injection is tried again");
+  reset_guard::boot(r, Cause::Crash);
+  check(!reset_guard::injectionHeld(r), "one crash after a hold is a restart again, not a hold");
+  for (int n = 0; n < 2; ++n) reset_guard::boot(r, Cause::Crash);
+  check(reset_guard::injectionHeld(r) && reset_guard::holdMs(r) == 60000, "three more: held twice as long");
+  for (int n = 0; n < 6; ++n) reset_guard::endHold(r);
+  check(reset_guard::holdMs(r) == reset_guard::kLongestHoldMs, "never longer than five minutes");
+  reset_guard::clearCrashes(r);
+  for (int n = 0; n < 3; ++n) reset_guard::boot(r, Cause::Crash);
+  check(reset_guard::holdMs(r) == 30000, "after Clear faults a hold starts short again");
+}
+
+void armedComesBackAfterResetsTheDriverDidNotAskFor() {
+  Record r = garbage();
+  reset_guard::boot(r, Cause::PowerOn);
+  check(!reset_guard::comesBackArmed(r, Cause::PowerOn), "power on: disarmed");
+  reset_guard::noteArmed(r, true);
+  check(reset_guard::comesBackArmed(r, reset_guard::boot(r, Cause::Crash)), "after a crash: armed again");
+  check(reset_guard::comesBackArmed(r, reset_guard::boot(r, Cause::Brownout)), "after a supply dip: armed again");
+  reset_guard::markCanRestart(r);
+  check(reset_guard::comesBackArmed(r, reset_guard::boot(r, Cause::Requested)),   // Marked: really a restart over CAN
+        "after restarting itself over a silent CAN bus: armed again");
+  check(!reset_guard::comesBackArmed(r, reset_guard::boot(r, Cause::Requested)), "a deliberate restart starts disarmed");
+  reset_guard::noteArmed(r, true);
+  reset_guard::boot(r, Cause::PowerOn);
+  check(!reset_guard::comesBackArmed(r, Cause::Crash) && r.armed == 0, "power on forgets it");
+  reset_guard::noteArmed(r, false);
+  check(!reset_guard::comesBackArmed(r, reset_guard::boot(r, Cause::Crash)), "disarmed stays disarmed");
+}
+
+void resetsWhileThePumpRanLengthenTheSoftStart() {
+  Record r = garbage();
+  reset_guard::boot(r, Cause::PowerOn);
+  check(reset_guard::softStartMs(r, 400) == 400, "no trouble: the normal soft start");
+  reset_guard::boot(r, Cause::Brownout);
+  check(reset_guard::softStartMs(r, 400) == 400, "a supply dip with the pump off (cranking) changes nothing");
+  reset_guard::notePump(r, true);
+  reset_guard::boot(r, Cause::Brownout);
+  check(r.pumpOn == 1, "boot leaves the pump state as it was at the reset, for the firmware to read");
+  reset_guard::notePump(r, false);
+  check(reset_guard::softStartMs(r, 400) == 800 && r.crashes == 0, "a supply dip with the pump running: twice as gentle");
+  reset_guard::notePump(r, true);
+  reset_guard::boot(r, Cause::Crash);
+  reset_guard::notePump(r, true);
+  reset_guard::boot(r, Cause::Crash);
+  check(reset_guard::softStartMs(r, 400) == 1600, "at most four times");
+  reset_guard::boot(r, Cause::PowerOn);
+  check(reset_guard::softStartMs(r, 400) == 400, "a new ignition cycle starts normal again");
+}
+
+void canRestartsAreLimitedAndSeparate() {
+  Record r = garbage();
+  reset_guard::boot(r, Cause::PowerOn);
+  for (int n = 0; n < 3; ++n) {
+    check(reset_guard::mayRestartForCan(r), "may restart over a silent bus");
+    reset_guard::markCanRestart(r);
+    check(reset_guard::boot(r, Cause::Requested) == Cause::CanRestart, "a marked restart over CAN is recognised");
+  }
+  check(!reset_guard::mayRestartForCan(r), "after three: no more restarts over CAN this ignition cycle");
+  check(reset_guard::mayRestartForFault(r) && !reset_guard::injectionHeld(r), "they count for nothing else");
+}
 } // namespace
 
 int main() {
@@ -103,6 +171,10 @@ int main() {
   brownoutsDoNotCount();
   faultRestartsAreLimited();
   markSurvivesACrashBeforeTheRestart();
+  holdsEndByThemselvesAndGrowLonger();
+  armedComesBackAfterResetsTheDriverDidNotAskFor();
+  resetsWhileThePumpRanLengthenTheSoftStart();
+  canRestartsAreLimitedAndSeparate();
   if (failures == 0) printf("reset_guard: all tests passed\n");
   return failures == 0 ? 0 : 1;
 }

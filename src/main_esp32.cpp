@@ -91,6 +91,9 @@ static_assert(CCM_CAN_PROTOCOL_VERSION == can_protocol::CAN_PROTOCOL_SCHEMA_VERS
 #ifndef CAN_PROTOCOL_HAS_METH_PWM
 #error "Update DIYComfortControlModule: the shared CAN contract needs the PWM duty settings (extension 5)."
 #endif
+#ifndef CAN_PROTOCOL_HAS_METH_START_REPORT
+#error "Update DIYComfortControlModule: the shared CAN contract needs the water/meth start report (extension 8)."
+#endif
 static_assert(meth_tune::kCount == can_protocol::meth_tune_setting::COUNT &&
               meth_tune::kPeriodMs == can_protocol::meth_tune_setting::PERIOD_MS &&
               meth_tune::kMaxDosePct == can_protocol::meth_tune_setting::MAX_DOSE_PCT &&
@@ -427,6 +430,10 @@ uint32_t lastSprayMs = 0;
 constexpr int32_t kPumpKeeperMs = 250;
 constexpr uint32_t kRelayHoldMs = 3000;
 
+// What a reset leaves behind (reset_guard.h), in memory a reset does not clear: the crash
+// count, and whether the board was armed and the pump running when it came.
+RTC_NOINIT_ATTR reset_guard::Record resetRecord;
+
 void setPump(float dutyPercent) {
   if (!(dutyPercent > 0.0f)) dutyPercent = 0.0f;
   if (dutyPercent > 100.0f) dutyPercent = 100.0f;
@@ -435,6 +442,7 @@ void setPump(float dutyPercent) {
   const uint32_t now = millis();
   pumpSetMs = now;
   pumpRunning = dutyPercent > 0.0f;
+  reset_guard::notePump(resetRecord, pumpRunning);
   if (pumpRunning) {
     lastSprayMs = now;
     relayClosed = true;
@@ -488,15 +496,31 @@ void pumpOffAtRestart() { pumpOffNow(); }
 // Crash loops (reset_guard.h): counted across resets in memory a reset does not clear.
 // ---------------------------------------------------------------------------
 constexpr uint32_t kWatchdogMs = 2000;   // Main loop or CAN task silent this long: restart
-RTC_NOINIT_ATTR reset_guard::Record resetRecord;
 reset_guard::Cause bootCause = reset_guard::Cause::Other;
 bool crashHold = false;   // Too many crashes since the ignition came on: injection held off
+uint32_t crashHoldEndsMs = 0;   // ...until this long after the start (reset_guard::holdMs)
 
 // The dash cleared faults: crashes so far are forgiven and injection is allowed again.
 void clearCrashHold() {
   if (crashHold) Serial.println(F("SAFETY: crash hold cleared; injection allowed again"));
   reset_guard::clearCrashes(resetRecord);
   crashHold = false;
+}
+
+// The hold has rested its time: injection is tried again (the next hold is longer).
+void endCrashHoldWhenDue(uint32_t now) {
+  if (!crashHold || static_cast<int32_t>(now - crashHoldEndsMs) < 0) return;
+  reset_guard::endHold(resetRecord);
+  crashHold = false;
+  Serial.printf("SAFETY: crash hold over after %lu s; injection allowed again (a next hold would last %lu s)\n",
+                static_cast<unsigned long>(crashHoldEndsMs / 1000), static_cast<unsigned long>(reset_guard::holdMs(resetRecord) / 1000));
+}
+
+// Armed or not, kept where a reset finds it: after a crash, a supply dip or a restart
+// over a fault the board comes back armed by itself (reset_guard::comesBackArmed).
+void setArmed(bool armed) {
+  config.mode = armed ? InjectionMode::BoostOnly : InjectionMode::Off;
+  reset_guard::noteArmed(resetRecord, armed);
 }
 
 reset_guard::Cause reportedResetCause(esp_reset_reason_t reason) {
@@ -535,6 +559,26 @@ QueueHandle_t canRxQueue = nullptr;
 bool spiStarted = false;
 bool txStuck = false;                      // The frame before never left: nobody is acknowledging.
 volatile uint32_t canRxOverflows = 0;
+// Hearing nothing. With the ignition on the ECU broadcasts many times a second and the
+// dash sends engine data, so a bus with nothing on it means the CAN controller or its
+// wiring has stopped working, even when its registers look right (a stuck SPI line reads
+// back as "normal mode"). The Nano went that way on its tenth spray in November 2026 and
+// stayed silent until the ignition was cycled. So: silent for kCanSilentMs, set the
+// controller up again (every kCanSilentRetryMs while it lasts); still silent after
+// kCanRestartAfterMs, restart the whole board (reset_guard::kCanRestartsAllowed per
+// ignition cycle). Only once the bus has worked since the ignition came on: a board on
+// the bench with nothing connected is left alone.
+uint32_t lastCanRxMs = 0;
+uint32_t lastCanInitMs = 0;
+bool canHeardSinceBoot = false;
+uint32_t canSilentResets = 0;              // Times it was set up again for silence (heartbeat)
+constexpr uint32_t kCanSilentMs = 1500;
+constexpr uint32_t kCanSilentRetryMs = 2000;
+constexpr uint32_t kCanRestartAfterMs = 15000;
+
+// The bus has worked this ignition cycle: frames since this start, or the last start was
+// a restart over a silent bus (it had worked before that).
+bool canHeardOnce() { return canHeardSinceBoot || bootCause == reset_guard::Cause::CanRestart; }
 
 uint8_t readRegister(uint8_t address) {
   SPI.beginTransaction(SPISettings(kCanSpiHz, MSBFIRST, SPI_MODE0));
@@ -582,6 +626,7 @@ bool initCanBus() {
   // Read back: normal mode, and frames retried when the bus is lost to another module.
   ok = ok && (readRegister(0x0F) & 0xE8) == 0x00;
   txStuck = false;
+  lastCanInitMs = millis();
   xSemaphoreGive(canLock);
   Serial.println(ok ? F("CAN: MCP2515 ready, 500 kbit/s") : F("CAN: MCP2515 not answering; will retry"));
   return ok;
@@ -668,11 +713,29 @@ bool serviceCanHealth(uint32_t now) {
   const uint8_t control = readRegister(0x0F);
   const uint8_t errors = mcp.getErrorFlags();
   xSemaphoreGive(canLock);
-  if ((control & 0xE8) == 0x00 && !(errors & 0x20) && consecutiveCanTxFailures < 64) return true;
-  Serial.println(F("CAN: controller lost its settings or went bus-off; setting it up again"));
+  const bool silent = canHeardOnce() && elapsed(now, lastCanRxMs, kCanSilentMs) && elapsed(now, lastCanInitMs, kCanSilentRetryMs);
+  if ((control & 0xE8) == 0x00 && !(errors & 0x20) && consecutiveCanTxFailures < 64 && !silent) return true;
+  if (silent) {
+    canSilentResets = canSilentResets + 1;
+    Serial.printf("CAN: nothing heard for %lu ms; setting the controller up again\n", static_cast<unsigned long>(now - lastCanRxMs));
+  } else {
+    Serial.println(F("CAN: controller lost its settings or went bus-off; setting it up again"));
+  }
   canOnline = false;
   lastCanRetryMs = now - kCanRetryMs;
   return false;
+}
+
+// Silent however often the controller is set up again: restart the board, which resets
+// the SPI hardware and everything else too. Injection is impossible meanwhile anyway: the
+// manifold pressure comes over CAN. Comes back armed if it was (reset_guard.h).
+void restartIfCanStaysSilent(uint32_t now) {
+  if (!canHeardOnce() || !elapsed(now, lastCanRxMs, kCanRestartAfterMs) || !reset_guard::mayRestartForCan(resetRecord)) return;
+  Serial.printf("FAULT: nothing on CAN for %lu s however often it was set up again; restarting the board\n",
+                static_cast<unsigned long>((now - lastCanRxMs) / 1000));
+  setPump(0.0f);
+  reset_guard::markCanRestart(resetRecord);
+  ESP.restart();
 }
 
 uint8_t scaledU8(float value, float scale) {
@@ -858,7 +921,7 @@ void handleMethConfigBroadcast(byte len, const byte *data) {
     return;
   }
 
-  config.mode = data[1] != 0U ? InjectionMode::BoostOnly : InjectionMode::Off;
+  setArmed(data[1] != 0U);
   config.tankProtectionEnabled = (data[6] & 0x01U) != 0U;
   // A disarmed periodic config must not cancel a deliberately started test.
   // Arming cancels the test; explicit DISARM/STOP commands still stop it.
@@ -994,7 +1057,7 @@ void handleCanFrame(unsigned long id, byte len, const byte *data) {
   } else switch (data[0]) {
   case can_protocol::meth_command::ARM:
     if (len >= 2) {
-      config.mode = data[1] ? InjectionMode::BoostOnly : InjectionMode::Off;
+      setArmed(data[1] != 0U);
       manualTestActive = false;
       manualTestDuty = 0;
       if (kSerialCanVerbose) {
@@ -1283,6 +1346,8 @@ void handleUpdateFrame(const RxFrame &rx, uint32_t now) {
 void drainCanFrames(uint32_t now) {
   RxFrame rx;
   for (uint8_t n = 0; n < 64 && xQueueReceive(canRxQueue, &rx, 0) == pdTRUE; ++n) {
+    lastCanRxMs = now;            // Anything at all: the bus and the controller are working.
+    canHeardSinceBoot = true;
     if (ecu::accept(rx.id, rx.data, rx.len, now, ecuData)) continue;
     if (rx.id == fw::ID_COMMAND) {
       handleUpdateFrame(rx, now);
@@ -1317,7 +1382,22 @@ uint8_t methFaultFlagsFor(const ControlResult &result, const SensorReadings &rea
     flags |= (1U << 4);
   }
   if (canCommandTimedOut) flags |= (1U << 5);
+  // Held off after repeated crashes (reset_guard.h), so the dash can say why and that
+  // clearing faults releases it (contract extension 8). The Nano never sets it.
+  if (crashHold) flags |= can_protocol::meth_fault_flag::CRASH_HOLD;
   return flags;
+}
+
+// Why this start happened, told to the dash once the bus is up (contract extension 8),
+// so a restart in the middle of a drive is in its event log with the reason.
+bool startReportPending = true;
+uint8_t startReportFlags = 0;
+
+void sendStartReportOnce(uint32_t now) {
+  if (!startReportPending || now < 1000) return;   // Let the bus settle after a start
+  if (transmitCanFrame(can_protocol::packMethStartReport(static_cast<uint8_t>(esp_reset_reason()), startReportFlags), "0x302-start")) {
+    startReportPending = false;
+  }
 }
 
 uint8_t boostGaugeKpaForCan(const SensorReadings &readings) {
@@ -1342,6 +1422,7 @@ void serviceCanBus(uint32_t now,
                    const ControlResult &result,
                    bool knockDetected,
                    int knockRaw) {
+  restartIfCanStaysSilent(now);
   if (!canOnline) {
     if (elapsed(now, lastCanRetryMs, kCanRetryMs)) {
       lastCanRetryMs = now;
@@ -1352,6 +1433,7 @@ void serviceCanBus(uint32_t now,
   }
 
   if (!serviceCanHealth(now)) return;
+  sendStartReportOnce(now);
   applyCanCommandTimeout(now);
   // Received frames were already handled by drainCanFrames() at the top of loop().
 
@@ -1624,7 +1706,9 @@ void updateIntakeTemps(uint32_t now) {
   } else {
     preTempValid = false;
   }
-  if (adc_sampler::averageMv(adc_sampler::kPost, millivolts) &&
+  // After the nozzle: not fitted on this board (pins::POST_INJECTION_TEMP_FITTED); the
+  // MicroSquirt's MAT stands for it on the dash.
+  if (pins::POST_INJECTION_TEMP_FITTED && adc_sampler::averageMv(adc_sampler::kPost, millivolts) &&
       analog_inputs::thermistorC(millivolts, pins::INTAKE_TEMP_SUPPLY_MV, pins::INTAKE_TEMP_PULLUP_OHMS,
                                  adc_sampler::topMv(adc_sampler::kPost), sample)) {
     postTempC = postTempValid ? postTempC + (sample - postTempC) * 0.3f : sample;
@@ -1860,8 +1944,15 @@ void setup() {
   // What the last reset was, and whether this ignition cycle has seen too many crashes.
   bootCause = reset_guard::boot(resetRecord, reportedResetCause(esp_reset_reason()));
   crashHold = reset_guard::injectionHeld(resetRecord);
+  crashHoldEndsMs = reset_guard::holdMs(resetRecord);
   const bool crashHookRan = crashHookMark == kCrashHookRan;
   crashHookMark = 0;
+  // What was going on when the reset came, then the pump recorded as off (it is).
+  const bool pumpWasOn = resetRecord.pumpOn != 0;
+  const bool armedAgain = reset_guard::comesBackArmed(resetRecord, bootCause);
+  reset_guard::notePump(resetRecord, false);
+  const uint32_t softStartMs = reset_guard::softStartMs(resetRecord, meth_tune::kSoftStartMs);
+  governor.setSoftStartMs(softStartMs);
 
   Serial.begin(config.serialBaud);
 #if ARDUINO_USB_CDC_ON_BOOT && ARDUINO_USB_MODE
@@ -1871,19 +1962,27 @@ void setup() {
   Serial.setTxTimeoutMs(0);
 #endif
   if (!pumpReady) Serial.println(F("BOOT: pump PWM did not start; the pump will not run"));
-  // Fail safe until the dash explicitly arms this controller.
-  config.mode = InjectionMode::Off;
+  // Disarmed (fail safe) until the dash arms this controller; but after a reset nobody
+  // asked for (a crash, a supply dip, a restart over a fault) armed again if it was, so
+  // injection carries on without waiting for the dash.
+  setArmed(armedAgain);
   Serial.println();
   Serial.printf("BOOT: ESP32-S3 water/meth and knock firmware, build %08lX\n", static_cast<unsigned long>(METH_FW_BUILD));
-  Serial.printf("BOOT: last reset: %s; crashes since the ignition came on: %u\n", reset_guard::name(bootCause),
-                static_cast<unsigned>(resetRecord.crashes));
+  Serial.printf("BOOT: last reset: %s%s; crashes since the ignition came on: %u\n", reset_guard::name(bootCause),
+                pumpWasOn ? ", with the pump running" : "", static_cast<unsigned>(resetRecord.crashes));
   if (bootCause == reset_guard::Cause::Crash) {
     Serial.println(crashHookRan ? F("BOOT: the crash handler switched the pump off before the reset")
                                 : F("BOOT: the crash handler did not run (the pull-downs held the pump off once the pins floated)"));
   }
+  if (armedAgain) Serial.println(F("BOOT: armed again, as before the reset"));
+  if (softStartMs > meth_tune::kSoftStartMs) {
+    Serial.printf("BOOT: %u resets with the pump running this ignition cycle: soft start %lu ms\n",
+                  static_cast<unsigned>(resetRecord.pumpResets), static_cast<unsigned long>(softStartMs));
+  }
   if (crashHold) {
-    Serial.printf("SAFETY: %u crashes since the ignition came on: injection held off until the dash clears "
-                  "faults or the ignition is cycled\n", static_cast<unsigned>(resetRecord.crashes));
+    Serial.printf("SAFETY: %u crashes since the ignition came on: injection held off for %lu s, then tried again "
+                  "(at once if the dash clears faults)\n", static_cast<unsigned>(resetRecord.crashes),
+                  static_cast<unsigned long>(crashHoldEndsMs / 1000));
   }
 
   pinMode(pins::WARNING_LED, OUTPUT);
@@ -1911,6 +2010,15 @@ void setup() {
   updater.setOnTrial(running && esp_ota_get_state_partition(running, &imageState) == ESP_OK &&
                      imageState == ESP_OTA_IMG_PENDING_VERIFY);
   if (updater.onTrial()) Serial.println(F("BOOT: new firmware, on trial until the dash confirms it"));
+  {
+    namespace sf = can_protocol::meth_start_flag;
+    using reset_guard::Cause;
+    startReportFlags = static_cast<uint8_t>((pumpWasOn ? sf::PUMP_WAS_ON : 0U) | (armedAgain ? sf::ARMED_AGAIN : 0U) |
+                                            (crashHold ? sf::CRASH_HOLD : 0U) | (updater.onTrial() ? sf::ON_TRIAL : 0U) |
+                                            (bootCause == Cause::CanRestart ? sf::RESTART_SILENT_CAN : 0U) |
+                                            (bootCause == Cause::FaultRestart ? sf::RESTART_ADC : 0U) |
+                                            (softStartMs > meth_tune::kSoftStartMs ? sf::GENTLE_START : 0U));
+  }
 
   if (kKnockOn) {
     // On the Nano the threshold offset covers its coarse measurement (8 half counts).
@@ -1990,6 +2098,7 @@ void loop() {
   // anything near the pump keeper's 250 ms is worth knowing about.
   if (lastLoopMs != 0 && now - lastLoopMs > loopGapMaxMs) loopGapMaxMs = now - lastLoopMs;
   lastLoopMs = now;
+  endCrashHoldWhenDue(now);
   if (pumpKeeperTrips != keeperTripsReported) {
     keeperTripsReported = pumpKeeperTrips;
     Serial.printf("SAFETY: the main loop went %ld ms without setting the pump; the CAN task switched it off (%lu times)\n",
@@ -2115,7 +2224,7 @@ void loop() {
     lastDebugMs = now;
     Serial.printf("HB t=%lu map=%.1f%s boostPsi=%.2f baro=%.1f rpm=%u%s duty=%.0f%% hold=%u mode=%u tankLow=%d can=%d "
                   "oilPsi=%.1f%s fuelPsi=%.1f%s pre=%.1f%s knock=%d krest=%umV knockHz=%lu klvl=%.1f kbase=%.1f k2=%.1f kshare=%.2f kfreq=%u kfound=%.0f ktone=%.0f kgain=%.1f%s kpeak=%umV rxOvf=%lu "
-                  "loopMax=%lums keeper=%lu crashes=%u%s\n",
+                  "loopMax=%lums keeper=%lu crashes=%u%s rxAge=%lums canResets=%lu soft=%lums\n",
                   static_cast<unsigned long>(now), readings.mapKpa, readings.mapValid ? "" : "!", readings.boostPsi,
                   config.map.baroKpa, rpm, engineRpmValid ? "" : "!", pumpDutyPercent, governor.hold(),
                   static_cast<unsigned>(config.mode), readings.tankLow ? 1 : 0, canOnline ? 1 : 0,
@@ -2127,7 +2236,8 @@ void loop() {
                   knockGain.gain(), knockGainAuto ? "" : "(fixed)", static_cast<unsigned>(knockGain.typicalPeak()),
                   static_cast<unsigned long>(canRxOverflows), static_cast<unsigned long>(loopGapMaxMs),
                   static_cast<unsigned long>(pumpKeeperTrips), static_cast<unsigned>(resetRecord.crashes),
-                  crashHold ? "(HOLD)" : "");
+                  crashHold ? "(HOLD)" : "", static_cast<unsigned long>(now - lastCanRxMs),
+                  static_cast<unsigned long>(canSilentResets), static_cast<unsigned long>(governor.softStartMs()));
     loopGapMaxMs = 0;
   }
 }

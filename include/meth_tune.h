@@ -448,8 +448,29 @@ inline float doseLimitDuty(const Settings &s, uint16_t rpm, float mapKpa) {
   return fraction >= 1.0f ? 100.0f : fraction * fraction * 100.0f;
 }
 
+// The pump is a motor, not a valve: an ordinary diaphragm water pump that takes PWM but
+// does not like being chopped about (owner, November 2026). So the drive is gentle with it:
+//   - Soft start: from rest the duty climbs from kSoftStartFloorPct to full over the soft
+//     start time, whatever is asked, until it reaches what is asked. A motor starting
+//     draws its largest current, and slamming it on dips the 12 V supply: the likely
+//     reason the Nano went silent at the start of its tenth spray (November 2026). During
+//     the soft start the duty may be under the minimum: the pump is spinning up and the
+//     line filling, not metering. The firmware lengthens it after a reset that came while
+//     the pump ran (reset_guard::softStartMs).
+//   - A rest of at least kPwmRestMs between runs: never more than two starts a second.
+//   - To start a run the dose limit must allow kDoseStartMarginPct above the minimum
+//     duty; only falling under the minimum stops one. No on-off at the edge.
+constexpr uint32_t kSoftStartMs = 400;
+constexpr float kSoftStartFloorPct = 5.0f;
+constexpr uint32_t kPwmRestMs = 500;
+constexpr float kDoseStartMarginPct = 3.0f;
+
 class PwmGovernor {
 public:
+  // 0 turns the soft start off (the bench tests of the ramp do).
+  void setSoftStartMs(uint32_t ms) { softStartMs_ = ms; }
+  uint32_t softStartMs() const { return softStartMs_; }
+
   // Normal injection. Returns the pump duty in percent for this instant; 0 = off.
   float update(uint32_t now, const Settings &s, const Inputs &in) {
     const uint32_t dt = started_ ? (now - lastMs_ > 1000UL ? 1000UL : now - lastMs_) : 0;
@@ -509,35 +530,51 @@ public:
     if (target > dose) target = dose;
     if (in.capDutyPercent < 100.0f && target > in.capDutyPercent) target = in.capDutyPercent;
     if (target > 100.0f) target = 100.0f;
-    // Below the minimum duty the nozzle dribbles instead of atomising: nothing, not a little.
-    if (hold == kHoldNone && target < low) hold = kHoldDoseLimit;
+    // Below the minimum duty the nozzle dribbles instead of atomising: nothing, not a
+    // little. A run starts only with some room above it (kDoseStartMarginPct).
+    const float doseToStart = low + kDoseStartMarginPct < 100.0f ? low + kDoseStartMarginPct : 100.0f;
+    if (hold == kHoldNone && (target < low || (!running_ && dose < doseToStart))) hold = kHoldDoseLimit;
+    // Rests between runs; the reason the last run stopped is still the reason.
+    if (hold == kHoldNone && !running_ && everRan_ && now - stoppedMs_ < kPwmRestMs) hold = stopHold_;
     hold_ = hold;
 
     if (hold != kHoldNone) {
-      duty_ = 0.0f;
+      stop(now, hold);
       return 0.0f;
     }
-    // Starting from rest: begin at the minimum duty and climb. kRampMs is the time the
-    // climb from minimum to maximum duty may take.
-    if (ramped) {
-      const float span = static_cast<float>(s.value[kMaxDutyPct]) - low;
-      const float step = span > 0.0f ? span * dt / s.value[kRampMs] : 100.0f;
-      const float from = duty_ > 0.0f ? duty_ : low - step;
-      if (target > from + step) target = from + step;
-      if (target < low) target = low;
+    // Each run's duty starts at the minimum and climbs: kRampMs is the time the climb
+    // from minimum to maximum duty may take. The soft start then shapes the first moments.
+    const float span = static_cast<float>(s.value[kMaxDutyPct]) - low;
+    const float step = span > 0.0f && s.value[kRampMs] > 0 ? span * dt / s.value[kRampMs] : 100.0f;
+    float allowed = 100.0f;
+    if (!running_) {
+      begin(now);
+      allowed = low;
+    } else {
+      allowed = rampDuty_ + step;
     }
-    duty_ = target;
+    if (ramped && target > allowed) target = allowed;
+    rampDuty_ = target;
+    duty_ = softStarted(now, target);
     return duty_;
   }
 
   // Pump test: no RPM, temperature, dose or time gates. Any test above 0% runs the
-  // pump at no less than the lowest duty that can be set, so it always turns.
+  // pump at no less than the lowest duty that can be set, so it always turns. It starts
+  // softly too: it is the same pump on the same supply.
   float manual(uint32_t now, const Settings &, uint8_t dutyPercent) {
     lastMs_ = now;
     started_ = true;
     hold_ = kHoldNone;
     const float floor = rangeOf(kMinDutyPct).min;
-    duty_ = dutyPercent == 0 ? 0.0f : dutyPercent > 100 ? 100.0f : dutyPercent < floor ? floor : static_cast<float>(dutyPercent);
+    const float wanted = dutyPercent == 0 ? 0.0f : dutyPercent > 100 ? 100.0f : dutyPercent < floor ? floor : static_cast<float>(dutyPercent);
+    if (!(wanted > 0.0f)) {
+      stop(now, kHoldDisarmed);
+      return 0.0f;
+    }
+    if (!running_) begin(now);
+    rampDuty_ = wanted;
+    duty_ = softStarted(now, wanted);
     return duty_;
   }
 
@@ -546,13 +583,43 @@ public:
   bool earlyStart() const { return early_ && hold_ == kHoldNone; }
   bool hotAir() const { return hotAir_ && hold_ == kHoldNone; }
   float duty() const { return duty_; }
+  // The pump is running and still in its soft start.
+  bool softStarting(uint32_t now) const { return running_ && softStartMs_ > 0 && now - runStartMs_ < softStartMs_; }
 
 private:
+  void begin(uint32_t now) {
+    running_ = true;
+    runStartMs_ = now;
+  }
+
+  void stop(uint32_t now, uint8_t why) {
+    if (running_) {
+      running_ = false;
+      everRan_ = true;
+      stoppedMs_ = now;
+      stopHold_ = why;
+    }
+    duty_ = 0.0f;
+  }
+
+  float softStarted(uint32_t now, float duty) const {
+    if (!softStarting(now)) return duty;
+    const float cap = kSoftStartFloorPct + (100.0f - kSoftStartFloorPct) * static_cast<float>(now - runStartMs_) / softStartMs_;
+    return duty > cap ? cap : duty;
+  }
+
   uint32_t lastMs_{0};
   uint32_t usedMs_{0};
+  uint32_t runStartMs_{0};
+  uint32_t stoppedMs_{0};
+  uint32_t softStartMs_{kSoftStartMs};
   float duty_{0.0f};
+  float rampDuty_{0.0f};   // This run's ramp: where the duty may climb on from
   uint8_t hold_{kHoldDisarmed};
+  uint8_t stopHold_{kHoldBelowBoost};
   bool started_{false};
+  bool running_{false};
+  bool everRan_{false};
   bool early_{false};
   bool hotAir_{false};
   bool resting_{false};
