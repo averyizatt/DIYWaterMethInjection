@@ -687,7 +687,16 @@ The controller can take new firmware over CAN like the gateway and the taillight
 controller (module number 3). It refuses to start an update, and drops one that is
 running, when the pump is on or boost is within 1 psi of the start threshold. During
 an update the pump is held off. A new firmware runs on trial: if the dash does not
-confirm it within 90 seconds, the controller goes back to the previous one.
+confirm it within 90 seconds, the controller goes back to the previous one. The dash
+confirms it only once the controller's own messages (0x300, 0x307, 0x30F) are back and
+steady.
+
+It takes the update protocol's version 2 (`firmware_update.h`, November 2026): 8 KB blocks,
+each compressed, unpacked by the ESP32's ROM decompressor, with only the missing frames
+sent again. During a transfer the CAN task reads the MCP2515 every 0.2 ms instead of every
+millisecond, and its SPI runs at 8 MHz (it was 1 MHz for jumper wires; the wiring is
+soldered now). The first update to this firmware still goes the old way, at about
+2.8 KB/s; the ones after it use version 2.
 
 The first flash is by USB. After that the dash does it: every change to this
 repository is built on GitHub and published as the `watermeth-latest` release, the

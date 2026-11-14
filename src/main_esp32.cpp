@@ -547,13 +547,19 @@ struct RxFrame {
   uint8_t len;
   uint8_t data[8];
 };
-constexpr uint32_t kCanSpiHz = 1000000;   // Slow enough for jumper wires to the module.
+// 8 MHz (the MCP2515 takes up to 10): the SPI wiring is soldered on the board (owner, November
+// 2026). It was 1 MHz for jumper wires; at that a read took long enough for firmware frames
+// sent back to back to be lost.
+constexpr uint32_t kCanSpiHz = 8000000;
 MCP2515 mcp(pins::CAN_SPI_CS, kCanSpiHz, &SPI);
 SemaphoreHandle_t canLock = nullptr;
 QueueHandle_t canRxQueue = nullptr;
 bool spiStarted = false;
 bool txStuck = false;                      // The frame before never left: nobody is acknowledging.
 volatile uint32_t canRxOverflows = 0;
+// A firmware transfer is open: the receive task reads the controller every 0.2 ms instead of
+// every millisecond, because the dash sends frames faster than its two receive buffers hold.
+volatile bool canFastPoll = false;
 // Hearing nothing. With the ignition on the ECU broadcasts many times a second and the
 // dash sends engine data, so a bus with nothing on it means the CAN controller or its
 // wiring has stopped working, even when its registers look right (a stuck SPI line reads
@@ -678,7 +684,16 @@ void canReceiveTask(void *) {
       }
       xSemaphoreGive(canLock);
     }
-    vTaskDelay(1);
+    // During a transfer: 0.2 ms between reads, still giving up the processor for a tick every
+    // ~8 ms so the idle task on this core runs (the watchdog watches it). The pump is held
+    // off throughout a transfer, so the keeper has nothing to do meanwhile.
+    static uint8_t fastReads = 0;
+    if (canFastPoll && ++fastReads < 40) {
+      esp_rom_delay_us(200);
+    } else {
+      fastReads = 0;
+      vTaskDelay(1);
+    }
   }
 }
 
@@ -1329,7 +1344,8 @@ struct OtaFlash {
   bool confirm() { return esp_ota_mark_app_valid_cancel_rollback() == ESP_OK; }
 };
 OtaFlash otaFlash;
-fw::Receiver<OtaFlash> updater(fw::TARGET_WATER_METH, METH_FW_BUILD, otaFlash);
+// The ROM's decompressor: the dash sends compressed blocks (firmware_update.h version 2).
+fw::Receiver<OtaFlash, fw::RomInflate> updater(fw::TARGET_WATER_METH, METH_FW_BUILD, otaFlash);
 uint32_t restartAtMs = 0;
 constexpr uint32_t kTrialMs = 90000;   // Unconfirmed after this long: back to the previous firmware.
 
@@ -2236,6 +2252,7 @@ void loop() {
   }
 
   // ---- Firmware update: nothing but the transfer, with the pump held off ----
+  canFastPoll = updater.active();
   if (updater.active()) {
     setPump(0.0f);
     if (injectionNeeded(now)) {
