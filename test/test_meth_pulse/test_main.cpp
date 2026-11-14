@@ -40,6 +40,7 @@ Inputs idle(uint8_t reason = kHoldBelowBoost) {
 Settings defaults() {
   Settings s;
   loadDefaults(s);   // 4 s cycle, 1 s at start boost (0.5 psi) to 2 s at full (10 psi), +0.5 s a cycle
+  s.value[kNozzleMlMin] = 60;   // These tests were written around a 60 ml/min nozzle
   return s;
 }
 
@@ -128,6 +129,23 @@ void flowIsTheShareOfTheCycleSoTheDoseLimitIsExact() {
   check(run(held, s, 0, 2000, lowAirflow) == 0.0f && held.hold() == kHoldDoseLimit, "under half a second allowed: held, pump off");
 }
 
+void theMeasuredNozzleKeepsTheShippedSettingsToTheirDose() {
+  // The car's nozzle measured 160 ml/min (8 g in the 3 s pump test). Water at 10% of fuel:
+  // 2500 RPM at 10 psi burns about 338 g/min, so 33.8 ml/min, 21% of the nozzle: 0.85 s in
+  // 4 s. 5000 RPM at 10 psi, about 676 g/min: 42%, 1.7 s. Never the 2 s full boost asks for
+  // at low RPM, and on all the time it would be about 47% of fuel at 2500 RPM.
+  Settings s;
+  loadDefaults(s);
+  check(s.value[kNozzleMlMin] == 160, "the shipped nozzle figure is the measured one");
+  const Inputs low = spraying(10.0f, 2500), high = spraying(10.0f, 5000);
+  check(doseLimitOnMs(s, 2500, low.mapKpa) > 820 && doseLimitOnMs(s, 2500, low.mapKpa) < 870, "2500 RPM, 10 psi: 0.85 s in 4 s");
+  check(doseLimitOnMs(s, 5000, high.mapKpa) > 1650 && doseLimitOnMs(s, 5000, high.mapKpa) < 1720, "5000 RPM, 10 psi: 1.7 s in 4 s");
+  PulseGovernor g;
+  run(g, s, 0, 4000, low);
+  g.update(4000, s, low);
+  check(g.onMs() > 820 && g.onMs() < 870, "pulses held to 10% of fuel at low RPM");
+}
+
 void theReasonsItStopsStillApply() {
   const Settings s = defaults();
   PulseGovernor g;
@@ -165,6 +183,7 @@ int main() {
   aContinuousRunIsNotRestarted();
   theSoftStartCanBeLongerOrOff();
   flowIsTheShareOfTheCycleSoTheDoseLimitIsExact();
+  theMeasuredNozzleKeepsTheShippedSettingsToTheirDose();
   theReasonsItStopsStillApply();
   thePumpTestIsTheShareOfTheCycleAtFullPressure();
   if (failures) {

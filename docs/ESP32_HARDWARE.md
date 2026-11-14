@@ -160,16 +160,24 @@ summary in words. After power on the memory holds noise and its checks reject it
 firmware update or the dash's Restart starts a new record without sending one.
 
 **The pump runs full on, in pulses** (`meth_tune::PulseGovernor`, November 2026). It is
-an ordinary diaphragm pump, 4-6 L/min against a 60 ml/min nozzle, so it is all but
+an ordinary diaphragm pump, 4-6 L/min against a 160 ml/min nozzle, so it is all but
 dead-headed and the pressure it holds follows its motor voltage: at part duty the nozzle
 gets part pressure and sprays coarsely, and the motor sits near stall. So the pump is
 either full on, at its full pressure with its own pressure switch regulating, or off.
 Flow is set by how long it runs in each cycle, exactly by the cycle settings on the
 dash: at least half a second on and half a second off, or on continuously, and at most
-one start per cycle. With the run times at start and full boost set to the whole cycle,
-it runs continuously whenever it sprays, and only the dose limit (when 60 ml/min would
-be more than that share of the engine's fuel, at low RPM) breaks it into long pulses.
-The flow estimate is then simply the nozzle's rating for the share of the cycle it runs.
+one start per cycle. The flow estimate is the nozzle figure for the share of the cycle
+the pump runs, and the dose limit holds that to a share of the engine's fuel.
+
+**The nozzle figure is measured, not the label.** The nozzle is sold as 60 ml/min. On the
+owner's 3 s pump test at full pressure (November 2026) it gave a very fine mist and about
+8 g of water in all, counting what the line, still pressurised behind the check valve,
+sprayed after the pump stopped before it misted off and dribbled: 160 ml/min, the
+built-in figure (`meth_tune::kMeasuredNozzleMlMin`). A tune saved with the old 60 is moved
+to 160 at start-up; a figure set by hand is kept. At 160 ml/min, on all the time would be
+about 47% of the fuel at 2500 RPM and 10 psi and 24% at 5000 RPM: far over the 10% dose
+limit, which therefore sets the pulses (0.85 s and 1.7 s of every 4 s there). To measure
+it again: a pump test at 100% into a cup on a scale, grams x 20 = ml/min for a 3 s test.
 
 **Every run starts gently.** From rest the duty climbs from 5% to full over 0.4 s (a
 motor starting draws its largest current, and slamming it on dips the 12 V supply); a

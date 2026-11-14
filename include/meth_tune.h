@@ -78,6 +78,11 @@ constexpr uint8_t kSetOk = 0;
 constexpr uint8_t kSetUnsupported = 1;
 constexpr uint8_t kSetClamped = 3;
 
+// The car's nozzle as measured on the pump test (see rangeOf). The label said 60 ml/min,
+// the built-in figure until then; a tune saved with that figure is moved to this one.
+constexpr uint16_t kMeasuredNozzleMlMin = 160;
+constexpr uint16_t kLabelNozzleMlMin = 60;
+
 struct Range {
   uint16_t min;
   uint16_t max;
@@ -100,7 +105,10 @@ inline Range rangeOf(uint8_t key) {
   case kMinPreTempC: return {0, 120, 0};
   case kOverboostAssist: return {0, 1, 0};
   case kMethPercent: return {0, 100, 0};
-  case kNozzleMlMin: return {20, 1000, 60};
+  // Measured, not the nozzle's label (60): the owner's 3 s pump test at full pressure gave
+  // about 8 g of water, counting what the still-pressurised line sprayed after the pump
+  // stopped (November 2026): 160 ml/min. Counting that run-on errs towards less spray.
+  case kNozzleMlMin: return {20, 1000, kMeasuredNozzleMlMin};
   case kMaxDosePct: return {0, 40, 10};
   case kEarlyRpm: return {0, 8000, 3500};
   case kHotStartC: return {0, 145, 0};
@@ -417,7 +425,7 @@ constexpr float kSoftStartFloorPct = 5.0f;
 // continuously). Only the start of each run uses PWM: a soft start, from
 // kSoftStartFloorPct to full over the soft start time. Why, rather than running the
 // pump continuously at a duty that follows boost, as the board did until then:
-//   - The pump is an ordinary diaphragm pump, 4-6 L/min against a 60 ml/min nozzle, so it
+//   - The pump is an ordinary diaphragm pump, 4-6 L/min against a 160 ml/min nozzle, so it
 //     is all but dead-headed and the pressure it holds follows its motor voltage. At part
 //     duty the line sits at part pressure, and the nozzle atomises by pressure: a coarse
 //     spray. Full on, every spray is at the pump's full pressure, as the first board's

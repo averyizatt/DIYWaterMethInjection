@@ -78,7 +78,7 @@ MicroSquirt's intake temperature.
 | Minimum air temperature before the nozzle (0 = off) | 0-120 C | 0 |
 | Overboost assist (the older 85% / 100% forcing) | 0-1 | 0 |
 | Methanol in the tank | 0-100 % | 0 |
-| Nozzle flow | 20-1000 ml/min | 60 |
+| Nozzle flow | 20-1000 ml/min | 160 (measured: the label says 60) |
 | Most fluid as a share of fuel flow (0 = off) | 0-40 % | 10 |
 | Early start RPM (0 = off) | 0-8000 | 3500 |
 | Hot air adds on-time from (0 = off) | 0-145 C | 0 |

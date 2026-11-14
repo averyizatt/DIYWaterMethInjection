@@ -827,18 +827,27 @@ void tuneChanged() {
 // ---------------------------------------------------------------------------
 // Saved tuning: one block in flash (NVS), checked before it is used.
 // ---------------------------------------------------------------------------
-constexpr uint8_t kTuneStoreVersion = 1;
+// Version 2: the nozzle figure is the measured one (meth_tune::kMeasuredNozzleMlMin). A
+// version 1 block holding the old built-in 60 ml/min (the nozzle's label, never measured)
+// gets the measured figure; any other nozzle figure was set on purpose and is kept.
+constexpr uint8_t kTuneStoreVersion = 2;
 
 bool loadTune() {
   Preferences store;
   if (!store.begin("methtune", true)) return false;
   meth_tune::Settings saved;
-  const bool read = store.getUChar("version", 0) == kTuneStoreVersion &&
+  const uint8_t version = store.getUChar("version", 0);
+  const bool read = (version == 1 || version == kTuneStoreVersion) &&
                     store.getBytes("values", saved.value, sizeof(saved.value)) == sizeof(saved.value);
   store.end();
   if (!read) return false;
   saved.value[0] = 0;
   if (!meth_tune::valid(saved)) return false;
+  if (version == 1 && saved.value[meth_tune::kNozzleMlMin] == meth_tune::kLabelNozzleMlMin) {
+    saved.value[meth_tune::kNozzleMlMin] = meth_tune::kMeasuredNozzleMlMin;
+    Serial.printf("BOOT: saved nozzle flow was the label's %u ml/min; using the measured %u\n",
+                  static_cast<unsigned>(meth_tune::kLabelNozzleMlMin), static_cast<unsigned>(meth_tune::kMeasuredNozzleMlMin));
+  }
   tune = saved;
   return true;
 }

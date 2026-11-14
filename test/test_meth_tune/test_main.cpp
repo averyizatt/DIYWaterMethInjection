@@ -70,9 +70,10 @@ Run simulate(PulseTiming &g, const Settings &s, uint32_t fromMs, uint32_t toMs, 
 Settings defaults() {
   Settings s;
   loadDefaults(s);
-  // These tests were written around a 5 psi start; the shipped start is 0.5 psi
-  // (checked in the meth tune tests).
+  // These tests were written around a 5 psi start and a 60 ml/min nozzle; the shipped
+  // start is 0.5 psi and the nozzle the measured 160 ml/min (both checked below).
   s.value[kStartPsiX10] = 50;
+  s.value[kNozzleMlMin] = 60;
   return s;
 }
 
@@ -82,7 +83,8 @@ void change(Settings &s, uint8_t key, uint16_t value) {
 }
 
 void defaultsAreConservativeAndValid() {
-  const Settings s = defaults();
+  Settings s;
+  loadDefaults(s);   // The shipped defaults, not the test helper's
   check(valid(s), "defaults are valid");
   check(s.value[kPeriodMs] == 4000 && s.value[kMinOnMs] == 1000 && s.value[kMaxOnMs] == 2000,
         "default: the pump runs 1-2 s in every 4 s");
@@ -91,7 +93,7 @@ void defaultsAreConservativeAndValid() {
   check(s.value[kOverboostAssist] == 0, "overboost assist is off by default");
   check(s.value[kRestS] > 0, "default has a spray time limit");
   check(s.value[kMaxDosePct] > 0 && s.value[kMaxDosePct] <= 10, "default has a dose limit of at most 10% of fuel");
-  check(s.value[kMethPercent] == 0 && s.value[kNozzleMlMin] == 60, "default: water only through a 60 ml/min nozzle");
+  check(s.value[kMethPercent] == 0 && s.value[kNozzleMlMin] == 160, "default: water only through the measured 160 ml/min nozzle");
 }
 
 void settingsClampAndNeverRaiseOtherValues() {
