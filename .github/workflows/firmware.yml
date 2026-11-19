@@ -54,7 +54,7 @@ jobs:
         run: |
           # Two commands, not "g++ ... && test": under bash -e a test that no longer compiled
           # would then be skipped without failing the run.
-          for name in test_meth_tune test_meth_pulse test_esp32_inputs test_reset_guard test_black_box test_status_light test_knock_agc test_knock_dsp test_knock_spectrum; do
+          for name in test_meth_tune test_meth_pulse test_esp32_inputs test_reset_guard test_black_box test_status_light test_knock_agc test_knock_dsp test_knock_spectrum test_pcb test_ecu_profiles; do
             g++ -std=c++11 -O2 -Wall -I include test/$name/test_main.cpp -o /tmp/$name
             /tmp/$name
           done
@@ -63,18 +63,24 @@ jobs:
           /tmp/test_injection_controller
           g++ -std=c++17 -O2 -Wall -I include tools/ltspice/ltreplay.cpp -o /tmp/ltreplay
 
+      # The PCB web page's live preview (GitHub Pages) is built from include/web_ui.h and the
+      # settings headers: it must be regenerated when they change.
+      - name: Web page preview is current
+        working-directory: DIYWaterMethInjection
+        run: python tools/web_ui_preview.py --check
+
       # The image is copied out at once: the next build runs with other flags, and
       # PlatformIO then clears the build folder.
       - name: Build the bench tests
         working-directory: DIYWaterMethInjection
-        run: pio run -e esp32s3_pump_test -e esp32s3_knock_gain_test -e esp32s3_knock_test -e esp32s3_inputs_test -e esp32s3_safety_test
+        run: pio run -e WaterMethPrototypeV2-PumpTest -e WaterMethPrototypeV2-KnockGainTest -e WaterMethPrototypeV2-KnockTest -e WaterMethPrototypeV2-InputsTest -e WaterMethPrototypeV2-SafetyTest
 
       # Knock listening is off in the published firmware for now (ESP32_KNOCK, the owner's
       # choice until the amplifier works on the bench). It is built here with knock on as
       # well, so the code keeps compiling while it is off. Not published.
       - name: Build the ESP32-S3 firmware with knock on
         working-directory: DIYWaterMethInjection
-        run: PLATFORMIO_BUILD_FLAGS="-DESP32_KNOCK=1" pio run -e esp32s3_water_meth
+        run: PLATFORMIO_BUILD_FLAGS="-DESP32_KNOCK=1" pio run -e WaterMethPrototypeV2
 
       # The build number the controller reports to the dash: the first eight hex digits of the commit.
       - name: Build the ESP32-S3 firmware
@@ -86,13 +92,13 @@ jobs:
           V=$(tr -cd '0-9.' < VERSION)
           if git tag --points-at HEAD | grep -qx "v$V"; then echo "RELEASE=$V" >> "$GITHUB_ENV"; else echo "RELEASE=$V+" >> "$GITHUB_ENV"; fi
           echo "BUILD=$BUILD" >> "$GITHUB_ENV"
-          PLATFORMIO_BUILD_FLAGS="-DMETH_FW_BUILD=0x$BUILD" pio run -e esp32s3_water_meth
+          PLATFORMIO_BUILD_FLAGS="-DMETH_FW_BUILD=0x$BUILD" pio run -e WaterMethPrototypeV2
 
       - name: Package
         working-directory: DIYWaterMethInjection
         run: |
           mkdir -p out
-          cp .pio/build/esp32s3_water_meth/firmware.bin out/watermeth-firmware.bin
+          cp .pio/build/WaterMethPrototypeV2/firmware.bin out/watermeth-firmware.bin
           python3 - <<'EOF'
           import hashlib, json, os, pathlib
           data = pathlib.Path('out/watermeth-firmware.bin').read_bytes()
@@ -103,6 +109,20 @@ jobs:
           pathlib.Path('out/watermeth-firmware.json').write_text(json.dumps(manifest) + '\n')
           print(manifest)
           EOF
+
+      # The PCB's two builds (docs/PCB.md). Copied out at once, like the prototype's image.
+      - name: Build the PCB firmware
+        working-directory: DIYWaterMethInjection
+        run: |
+          for env in WaterMethPCBFrogDash WaterMethPCBStandalone; do
+            PLATFORMIO_BUILD_FLAGS="-DMETH_FW_BUILD=0x$BUILD" pio run -e $env
+            cp .pio/build/$env/firmware.bin out/$env.bin
+          done
+          # Each image must carry its own board mark (pcb_board.h) and not the other's:
+          # firmware arriving without its mark is refused, so a mix-up is never installed.
+          grep -qa WMPCB-REVD-FROGDASH-IMAGE out/WaterMethPCBFrogDash.bin && ! grep -qa WMPCB-REVD-STANDALONE-IMAGE out/WaterMethPCBFrogDash.bin
+          grep -qa WMPCB-REVD-STANDALONE-IMAGE out/WaterMethPCBStandalone.bin && ! grep -qa WMPCB-REVD-FROGDASH-IMAGE out/WaterMethPCBStandalone.bin
+          ! grep -qa WMPCB-REVD out/watermeth-firmware.bin
 
       - uses: actions/upload-artifact@v4
         with:
@@ -120,3 +140,7 @@ jobs:
             --notes "Built automatically from main, for the ESP32-S3 board. The dash downloads this during Update now and installs it over the CAN bus."
           gh release upload watermeth-latest out/watermeth-firmware.bin --clobber
           gh release upload watermeth-latest out/watermeth-firmware.json --clobber
+          # The PCB's images go to a release of their own, never watermeth-latest: the dash
+          # sends watermeth-latest to the prototype board in the car.
+          gh release view watermeth-pcb-latest >/dev/null 2>&1 || gh release create watermeth-pcb-latest             --title "Water/meth PCB firmware (latest build)" --latest=false             --notes "Built automatically from main, for the water/meth controller PCB (rev D, XIAO ESP32-S3). WaterMethPCBStandalone.bin: any car, set up from a phone over the board's Wi-Fi. WaterMethPCBFrogDash.bin: for a Frogdash dash. Flash by USB the first time (docs/PCB.md)."
+          gh release upload watermeth-pcb-latest out/WaterMethPCBFrogDash.bin out/WaterMethPCBStandalone.bin --clobber

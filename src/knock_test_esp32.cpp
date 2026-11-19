@@ -1,8 +1,8 @@
 // Knock test for the ESP32-S3 board, with the knock amplifier on fixed resistors (the gain
-// jumpers J1-J5, no digital potentiometer). Environment esp32s3_knock_test. No CAN, no
+// jumpers J1-J5, no digital potentiometer). Environment WaterMethPrototypeV2-KnockTest. No CAN, no
 // pump: just the knock listening of the real firmware and a report that is easy to read.
 //
-// The same code as esp32s3_water_meth: the ADC sampler and its filters on every sample
+// The same code as WaterMethPrototypeV2: the ADC sampler and its filters on every sample
 // (adc_sampler.cpp, knock_dsp.h), the detector that decides what is knock, and the
 // spectrum and frequency finder (knock_spectrum.h).
 //

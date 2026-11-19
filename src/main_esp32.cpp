@@ -68,7 +68,7 @@
 #endif
 constexpr bool kKnockOn = ESP32_KNOCK != 0;
 
-// Bench only (environment esp32s3_safety_test): serial commands that make this firmware
+// Bench only (environment WaterMethPrototypeV2-SafetyTest): serial commands that make this firmware
 // fail on purpose, one way at a time, to watch it recover. Never in the car's build.
 #ifndef METH_SAFETY_TEST
 #define METH_SAFETY_TEST 0

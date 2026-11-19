@@ -1,5 +1,5 @@
 // Bench test for the knock amplifier and its X9C104 gain potentiometer on the ESP32-S3
-// board (environment esp32s3_knock_gain_test). No CAN, no pump, no injection rules.
+// board (environment WaterMethPrototypeV2-KnockGainTest). No CAN, no pump, no injection rules.
 //
 // It walks the potentiometer to the bottom, then steps it through its range, three
 // seconds at each stop, and goes round again. At each stop it prints what the firmware

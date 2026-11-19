@@ -196,17 +196,19 @@ inline uint16_t hotAirOnMs(const Settings &s, bool preValid, float preC) {
 }
 
 // Estimated fuel flow (g/min) at this engine speed and manifold absolute pressure.
-inline float fuelGPerMin(uint16_t rpm, float mapKpa) {
-  return mapKpa > 0.0f ? rpm * mapKpa * kFuelGPerMinPerRpmKpa : 0.0f;
+// fuelScale is the engine's size against the 2.3 L the constant is for (the stand-alone
+// PCB build sets it from the engine size; 1 everywhere else).
+inline float fuelGPerMin(uint16_t rpm, float mapKpa, float fuelScale = 1.0f) {
+  return mapKpa > 0.0f ? rpm * mapKpa * kFuelGPerMinPerRpmKpa * fuelScale : 0.0f;
 }
 
 // Longest on-time the dose limit allows in one cycle: fluid may be at most
 // kMaxDosePct of fuel flow, and the nozzle delivers kNozzleMlMin while the pump runs
 // (1 ml taken as 1 g). Returns the period when the limit is off or not reached.
-inline uint16_t doseLimitOnMs(const Settings &s, uint16_t rpm, float mapKpa) {
+inline uint16_t doseLimitOnMs(const Settings &s, uint16_t rpm, float mapKpa, float fuelScale = 1.0f) {
   const uint16_t period = s.value[kPeriodMs];
   if (s.value[kMaxDosePct] == 0) return period;
-  const float allowedMlMin = fuelGPerMin(rpm, mapKpa) * s.value[kMaxDosePct] / 100.0f;
+  const float allowedMlMin = fuelGPerMin(rpm, mapKpa, fuelScale) * s.value[kMaxDosePct] / 100.0f;
   const float duty = allowedMlMin / s.value[kNozzleMlMin];
   return duty >= 1.0f ? period : static_cast<uint16_t>(period * duty);
 }
@@ -242,6 +244,12 @@ struct Inputs {
   bool assistActive{false};     // Overboost assist requested by the controller.
   float assistDutyPercent{0.0f};
   float capDutyPercent{100.0f}; // Master duty cap; 100 = none.
+  // The stand-alone PCB build only (both are left as they are everywhere else):
+  float fuelScale{1.0f};        // Engine size against 2.3 L, for the dose limit.
+  // False for a setup with no engine speed at all (a MAP sensor and nothing on CAN): then
+  // there is no RPM gate, and no dose limit (it needs engine speed); the pulse timing,
+  // spray time limit and rest still apply.
+  bool rpmRequired{true};
 };
 
 class PulseTiming {
@@ -268,8 +276,8 @@ public:
 
     uint8_t hold = kHoldNone;
     if (!wanted) hold = in.idleHold == kHoldNone ? static_cast<uint8_t>(kHoldBelowBoost) : in.idleHold;
-    else if (!in.rpmValid) hold = kHoldRpmMissing;
-    else if (in.rpm < s.value[kMinRpm]) hold = kHoldRpmLow;
+    else if (!in.rpmValid && in.rpmRequired) hold = kHoldRpmMissing;
+    else if (in.rpmValid && in.rpm < s.value[kMinRpm]) hold = kHoldRpmLow;
     else if (s.value[kMinPreTempC] > 0 && !in.preValid) hold = kHoldTempSensor;
     else if (s.value[kMinPreTempC] > 0 && in.preC < static_cast<float>(s.value[kMinPreTempC])) hold = kHoldAirCold;
 
@@ -305,7 +313,7 @@ public:
       ramp = 0;
     }
     // Limits come last, so nothing above can exceed them.
-    const uint16_t dose = doseLimitOnMs(s, in.rpm, in.mapKpa);
+    const uint16_t dose = in.rpmValid || in.rpmRequired ? doseLimitOnMs(s, in.rpm, in.mapKpa, in.fuelScale) : period;
     if (target > dose) target = dose;
     if (in.capDutyPercent < 100.0f) {
       const uint16_t cap = onFromDuty(in.capDutyPercent, period);

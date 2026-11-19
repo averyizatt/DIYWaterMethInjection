@@ -1,7 +1,7 @@
 # ESP32-S3 water/meth and knock controller: hardware
 
 The car's water/meth and knock controller. Firmware: `src/main_esp32.cpp`, PlatformIO
-environment `esp32s3_water_meth` (the default).
+environment `WaterMethPrototypeV2` (the default).
 
 - **Pump:** on a MOSFET, full on or full off in timed pulses, each started with a short
   soft ramp (see [Pump](#pump)).
@@ -203,7 +203,7 @@ moment to take from the pump control. The serial monitor prints a line whenever 
 CAN task has had to switch the pump off, and at start-up the reason for the last reset
 and, after a crash, whether the crash handler switched the pump off first.
 
-**Trying each failure on the bench:** the environment `esp32s3_safety_test` is the real
+**Trying each failure on the bench:** the environment `WaterMethPrototypeV2-SafetyTest` is the real
 firmware plus serial commands that make it fail on purpose, one way at a time: `s` the
 main loop stalls for 600 ms, `h` it hangs, `c` the CAN task hangs, `x` a crash, `i` a
 core stuck with interrupts off, `f` clear faults. Each starts with the pump output at
@@ -211,16 +211,16 @@ core stuck with interrupts off, `f` clear faults. Each starts with the pump outp
 CAN task switched the pump off 252 ms into the stall; both hangs were caught by the
 watchdog at 2.0 s; every crash ran the crash handler first and the board was running
 again 0.1-0.3 s after the reset; the third crash held injection off and `f` released
-it. Flash `esp32s3_water_meth` again afterwards: the test commands are not in it.
+it. Flash `WaterMethPrototypeV2` again afterwards: the test commands are not in it.
 
 ### Testing the driver by itself
 
-Before anything else is wired, the environment `esp32s3_pump_test` drives only the
+Before anything else is wired, the environment `WaterMethPrototypeV2-PumpTest` drives only the
 pump output: off for the first 10 seconds after start-up, then 10 % duty, 20 %, and so
 on to 100 %, two seconds each, then off until the board's reset button is pressed. It
 uses the same pin and PWM frequency as the real firmware, and prints each step on the
 serial monitor (115200). Have fluid in the pump: it should not run dry. Flash
-`esp32s3_water_meth` again afterwards.
+`WaterMethPrototypeV2` again afterwards.
 
 ## CAN module
 
@@ -262,8 +262,8 @@ an open switch or a broken wire reads as an empty tank.
 > **Off in the firmware for now** (November 2026), until the amplifier's input works on
 > the bench: `ESP32_KNOCK` in `src/main_esp32.cpp`, 0 by default. The dash shows knock
 > as unavailable, and the gain potentiometer is left alone. Add `-DESP32_KNOCK=1` to the
-> `esp32s3_water_meth` build flags to bring it back. The bench tests below
-> (`esp32s3_knock_gain_test`, `esp32s3_knock_test`) still work: they have their own code.
+> `WaterMethPrototypeV2` build flags to bring it back. The bench tests below
+> (`WaterMethPrototypeV2-KnockGainTest`, `WaterMethPrototypeV2-KnockTest`) still work: they have their own code.
 
 Engine noise at the knock sensor is many times larger at high RPM than at idle. With a
 fixed gain the signal is either a few ADC counts at idle or clipping at speed. The
@@ -351,7 +351,7 @@ gain can be held at a position from there (see [On the dash](#on-the-dash)).
 
 ### Testing it by itself
 
-The environment `esp32s3_knock_gain_test` steps the potentiometer from bottom to top in
+The environment `WaterMethPrototypeV2-KnockGainTest` steps the potentiometer from bottom to top in
 eleven stops, three seconds each, and prints at each one the position, the gain it
 should give, the resistance to expect across VW and VL, and what the ADC hears
 (resting level, swing, the level in each knock filter, the real sample rate, clipping).
@@ -367,12 +367,12 @@ should give, the resistance to expect across VW and VL, and what the ADC hears
    put at every gain.
 4. "rate" should read about 38460.
 
-Flash `esp32s3_water_meth` again afterwards.
+Flash `WaterMethPrototypeV2` again afterwards.
 
 ### Testing the knock circuit with fixed resistors
 
 Before the potentiometer is fitted, with the gain set by a jumper (J1-J5: 1.47, 2, 3.2,
-5.7 or 11 times), flash **`esp32s3_knock_test`** (`src/knock_test_esp32.cpp`). It runs
+5.7 or 11 times), flash **`WaterMethPrototypeV2-KnockTest`** (`src/knock_test_esp32.cpp`). It runs
 the real firmware's knock listening and nothing else, and prints in plain words every
 2 s: whether the ADC runs at its rate, where the amplifier rests (about 825 mV on
 GPIO1), how far the signal swings and whether it clips, the size of the signal at the
@@ -677,7 +677,7 @@ KSPEC kHz:dB 3.2:21 3.8:19 4.4:18 5.0:20 5.6:24 6.2:29 6.8:23 7.4:18 8.0:16 8.6:
 
 Then, engine off, run a pump test from the dash and check the pump runs and stops.
 
-Before moving the board to the car, `esp32s3_inputs_test` shows the float switch
+Before moving the board to the car, `WaterMethPrototypeV2-InputsTest` shows the float switch
 (GPIO7) and the air temperature sensors (GPIO5, GPIO6) as the firmware reads them,
 once a second, with nothing else running.
 

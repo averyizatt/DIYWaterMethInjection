@@ -1,5 +1,5 @@
 // Bench test for the tank float switch and the intake air temperature sensors on the
-// ESP32-S3 board (environment esp32s3_inputs_test). No CAN, no pump, no knock.
+// ESP32-S3 board (environment WaterMethPrototypeV2-InputsTest). No CAN, no pump, no knock.
 //
 // The same code the real firmware uses: the ADC sampler (adc_sampler.cpp), the
 // thermistor curve and the float switch's debounce and hold (analog_inputs.h), with the

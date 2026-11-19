@@ -1,5 +1,5 @@
 // Bench test for the pump's MOSFET driver on the ESP32-S3 board (environment
-// esp32s3_pump_test). Nothing else runs: no CAN, no sensors, no injection rules.
+// WaterMethPrototypeV2-PumpTest). Nothing else runs: no CAN, no sensors, no injection rules.
 //
 //   first 10 s   pump off
 //   then         10 %, 20 %, ... 100 % duty, two seconds each

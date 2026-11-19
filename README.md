@@ -1,7 +1,29 @@
 # DIY Water/Meth Injection Controller
 
+[![Firmware](https://github.com/averyizatt/DIYWaterMethInjection/actions/workflows/firmware.yml/badge.svg)](https://github.com/averyizatt/DIYWaterMethInjection/actions/workflows/firmware.yml)
+[![Preview](https://github.com/averyizatt/DIYWaterMethInjection/actions/workflows/pages.yml/badge.svg)](https://averyizatt.github.io/DIYWaterMethInjection/)
+
+**[Try the PCB's phone page in the live preview](https://averyizatt.github.io/DIYWaterMethInjection/)**:
+the stand-alone board's own web page with a simulated engine, pump and valve behind it. Open
+it on a phone; everything is clickable and nothing is saved.
+
+Two boards, each with its own firmware (PlatformIO environments):
+
+- **WaterMethPrototypeV2**: the car's board, an ESP32-S3 DevKitC-1 with an MCP2515 CAN module
+  (below, and [docs/ESP32_HARDWARE.md](docs/ESP32_HARDWARE.md)). The default build; its
+  bench tests are `WaterMethPrototypeV2-PumpTest`, `-InputsTest`, `-KnockTest`,
+  `-KnockGainTest` and `-SafetyTest`.
+- **The water/meth controller PCB** (rev D, XIAO ESP32-S3): [docs/PCB.md](docs/PCB.md).
+  - **WaterMethPCBStandalone**: for any car, with no dash. It gets engine data from OBD-II or
+    an aftermarket ECU's CAN broadcast, or from a MAP sensor. It is set up from a phone over
+    the board's own Wi-Fi.
+  - **WaterMethPCBFrogDash**: the Frogdash dash's CAN protocol.
+  - The stand-alone build's phone page has a [live preview](https://averyizatt.github.io/DIYWaterMethInjection/)
+    (`preview/index.html`, built by `python tools/web_ui_preview.py` after editing
+    `include/web_ui.h` or the settings; CI fails if it is out of date).
+
 Firmware for the car's water/meth and knock controller: an ESP32-S3 DevKitC-1 with an
-MCP2515 CAN module (`src/main_esp32.cpp`, PlatformIO environment `esp32s3_water_meth`).
+MCP2515 CAN module (`src/main_esp32.cpp`, PlatformIO environment `WaterMethPrototypeV2`).
 Wiring, parts, bench tests and first start-up checks:
 [docs/ESP32_HARDWARE.md](docs/ESP32_HARDWARE.md).
 
@@ -205,11 +227,11 @@ g++ -std=c++11 -O2 -Wall -I include test/test_injection_controller/test_main.cpp
 ## Build and upload
 
 ```bash
-platformio run -t upload            # esp32s3_water_meth, the default
-platformio run -e esp32s3_safety_test -t upload   # bench: make it fail on purpose
+platformio run -t upload            # WaterMethPrototypeV2, the default
+platformio run -e WaterMethPrototypeV2-SafetyTest -t upload   # bench: make it fail on purpose
 ```
 
-The bench test environments (`esp32s3_pump_test`, `esp32s3_inputs_test`,
-`esp32s3_knock_test`, `esp32s3_knock_gain_test`, `esp32s3_safety_test`) are described
-in [docs/ESP32_HARDWARE.md](docs/ESP32_HARDWARE.md). Flash `esp32s3_water_meth` again
+The bench test environments (`WaterMethPrototypeV2-PumpTest`, `WaterMethPrototypeV2-InputsTest`,
+`WaterMethPrototypeV2-KnockTest`, `WaterMethPrototypeV2-KnockGainTest`, `WaterMethPrototypeV2-SafetyTest`) are described
+in [docs/ESP32_HARDWARE.md](docs/ESP32_HARDWARE.md). Flash `WaterMethPrototypeV2` again
 afterwards. In the car, new builds go in from the dash over CAN.
